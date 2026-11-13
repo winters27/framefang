@@ -1,0 +1,16 @@
+Framefang
+Copyright 2026 winters27
+
+Framefang is a modified version of Kashot
+(https://github.com/singhpratech/kashot), by Prateek Singh, licensed under
+the Apache License, Version 2.0. See LICENSE.
+
+Changes from Kashot include, among others: the product name and icon; a
+region picker that hands off to a separate, see-through editor window; a
+faster overlay; anti-aliased drawing with a new arrow; per-tool color, size
+and settings flyouts; automatic copying; a button to the system's own
+screenshot-key setting; and the removal of the watermark, Kashot's website,
+store packaging and release automation. Modified source files are those
+that differ from Kashot's repository at commit 9550e33.
+
+Third-party components are listed in THIRD_PARTY_LICENSES.md.

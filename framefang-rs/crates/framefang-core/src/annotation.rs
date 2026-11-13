@@ -1,0 +1,350 @@
+//! Polymorphic annotation hierarchy. Each variant draws into a graphics target
+//! supplied by the renderer — `framefang-app` provides the iced::Canvas backend.
+//!
+//! Mirrors the C# `Annotation` hierarchy in `Framefang/Annotations.cs`. When you
+//! add a new annotation type, also update:
+//!  * `tool::Tool` enum
+//!  * `tool::Tool::ALL` array
+//!  * the renderer (`framefang-app/src/overlay/render.rs`)
+
+use serde::{Deserialize, Serialize};
+
+use crate::color::Rgba;
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Point2 {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl Point2 {
+    pub const fn new(x: f32, y: f32) -> Self { Self { x, y } }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Rect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+impl Rect {
+    pub fn from_corners(a: Point2, b: Point2) -> Self {
+        let x = a.x.min(b.x);
+        let y = a.y.min(b.y);
+        Rect { x, y, w: (b.x - a.x).abs(), h: (b.y - a.y).abs() }
+    }
+
+    pub fn contains(self, p: Point2) -> bool {
+        p.x >= self.x && p.x <= self.x + self.w && p.y >= self.y && p.y <= self.y + self.h
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.w <= 0.0 || self.h <= 0.0
+    }
+}
+
+/// Common style fields shared across most annotations.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Stroke {
+    pub color:     Rgba,
+    pub thickness: f32,
+}
+
+impl Default for Stroke {
+    fn default() -> Self {
+        Stroke { color: Rgba::RED, thickness: 3.0 }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum AnnotationKind {
+    Pen        { stroke: Stroke, points: Vec<Point2> },
+    Line       { stroke: Stroke, start: Point2, end: Point2 },
+    Arrow      { stroke: Stroke, start: Point2, end: Point2 },
+    Rectangle  { stroke: Stroke, start: Point2, end: Point2 },
+    Ellipse    { stroke: Stroke, start: Point2, end: Point2 },
+    Marker     { stroke: Stroke, points: Vec<Point2> },
+    Text       { color: Rgba, position: Point2, text: String, font_size: f32 },
+    Step       { color: Rgba, center: Point2, number: u32 },
+    Pixelate   { start: Point2, end: Point2, block_size: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Annotation {
+    pub kind: AnnotationKind,
+    /// Video-mode visibility window in clip seconds: start inclusive, end
+    /// exclusive. `end` may be `f32::INFINITY` for "visible until the clip
+    /// ends". `None` = whole clip — screenshot mode and the static video
+    /// default, so a session that never touches the timeline carries no
+    /// windows at all and burns exactly like before. `#[serde(default)]`
+    /// keeps any future session-file format readable across this change
+    /// (nothing persists `Annotation` today).
+    #[serde(default)]
+    pub time: Option<(f32, f32)>,
+}
+
+impl Annotation {
+    pub fn pen(stroke: Stroke, p: Point2) -> Annotation {
+        Annotation { kind: AnnotationKind::Pen { stroke, points: vec![p] }, time: None }
+    }
+    pub fn line(stroke: Stroke, a: Point2) -> Annotation {
+        Annotation { kind: AnnotationKind::Line { stroke, start: a, end: a }, time: None }
+    }
+    pub fn arrow(stroke: Stroke, a: Point2) -> Annotation {
+        Annotation { kind: AnnotationKind::Arrow { stroke, start: a, end: a }, time: None }
+    }
+    pub fn rectangle(stroke: Stroke, a: Point2) -> Annotation {
+        Annotation { kind: AnnotationKind::Rectangle { stroke, start: a, end: a }, time: None }
+    }
+    pub fn ellipse(stroke: Stroke, a: Point2) -> Annotation {
+        Annotation { kind: AnnotationKind::Ellipse { stroke, start: a, end: a }, time: None }
+    }
+    pub fn marker(stroke: Stroke, p: Point2, alpha: u8) -> Annotation {
+        // Marker thickness is 6× the configured thickness; alpha is the
+        // user-controlled value from `AppSettings::marker_opacity` (default
+        // `0xC8`). The editor's per-tool slider mutates that setting live
+        // and passes the current value in here on every new marker stroke.
+        let stroke = Stroke {
+            thickness: stroke.thickness * 6.0,
+            color:     stroke.color.with_alpha(alpha),
+        };
+        Annotation { kind: AnnotationKind::Marker { stroke, points: vec![p] }, time: None }
+    }
+    /// Text at the default em-size. `font_size` is a pixel em-size handed
+    /// straight to the rasterizer (`crate::text`), not a point size.
+    pub fn text(color: Rgba, p: Point2, text: impl Into<String>) -> Annotation {
+        Annotation::text_sized(color, p, text, crate::text::DEFAULT_PX)
+    }
+    /// Text at an explicit em-size — the editor derives it from the current
+    /// stroke thickness via `crate::text::font_size_for_thickness`.
+    pub fn text_sized(color: Rgba, p: Point2, text: impl Into<String>, font_size: f32) -> Annotation {
+        let font_size = crate::text::clamp_px(font_size);
+        Annotation { kind: AnnotationKind::Text { color, position: p, text: text.into(), font_size }, time: None }
+    }
+    pub fn step(color: Rgba, center: Point2, number: u32) -> Annotation {
+        Annotation { kind: AnnotationKind::Step { color, center, number }, time: None }
+    }
+    pub fn pixelate(a: Point2) -> Annotation {
+        Annotation { kind: AnnotationKind::Pixelate { start: a, end: a, block_size: 10 }, time: None }
+    }
+
+    /// Update the in-progress annotation with the latest mouse position.
+    pub fn extend(&mut self, p: Point2) {
+        match &mut self.kind {
+            AnnotationKind::Pen { points, .. }      => points.push(p),
+            AnnotationKind::Marker { points, .. }   => points.push(p),
+            AnnotationKind::Line { end, .. }        => *end = p,
+            AnnotationKind::Arrow { end, .. }       => *end = p,
+            AnnotationKind::Rectangle { end, .. }   => *end = p,
+            AnnotationKind::Ellipse { end, .. }     => *end = p,
+            AnnotationKind::Pixelate { end, .. }    => *end = p,
+            AnnotationKind::Text { .. }             => {}
+            AnnotationKind::Step { .. }             => {}
+        }
+    }
+}
+
+// ── Color palettes ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct ColorPalette {
+    pub name:   &'static str,
+    pub colors: [Rgba; 16],
+}
+
+pub struct Palettes;
+
+impl Palettes {
+    pub const ALL: [ColorPalette; 4] = [
+        ColorPalette { name: "Vivid", colors: [
+            Rgba::new_opaque(220,  38,  38),
+            Rgba::new_opaque(255, 100,   0),
+            Rgba::new_opaque(255, 180,   0),
+            Rgba::new_opaque(255, 230,   0),
+            Rgba::new_opaque(130, 220,   0),
+            Rgba::new_opaque(  0, 180,  80),
+            Rgba::new_opaque(  0, 200, 200),
+            Rgba::new_opaque(  0, 180, 240),
+            Rgba::new_opaque(  0, 100, 255),
+            Rgba::new_opaque( 80,  80, 220),
+            Rgba::new_opaque(160,  60, 240),
+            Rgba::new_opaque(240,  60, 220),
+            Rgba::new_opaque(255, 100, 200),
+            Rgba::new_opaque(255,  80,  80),
+            Rgba::new_opaque(255, 255, 255),
+            Rgba::new_opaque(  0,   0,   0),
+        ] },
+        ColorPalette { name: "Highlighter", colors: [
+            Rgba::new(255, 235,   0, 170),
+            Rgba::new(100, 255, 100, 170),
+            Rgba::new(255, 100, 200, 170),
+            Rgba::new(100, 230, 255, 170),
+            Rgba::new(255, 150,   0, 170),
+            Rgba::new(200, 100, 255, 170),
+            Rgba::new( 50, 220,  50, 170),
+            Rgba::new(100, 150, 255, 170),
+            Rgba::new(255,  80,  80, 170),
+            Rgba::new(240,  60, 220, 170),
+            Rgba::new(  0, 200, 200, 170),
+            Rgba::new(255, 180, 100, 170),
+            Rgba::new(180, 255, 100, 170),
+            Rgba::new(100, 100, 255, 170),
+            Rgba::new(230, 230, 230, 170),
+            Rgba::new( 80,  80,  80, 170),
+        ] },
+        ColorPalette { name: "Pastel", colors: [
+            Rgba::new_opaque(255, 200, 200),
+            Rgba::new_opaque(255, 220, 180),
+            Rgba::new_opaque(255, 235, 180),
+            Rgba::new_opaque(255, 245, 200),
+            Rgba::new_opaque(230, 255, 200),
+            Rgba::new_opaque(200, 255, 220),
+            Rgba::new_opaque(200, 245, 245),
+            Rgba::new_opaque(200, 230, 255),
+            Rgba::new_opaque(200, 215, 255),
+            Rgba::new_opaque(220, 200, 255),
+            Rgba::new_opaque(240, 200, 255),
+            Rgba::new_opaque(255, 200, 235),
+            Rgba::new_opaque(255, 215, 215),
+            Rgba::new_opaque(240, 240, 240),
+            Rgba::new_opaque(200, 200, 210),
+            Rgba::new_opaque(100, 100, 110),
+        ] },
+        ColorPalette { name: "Pro", colors: [
+            Rgba::new_opaque(220,  38,  38),
+            Rgba::new_opaque( 30, 100, 220),
+            Rgba::new_opaque( 30, 160,  60),
+            Rgba::new_opaque(240, 120,   0),
+            Rgba::new_opaque(138,  43, 226),
+            Rgba::new_opaque(220, 180,   0),
+            Rgba::new_opaque(  0, 160, 200),
+            Rgba::new_opaque(200,  60, 130),
+            Rgba::new_opaque(100,  30,  30),
+            Rgba::new_opaque( 30,  30, 100),
+            Rgba::new_opaque( 30,  80,  30),
+            Rgba::new_opaque(100,  60,   0),
+            Rgba::new_opaque(  0,   0,   0),
+            Rgba::new_opaque( 80,  80,  80),
+            Rgba::new_opaque(200, 200, 200),
+            Rgba::new_opaque(255, 255, 255),
+        ] },
+    ];
+
+    pub fn get(index: usize) -> &'static ColorPalette {
+        let i = index.min(Self::ALL.len() - 1);
+        &Self::ALL[i]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rect_from_corners_normalizes() {
+        let r = Rect::from_corners(Point2::new(50.0, 80.0), Point2::new(10.0, 20.0));
+        assert_eq!(r, Rect { x: 10.0, y: 20.0, w: 40.0, h: 60.0 });
+    }
+
+    #[test]
+    fn pen_extension_appends_points() {
+        let mut a = Annotation::pen(Stroke::default(), Point2::new(1.0, 2.0));
+        a.extend(Point2::new(3.0, 4.0));
+        a.extend(Point2::new(5.0, 6.0));
+        match a.kind {
+            AnnotationKind::Pen { points, .. } => assert_eq!(points.len(), 3),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn text_font_size_is_a_rasterizable_pixel_size() {
+        // Serialization shape is unchanged — `font_size` is still one f32 on
+        // the Text variant — but it now means pixels, and the constructors
+        // guarantee the rasterizer will accept it.
+        let p = Point2::new(0.0, 0.0);
+        match Annotation::text(Rgba::RED, p, "hi").kind {
+            AnnotationKind::Text { font_size, .. } => {
+                assert_eq!(font_size, crate::text::DEFAULT_PX);
+            }
+            _ => panic!("wrong variant"),
+        }
+        match Annotation::text_sized(Rgba::RED, p, "hi", 1.0e9).kind {
+            AnnotationKind::Text { font_size, .. } => {
+                assert_eq!(font_size, crate::text::MAX_PX);
+            }
+            _ => panic!("wrong variant"),
+        }
+        match Annotation::text_sized(Rgba::RED, p, "hi", f32::NAN).kind {
+            AnnotationKind::Text { font_size, .. } => {
+                assert_eq!(font_size, crate::text::DEFAULT_PX);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn palettes_have_16_colors_each() {
+        for p in Palettes::ALL.iter() { assert_eq!(p.colors.len(), 16); }
+    }
+
+    #[test]
+    fn marker_alpha_param_overrides_stroke_alpha() {
+        // The slider passes the user-chosen alpha straight through. Whatever
+        // alpha the swatch color carried is replaced by the param; only the
+        // RGB triple survives. This is what makes the slider's live preview
+        // match the eventual painted stroke.
+        let opaque = Stroke {
+            color:     Rgba::new(255, 0, 0, 0xFF),
+            thickness: 4.0,
+        };
+        let a = Annotation::marker(opaque, Point2::new(10.0, 20.0), 0x80);
+        match a.kind {
+            AnnotationKind::Marker { stroke, points } => {
+                assert_eq!(stroke.color.a, 0x80, "alpha must come from the param, not the input swatch");
+                assert_eq!(stroke.color.r, 255);
+                assert_eq!(stroke.color.g, 0);
+                assert_eq!(stroke.color.b, 0);
+                assert_eq!(stroke.thickness, 24.0, "thickness multiplier is 6×, untouched by this change");
+                assert_eq!(points, vec![Point2::new(10.0, 20.0)]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn marker_alpha_param_min_and_max() {
+        let stroke = Stroke::default();
+        let p = Point2::new(0.0, 0.0);
+        for alpha in [0x00u8, 0x01, 0x7F, 0xC8, 0xFF] {
+            let a = Annotation::marker(stroke, p, alpha);
+            match a.kind {
+                AnnotationKind::Marker { stroke: s, .. } => assert_eq!(s.color.a, alpha),
+                _ => panic!("wrong variant"),
+            }
+        }
+    }
+
+    #[test]
+    fn constructors_default_to_whole_clip_time() {
+        // `None` = whole clip; the editor stamps a window only in video
+        // mode. Every constructor must start un-windowed so screenshot
+        // sessions are structurally unchanged.
+        let p = Point2::new(1.0, 2.0);
+        assert_eq!(Annotation::pen(Stroke::default(), p).time, None);
+        assert_eq!(Annotation::marker(Stroke::default(), p, 0x80).time, None);
+        assert_eq!(Annotation::text(Rgba::RED, p, "hi").time, None);
+        assert_eq!(Annotation::step(Rgba::RED, p, 1).time, None);
+        assert_eq!(Annotation::pixelate(p).time, None);
+    }
+
+    #[test]
+    fn extend_leaves_time_window_untouched() {
+        let mut a = Annotation::pen(Stroke::default(), Point2::new(0.0, 0.0));
+        a.time = Some((1.5, 4.5));
+        a.extend(Point2::new(3.0, 3.0));
+        assert_eq!(a.time, Some((1.5, 4.5)));
+    }
+}

@@ -1,0 +1,2051 @@
+//! Tray-resident lifecycle.
+//!
+//! Uses `winit` directly because both `tray-icon` and `global-hotkey` deliver
+//! events via channels that need the OS event loop to be pumped on the main
+//! thread. We poll those channels each tick and dispatch to the capture
+//! pipeline.
+
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+use anyhow::{anyhow, Result};
+use chrono::Local;
+use framefang_core::hotkeys::HotkeyAction;
+use framefang_core::region::{
+    indicator_placement, record_rect_from_selection, CaptureRect, DesktopBounds,
+};
+use framefang_core::AppSettings;
+use framefang_platform::{
+    capture::capture_all_screens,
+    hotkey::HotkeyManager,
+    recorder::Recorder,
+    tray::{MenuLabels, Tray, TrayEvent},
+};
+
+use crate::about_form::{AboutOutcome, AboutView};
+use crate::convert_image_form::{ConvertImageOutcome, ConvertImageView};
+use crate::convert_video_form::{ConvertVideoOutcome, ConvertVideoView};
+use crate::editor::{ChosenRegion, Overlay, OverlayGroup, OverlayOutcome, VideoCommit};
+use crate::firstrun_form::{FirstRunOutcome, FirstRunView};
+use crate::pin::PinView;
+use crate::recording_indicator::RecordingIndicator;
+use crate::self_updater;
+use crate::settings_form::{SettingsOutcome, SettingsView};
+use crate::updates_form::{UpdatesOutcome, UpdatesView};
+use winit::application::ApplicationHandler;
+use winit::event::WindowEvent;
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::window::WindowId;
+
+pub fn run() -> Result<()> {
+    // Must be sampled before `load()` and before anything can call `save()`:
+    // the settings file is written on first save/exit, so its absence is the
+    // only "this user has never run Framefang" signal we have. A missing config
+    // dir (no HOME) reads as "not first run" — better to skip the welcome
+    // than to show it on every launch.
+    let first_run = AppSettings::settings_path().map(|p| !p.exists()).unwrap_or(false);
+
+    let settings = AppSettings::load();
+    crate::palette::set(crate::palette::Scheme::parse(&settings.theme));
+
+    // Asked once, at startup, and threaded through the app: the answer can't
+    // change without a new login session, and both the startup notice and the
+    // Capture row label need it.
+    let wayland = framefang_platform::session::is_wayland();
+
+    // Hotkey init is best-effort. If it fails (no display server, no portal,
+    // the binding already taken) the app stays running so the user can fix the
+    // issue and try again from the menu later. The failure is *kept*, not just
+    // logged: on Wayland "the shortcut doesn't work" is the single most likely
+    // thing to go wrong, and stderr is not a surface a tray app's user reads.
+    // `ensure_tray` turns whatever is here into one toast.
+    let mut hotkey_error: Option<String> = None;
+    let mut hotkeys = match HotkeyManager::new() {
+        Ok(mut hk) => {
+            // Only the primary capture binding earns a toast: the two
+            // optional actions ship unbound and a chord the desktop already
+            // owns costs just that shortcut (logged by `apply_hotkeys`).
+            for (action, e) in apply_hotkeys(&mut hk, &settings) {
+                if action == HotkeyAction::Capture {
+                    hotkey_error = Some(e.to_string());
+                }
+            }
+            // The registration succeeds even when the system takes the key
+            // first, so this is the only way to know presses will never arrive.
+            if hotkey_error.is_none() && crate::system_shortcuts::system_takes(&settings.hotkey()) {
+                hotkey_error = Some("Windows' Snipping Tool has the Print Screen key. \
+                                     Open Framefang Settings and use the button under Hotkeys \
+                                     to hand it over.".to_owned());
+            }
+            Some(hk)
+        }
+        Err(e) => {
+            eprintln!("hotkey init failed: {e} — use tray menu to capture");
+            hotkey_error = Some(e.to_string());
+            None
+        }
+    };
+
+    // Whether presses arrive through a window-system grab or through the
+    // desktop's global-shortcuts portal. Only the portal can have the
+    // compositor override the requested binding, so only it needs the extra
+    // "your desktop decides" wording.
+    let portal_hotkey = hotkeys.as_ref()
+        .map(|hk| hk.backend().is_portal())
+        .unwrap_or(false);
+
+    if hotkey_error.is_some() {
+        eprintln!("Framefang is running. The capture shortcut is unavailable — \
+                   use the tray menu to capture.");
+    } else if portal_hotkey {
+        eprintln!("Framefang is running. Wayland session — {} was requested from the \
+                   desktop's global-shortcuts portal; your desktop decides the final \
+                   binding and lists it under its keyboard settings.",
+            settings.hotkey().describe());
+    } else {
+        eprintln!("Framefang is running. Press {} or use the tray menu to capture.",
+            settings.hotkey().describe());
+    }
+
+    struct TrayApp {
+        settings:   AppSettings,
+        hotkeys:    Option<HotkeyManager>,
+        /// Built on the first event-loop tick, not in `run()` — see
+        /// `ensure_tray`. Stays `None` for the whole session if the build
+        /// failed, in which case the fallback About window is the only
+        /// surface and closing it quits.
+        tray:       Option<Tray>,
+        /// Whether `ensure_tray` has already run. Distinguishes "not built
+        /// yet" from "built and failed", which `tray: None` alone can't.
+        tray_built: bool,
+        /// Wayland session. Capture and recording both route through
+        /// xdg-desktop-portal here rather than through X11.
+        wayland:    bool,
+        /// Set when hotkey setup failed, so `ensure_tray` can say what went
+        /// wrong once instead of leaving a shortcut that never fires
+        /// unexplained. Cleared after it has been shown.
+        hotkey_error: Option<String>,
+        /// Whether presses come from the global-shortcuts portal rather than a
+        /// window-system grab. Changes what the tray's Capture row can honestly
+        /// promise about the binding.
+        portal_hotkey: bool,
+        recorder:   Recorder,
+        /// Active overlay editor window, if a capture-and-edit is in flight.
+        /// Holds the captured screenshot and the user's selection state until
+        /// they accept (Enter / right-click) or cancel (Esc).
+        overlay:    Option<Overlay>,
+        /// Floating "Pin" windows the user has chosen to keep on screen.
+        /// Each is its own borderless winit window; the tray app routes
+        /// their `WindowEvent`s by `WindowId` and drops them when their
+        /// handler signals close.
+        pinned:     Vec<PinView>,
+        /// Settings dialog window, present while the user is editing
+        /// preferences. Routed by `WindowId` like the overlay + pinned
+        /// windows. `None` when no settings dialog is open.
+        settings_view: Option<SettingsView>,
+        /// Floating recording-control window that appears while a screen
+        /// recording is live. Lets the user stop the recording with one
+        /// click instead of digging through the tray menu.
+        recording_view: Option<RecordingIndicator>,
+        /// Themed About modal — replaces the prior rfd MessageDialog.
+        about_view:    Option<AboutView>,
+        /// Set when the settings file didn't exist at startup; cleared by
+        /// `maybe_show_first_run` once the welcome window has had its one
+        /// chance to open.
+        first_run:     bool,
+        /// One-time welcome window. Closing it only drops the view — unlike
+        /// the tray-failure About fallback, it never exits the app.
+        firstrun_view: Option<FirstRunView>,
+        /// Themed Check-for-updates modal — replaces the prior open-url.
+        updates_view:  Option<UpdatesView>,
+        /// Themed Convert-image dialog.
+        convert_image_view: Option<ConvertImageView>,
+        /// Themed Convert-video dialog (shells out to bundled ffmpeg).
+        convert_video_view: Option<ConvertVideoView>,
+        /// In-flight self-update job, if the user clicked Download &
+        /// install in the Updates dialog. Polled from `poll()` every
+        /// tick — when it finishes we either log the error and carry on
+        /// or, on success, the worker will already have spawned the new
+        /// framefang.exe and called `exit(0)` so this thread never returns.
+        update_job: Option<std::thread::JoinHandle<Result<(), String>>>,
+        last_tick:  Instant,
+        capturing:  bool,
+        /// Path of the most recently saved recording this session — the
+        /// target of the tray's "Annotate last recording". Falls back to
+        /// the newest .mp4 in the recordings folder when None (fresh app
+        /// start).
+        last_recording: Option<PathBuf>,
+        /// Virtual-desktop bounds of the screenshot the live overlay is
+        /// showing. A region the user drags in that overlay is clamped against
+        /// exactly this before it reaches the recorder, so the rectangle can
+        /// never name a pixel that wasn't on screen. Also where the REC
+        /// indicator is placed relative to.
+        overlay_desktop: Option<DesktopBounds>,
+        /// When this instance came up — see the capture-request poll.
+        started_at: Instant,
+        /// Audio sources the tray asked for when it opened a record-region
+        /// overlay. Taken when that overlay commits; `None` for the Record
+        /// button in an ordinary capture session, which records silently — the
+        /// same as the plain "Record" tray row.
+        pending_region_audio: Option<framefang_platform::recorder::RecordingOptions>,
+        /// While `overlay` is a video-annotate session (`new_for_video`),
+        /// the clip it belongs to. `Accepted` then carries an annotations-
+        /// only transparent overlay that gets burned over this file
+        /// instead of being saved as a screenshot.
+        video_annotate: Option<PathBuf>,
+    }
+
+    impl TrayApp {
+        /// Build the tray icon, once, from inside the running event loop.
+        ///
+        /// `tray-icon` requires the status item to be created after the loop
+        /// is up: on macOS an `NSStatusItem` built before `NSApplication`
+        /// finishes launching is dropped on the floor and the menu bar stays
+        /// empty. Windows and Linux tolerate the early build, but running the
+        /// same deferred path everywhere means one code path to reason about
+        /// instead of a macOS special case.
+        ///
+        /// A failure here is not survivable in silence: with no tray there is
+        /// no menu, and the tray's Exit item is the app's only exit — the user
+        /// would be left with an invisible process they can't quit. So we put
+        /// the About window up as a visible, dismissable surface (closing it
+        /// exits, see the `AboutOutcome::Closed` arm) and toast the reason.
+        fn ensure_tray(&mut self, loop_target: &ActiveEventLoop) {
+            if self.tray_built { return; }
+            self.tray_built = true;
+
+            match Tray::new(tray_tooltip(&self.settings),
+                            &menu_labels(&self.settings, self.portal_hotkey)) {
+                Ok(t) => self.tray = Some(t),
+                Err(e) => {
+                    eprintln!("tray init failed: {e}");
+                    notify("Framefang — no tray icon",
+                        &format!("{e}\n\nThe About window is open instead; closing it quits Framefang."),
+                        true);
+                    self.show_about(loop_target);
+                    if self.about_view.is_none() {
+                        // No tray and no window either — nothing on screen can
+                        // ever reach this process. Quit instead of idling
+                        // forever at 30 Hz.
+                        eprintln!("No tray and no fallback window — exiting.");
+                        loop_target.exit();
+                    }
+                }
+            }
+
+            // One toast, only when there is something the user has to act on.
+            // A portal binding that went through needs no announcement — it
+            // just works — and the old unconditional "Wayland can't do this"
+            // notice is no longer true.
+            if let Some(reason) = self.hotkey_error.take() {
+                notify("Framefang — capture shortcut unavailable", &reason, true);
+            }
+        }
+
+        fn poll(&mut self, loop_target: &ActiveEventLoop) {
+            // Drive any platform-native loop the tray depends on (GTK on
+            // Linux). Must run before try_recv so menu-click signals have a
+            // chance to land in the channel.
+            if let Some(tray) = &self.tray {
+                tray.pump_events();
+                match tray.try_recv() {
+                    TrayEvent::None                  => {}
+                    TrayEvent::Capture               => self.capture(loop_target),
+                    TrayEvent::CaptureFullScreen     => self.capture_full_screen(true),
+                    TrayEvent::CaptureDelayed(secs)  => self.capture_after(loop_target, Duration::from_secs(secs as u64)),
+                    TrayEvent::CancelPending         => {} // handled inline by the delay loop
+                    TrayEvent::StartRecording(opts)  => self.start_recording(opts, loop_target, None),
+                    TrayEvent::StartRegionRecording(opts) => self.begin_region_recording(opts, loop_target),
+                    TrayEvent::StopRecording         => self.stop_recording(),
+                    TrayEvent::AnnotateLastRecording => self.annotate_last_recording(loop_target),
+                    TrayEvent::OpenSaveFolder        => self.open_save_folder(),
+                    TrayEvent::OpenRecordingsFolder  => self.open_recordings_folder(),
+                    TrayEvent::Settings              => self.show_settings(loop_target),
+                    TrayEvent::About                 => self.show_about(loop_target),
+                    TrayEvent::CheckForUpdates       => self.show_updates(loop_target),
+                    TrayEvent::ConvertImage          => self.show_convert_image(loop_target),
+                    TrayEvent::ConvertVideo          => self.show_convert_video(loop_target),
+                    TrayEvent::Exit                  => {
+                        // Stop any active recording before tearing down so
+                        // the MP4 moov atom gets finalized. Best-effort —
+                        // if it errors we still exit.
+                        let _ = self.recorder.stop();
+                        loop_target.exit();
+                    }
+                }
+            }
+            // Collected before dispatch so the manager borrow is done with
+            // by the time an action mutates `self`.
+            let fired = self.hotkeys.as_ref().map(|hk| hk.drain_pressed()).unwrap_or_default();
+            for action in fired {
+                match action {
+                    HotkeyAction::Capture           => self.capture_from_hotkey(loop_target),
+                    HotkeyAction::CaptureFullScreen => self.capture_full_screen(false),
+                    HotkeyAction::ToggleRecording   => self.toggle_recording(loop_target),
+                }
+            }
+            // A second launch of Framefang doesn't open a second tray icon — it
+            // leaves a capture request beside the instance lock and exits.
+            // Claim it here so re-running the app (double-clicked desktop
+            // icon, `framefang` typed again) captures instead of doing nothing.
+            // Costs one failing `unlink` per tick when idle. Requests that
+            // land in our first seconds of life are dropped unanswered: two
+            // launches that close together are a login that started Framefang
+            // twice (duplicate autostart entries), not someone asking for a
+            // screenshot, and a dimmed full-screen overlay is the wrong
+            // thing to greet a fresh desktop with.
+            if framefang_platform::instance::take_capture_request()
+                && self.started_at.elapsed() >= STARTUP_CAPTURE_GRACE
+            {
+                self.capture(loop_target);
+            }
+            // Nothing else watches the encoder between start and stop, so an
+            // encoder that dies mid-recording (disk filled, capture device
+            // unplugged, OOM kill) would otherwise leave the app flashing REC
+            // over a dead process. `poll_health` has already returned the
+            // recorder to idle by the time it errs, so we only clean up the UI
+            // — calling `stop()` here would just report "not currently
+            // recording" over the real reason.
+            if let Err(e) = self.recorder.poll_health() {
+                eprintln!("Recording stopped unexpectedly: {e}");
+                if let Some(t) = &self.tray { t.set_recording(false); }
+                self.recording_view = None;
+                notify("Framefang — recording stopped unexpectedly", &format!("{e}"), true);
+            }
+            // Keep the recording indicator's flashing dot animating even
+            // when there's no mouse activity over its window.
+            if let Some(v) = &self.recording_view { v.tick(); }
+            // Pump the updates dialog so its background-fetch result lands
+            // and the "checking…" dots keep cycling.
+            if let Some(v) = self.updates_view.as_mut() { v.tick(); }
+            // Drive the convert-video dialog so its background ffmpeg
+            // result lands and the "encoding…" dots keep moving.
+            if let Some(v) = self.convert_video_view.as_mut() { v.tick(); }
+            // Reap the self-update worker if it's done — surfaces any
+            // failure to the user (success exits the process from inside
+            // the worker, so we'd never see a successful join here).
+            self.poll_update_job();
+        }
+
+        fn capture(&mut self, loop_target: &ActiveEventLoop) {
+            self.capture_after(loop_target, Duration::ZERO);
+        }
+
+        /// Fire a capture after a user-facing delay, then open the overlay
+        /// editor so the user can drag a region. Used by the plain "Capture
+        /// Screen" menu/hotkey path (delay = 0) and the "Capture after delay…"
+        /// submenu entries (3 / 5 / 10 s).
+        ///
+        /// During any countdown the tray's GTK main context is still pumped
+        /// (on Linux) so the icon stays responsive.
+        fn capture_after(&mut self, loop_target: &ActiveEventLoop, user_delay: Duration) {
+            self.capture_inner(loop_target, user_delay, true);
+        }
+
+        /// The capture hotkey: no tray menu is open, so there is nothing to
+        /// wait out and the screen freezes the moment the key goes down.
+        fn capture_from_hotkey(&mut self, loop_target: &ActiveEventLoop) {
+            self.capture_inner(loop_target, Duration::ZERO, false);
+        }
+
+        /// `settle`: wait for the tray menu to finish fading before the shot,
+        /// which only a capture started from that menu needs.
+        fn capture_inner(&mut self, loop_target: &ActiveEventLoop, user_delay: Duration, settle: bool) {
+            if self.capturing || self.overlay.is_some() { return; }
+            self.capturing = true;
+
+            if !user_delay.is_zero() {
+                eprintln!("Capturing in {} second{}…",
+                    user_delay.as_secs(),
+                    if user_delay.as_secs() == 1 { "" } else { "s" });
+                if let Some(t) = &self.tray { t.set_pending(true); }
+                let until = Instant::now() + user_delay;
+                let mut cancelled = false;
+                while Instant::now() < until {
+                    if let Some(t) = &self.tray {
+                        t.pump_events();
+                        // Drain pending tray events — if the user clicked
+                        // "Cancel pending capture", abort the countdown.
+                        if let TrayEvent::CancelPending = t.try_recv() {
+                            eprintln!("Cancel pending capture — aborting countdown.");
+                            cancelled = true;
+                            break;
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                if let Some(t) = &self.tray { t.set_pending(false); }
+                if cancelled { self.capturing = false; return; }
+            }
+
+            // Brief settle delay so the tray menu / flyout can fully dismiss
+            // before xcap shoots the desktop. On top of any user-facing delay.
+            //
+            // Windows needs more: the tray context menu has a fade-out
+            // animation (~200–400ms depending on SPI_GETMENUFADE), and if the
+            // click came through the hidden-icons chevron the whole
+            // NotifyIconOverflowWindow stays mapped until we dismiss it. We
+            // force both to close, then wait long enough for the fade to
+            // finish — otherwise the screenshot captures a ghost of the menu.
+            //
+            // The hotkey skips all of it: it was 700 ms of dead time between
+            // the key press and the frozen screen.
+            #[cfg(target_os = "windows")]
+            if settle {
+                dismiss_tray_flyouts();
+                std::thread::sleep(Duration::from_millis(700));
+            }
+            #[cfg(not(target_os = "windows"))]
+            if settle { std::thread::sleep(Duration::from_millis(250)); }
+
+            // Both failure arms are toasted, not just logged: the user pressed
+            // the hotkey and nothing appeared on screen, and stderr is not a
+            // surface a tray-resident app's user ever reads.
+            match capture_all_screens() {
+                Ok(shot) => {
+                    // Remember what desktop this selection is being dragged
+                    // over: if the user turns the capture into a recording via
+                    // the action row's Record button, that's what the rectangle
+                    // gets clamped against.
+                    self.overlay_desktop = Some(shot.desktop_bounds());
+                    self.pending_region_audio = None;
+                    // `shot.geometry()` carries the virtual-desktop origin and
+                    // the monitor list (in device pixels), so the overlay spans
+                    // every screen and maps the selection back to the pixels
+                    // the user actually dragged over. The capture's
+                    // logical/physical map travels with the frame too: on a
+                    // scaled display the bitmap is in device pixels and the
+                    // editor needs the mapping to hand a selection back to the
+                    // rest of the desktop.
+                    match Overlay::new(
+                        loop_target, shot.geometry(), shot.bitmap, self.settings.clone()) {
+                        Ok(mut ov) => {
+                            ov.set_display_map(shot.map);
+                            self.overlay = Some(ov);
+                        }
+                        Err(e) => {
+                            eprintln!("Overlay open failed: {e}");
+                            notify("Framefang — capture failed",
+                                &format!("The editor window wouldn't open: {e}"), true);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Capture failed: {e}");
+                    notify("Framefang — capture failed", &format!("{e}"), true);
+                }
+            }
+
+            self.capturing = false;
+        }
+
+        /// Tray -> "Record region": freeze the desktop, open the overlay as a
+        /// selection-only picker, and remember the audio sources so the commit
+        /// can start the recorder with them. The recording itself starts from
+        /// `start_region_from_selection` once the user confirms.
+        fn begin_region_recording(&mut self,
+                                  opts: framefang_platform::recorder::RecordingOptions,
+                                  loop_target: &ActiveEventLoop) {
+            if self.recorder.is_recording() {
+                notify("Framefang — already recording",
+                    "Stop the current recording before starting another one.", true);
+                return;
+            }
+            if self.capturing || self.overlay.is_some() { return; }
+            self.capturing = true;
+
+            // Same settle delay as `capture_after`: the tray menu has to be
+            // fully gone before the desktop is frozen, or the user drags their
+            // region over a ghost of the menu.
+            #[cfg(target_os = "windows")]
+            {
+                dismiss_tray_flyouts();
+                std::thread::sleep(Duration::from_millis(700));
+            }
+            #[cfg(not(target_os = "windows"))]
+            std::thread::sleep(Duration::from_millis(250));
+
+            match capture_all_screens() {
+                Ok(shot) => {
+                    self.overlay_desktop = Some(shot.desktop_bounds());
+                    self.pending_region_audio = Some(opts);
+                    match Overlay::new_for_region_record(
+                        loop_target, shot.geometry(), shot.bitmap, self.settings.clone())
+                    {
+                        Ok(mut ov) => {
+                            ov.set_display_map(shot.map);
+                            self.overlay = Some(ov);
+                        }
+                        Err(e) => {
+                            self.pending_region_audio = None;
+                            eprintln!("Region selector open failed: {e}");
+                            notify("Framefang — recording failed",
+                                &format!("The region selector wouldn't open: {e}"), true);
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Without a frozen desktop there is nothing to drag a
+                    // rectangle over, so this is a dead end rather than a
+                    // reason to fall back to a full-screen recording the user
+                    // didn't ask for.
+                    eprintln!("Region selector capture failed: {e}");
+                    notify("Framefang — recording failed",
+                        &format!("Couldn't read the screen to pick a region: {e}"), true);
+                }
+            }
+
+            self.capturing = false;
+        }
+
+        /// Turn a confirmed overlay selection into a live region recording.
+        ///
+        /// The selection is in virtual-screen device pixels (the overlay lifts
+        /// it out of frame space) — `record_rect_from_selection` clamps it to the desktop
+        /// the shot came from and rounds it to the even dimensions H.264 needs.
+        fn start_region_from_selection(&mut self,
+                                       selection: (i32, i32, i32, i32),
+                                       loop_target: &ActiveEventLoop) {
+            let opts = self.pending_region_audio.take()
+                .unwrap_or(framefang_platform::recorder::RecordingOptions::NONE);
+            let Some(bounds) = self.overlay_desktop else {
+                notify("Framefang — recording failed",
+                    "Lost track of the screen the region was picked on.", true);
+                return;
+            };
+            let Some(rect) = record_rect_from_selection(selection, bounds) else {
+                notify("Framefang — region too small",
+                    "Pick a larger area — a recording needs at least 16x16 pixels.", true);
+                return;
+            };
+            // The overlay window is already dropped, but the compositor still
+            // has to repaint what was under it. Starting the encoder in the
+            // same breath burns a dimmed frame (and the selection chrome) into
+            // the first moments of the video.
+            std::thread::sleep(Duration::from_millis(300));
+            self.start_recording(opts, loop_target, Some(rect));
+        }
+
+        /// One-click full-screen capture: grab the whole desktop and auto-save
+        /// it straight to the configured folder — no region selector, no editor.
+        /// The user gets a toast with the saved path since there's no overlay
+        /// to confirm against.
+        /// `settle`: wait out the tray menu's fade first. Only a capture
+        /// started from that menu needs it; the hotkey shoots at once.
+        fn capture_full_screen(&mut self, settle: bool) {
+            if self.capturing || self.overlay.is_some() { return; }
+            self.capturing = true;
+
+            // Same settle delay as capture_after so the tray menu / flyout fully
+            // dismisses before xcap shoots the desktop — otherwise the menu's
+            // fade-out ghost lands in the screenshot.
+            #[cfg(target_os = "windows")]
+            if settle {
+                dismiss_tray_flyouts();
+                std::thread::sleep(Duration::from_millis(700));
+            }
+            #[cfg(not(target_os = "windows"))]
+            if settle { std::thread::sleep(Duration::from_millis(250)); }
+
+            match capture_all_screens() {
+                Ok(shot) => {
+                    let img = shot.bitmap;
+                    if self.settings.auto_copy { self.copy_final(img.clone()); }
+                    match save_capture(&mut self.settings, &img) {
+                        Ok(path) => {
+                            eprintln!("Saved full screen {}", path.display());
+                            notify("Framefang — full screen saved",
+                                &format!("{}", path.display()), false);
+                        }
+                        Err(e) => {
+                            eprintln!("Save failed: {e}");
+                            notify("Framefang — screenshot not saved", &format!("{e}"), true);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Capture failed: {e}");
+                    notify("Framefang — capture failed", &format!("{e}"), true);
+                }
+            }
+
+            self.capturing = false;
+        }
+
+        /// Persist a final image (already cropped to the user's selection in
+        /// the overlay editor) to the configured save directory.
+        ///
+        /// Notifies on both outcomes, like `capture_full_screen`: the overlay
+        /// has already closed by the time this runs, so the toast naming the
+        /// path is the only confirmation the shot landed anywhere — and a
+        /// failed write used to look exactly like a successful one.
+        fn save_final(&mut self, img: image::ImageBuffer<image::Rgba<u8>, Vec<u8>>) {
+            match save_capture(&mut self.settings, &img) {
+                Ok(path) => {
+                    eprintln!("Saved {}", path.display());
+                    notify("Framefang — screenshot saved",
+                        &format!("{}", path.display()), false);
+                }
+                Err(e) => {
+                    eprintln!("Save failed: {e}");
+                    notify("Framefang — screenshot not saved", &format!("{e}"), true);
+                }
+            }
+        }
+
+        /// Push the final cropped image into the system clipboard. Uses
+        /// arboard, which speaks the right protocol on every platform (X11
+        /// selection on Linux, NSPasteboard on macOS, OpenClipboard on
+        /// Windows). On Linux arboard runs a background thread to keep the
+        /// selection alive while the source process exits — that's fine
+        /// because Framefang stays resident. The pasted bitmap is exactly what
+        /// `save_final` writes to disk.
+        ///
+        /// Both failure arms toast. Copy is a dead end when it fails — the
+        /// bitmap is dropped here and never reaches the save folder — so a
+        /// silent stderr line meant the user pasted stale clipboard contents
+        /// and never learned the shot was gone.
+        fn copy_final(&mut self, img: image::ImageBuffer<image::Rgba<u8>, Vec<u8>>) {
+            let (w, h) = (img.width() as usize, img.height() as usize);
+            let bytes  = img.into_raw();
+            match arboard::Clipboard::new() {
+                Ok(mut clip) => {
+                    let data = arboard::ImageData {
+                        width:  w,
+                        height: h,
+                        bytes:  std::borrow::Cow::Owned(bytes),
+                    };
+                    if let Err(e) = clip.set_image(data) {
+                        eprintln!("Clipboard copy failed: {e}");
+                        notify("Framefang — copy failed",
+                            &framefang_core::failure::clipboard_failure(&e.to_string()), true);
+                    } else {
+                        eprintln!("Copied {w}×{h} to clipboard");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Clipboard unavailable: {e}");
+                    notify("Framefang — copy failed",
+                        &framefang_core::failure::clipboard_failure(&e.to_string()), true);
+                }
+            }
+        }
+
+        /// One binding, both ends of a take: start a recording, or stop the
+        /// one that's already running.
+        ///
+        /// Starts with no audio, matching the plain "Record" menu row the
+        /// hotkey is advertised on. The three audio variants stay menu-only —
+        /// a single toggle has no way to ask which sources the user wants,
+        /// and silently picking one would make the same key produce different
+        /// files on different days.
+        fn toggle_recording(&mut self, loop_target: &ActiveEventLoop) {
+            if self.recorder.is_recording() {
+                self.stop_recording();
+            } else {
+                self.start_recording(
+                    framefang_platform::recorder::RecordingOptions::NONE, loop_target, None);
+            }
+        }
+
+        /// Start recording. Output lands in the user's Videos directory (or a
+        /// fallback) as `framefang_<timestamp>.mp4`. Shows a desktop notification
+        /// AND spawns a floating control window with a flashing red dot +
+        /// timer + STOP button so the user has a one-click stop without hunting
+        /// through the tray menu.
+        ///
+        /// `region` is `None` for the whole desktop, or the rectangle the user
+        /// picked in the overlay. Audio is wired identically either way — the
+        /// rectangle only narrows the video input.
+        fn start_recording(&mut self,
+                           opts: framefang_platform::recorder::RecordingOptions,
+                           loop_target: &ActiveEventLoop,
+                           region: Option<CaptureRect>) {
+            // Reachable from the overlay's Record button, which is offered
+            // in every capture session — including one opened while a
+            // recording is running — so this has to say so, not just log.
+            if self.recorder.is_recording() {
+                notify("Framefang — already recording",
+                    "Stop the current recording before starting another one.", true);
+                return;
+            }
+            let dir   = recordings_directory_for(&self.settings);
+            let stamp = Local::now().format("%Y%m%d_%H%M%S");
+            let out   = dir.join(format!("framefang_{stamp}.mp4"));
+            match self.recorder.start_region(out.clone(), opts, region) {
+                Ok(effective) => {
+                    // Describe what's actually in the file, not what the menu
+                    // row asked for: audio capture is best-effort, so a box
+                    // with no reachable audio server still records video, and
+                    // promising a mic track that isn't there is worse than
+                    // recording without one.
+                    let audio_label = audio_label_for(effective);
+                    let dropped     = audio_downgrade_note(opts, effective);
+                    let scope       = match region {
+                        Some(r) => format!("{}x{} region", r.width, r.height),
+                        None    => "full screen".to_string(),
+                    };
+                    eprintln!("Recording {scope} ({audio_label}) → {}", out.display());
+                    if let Some(t) = &self.tray { t.set_recording(true); }
+                    // Float a small flashing control panel so the user can stop
+                    // the recording without opening the tray menu. Place it
+                    // clear of the recorded rectangle: on Windows / macOS the
+                    // panel excludes itself from screen capture anyway, but
+                    // keeping it off the region also stops it covering the very
+                    // thing being recorded.
+                    //
+                    // X11 has no capture-exclusion API, so there the panel is
+                    // only safe when it lands entirely outside the recorded
+                    // rectangle — which a region recording usually allows and a
+                    // full-screen one never does. Wayland is worse: the
+                    // compositor ignores the position we ask for, so "outside
+                    // the rectangle" is a wish, not a fact, and the ScreenCast
+                    // path has no exclusion either — no panel there at all.
+                    // Best-effort either way: log + carry on if the OS won't
+                    // give us another window.
+                    let place = indicator_placement(
+                        self.indicator_bounds(loop_target, region),
+                        region,
+                        crate::recording_indicator::SIZE,
+                        24,
+                    );
+                    let capture_safe = cfg!(not(target_os = "linux"))
+                        || (region.is_some() && place.clear_of_region
+                            && !framefang_platform::session::is_wayland());
+                    if capture_safe {
+                        match RecordingIndicator::new_at(loop_target, (place.x, place.y)) {
+                            Ok(v)  => self.recording_view = Some(v),
+                            Err(e) => eprintln!("Recording indicator failed: {e} — stop via tray menu."),
+                        }
+                    } else if cfg!(target_os = "linux") {
+                        eprintln!("Recording indicator skipped on Linux (it would be captured) — stop via tray menu.");
+                    }
+                    let stop_hint = if self.recording_view.is_some() {
+                        "Click the floating STOP button (it won't appear in the video) or use the tray menu to finish."
+                    } else {
+                        "Use the tray menu to finish."
+                    };
+                    notify("Framefang — recording started",
+                        &format!("{scope} - {audio_label}{dropped}\nSaving to {}\n\n{stop_hint}",
+                            out.display()),
+                        true);
+                }
+                Err(e) => {
+                    eprintln!("Recording failed to start: {e}");
+                    // Do NOT block the event loop: a synchronous modal here
+                    // freezes the capture hotkey + tray until it's dismissed.
+                    // On Windows the error modal runs on its own thread
+                    // (MessageBoxW is thread-safe and modal only to that
+                    // thread), so capture keeps working while it's up; other
+                    // platforms (GTK/AppKit dialogs are main-thread-only) get
+                    // the non-blocking toast instead.
+                    let msg = format!("{e}");
+                    #[cfg(target_os = "windows")]
+                    {
+                        std::thread::spawn(move || {
+                            rfd::MessageDialog::new()
+                                .set_level(rfd::MessageLevel::Error)
+                                .set_title("Framefang — recording failed")
+                                .set_description(msg)
+                                .show();
+                        });
+                    }
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        notify("Framefang — recording failed", &msg, true);
+                    }
+                }
+            }
+        }
+
+        /// The desktop rectangle the REC indicator is positioned within.
+        ///
+        /// A region was picked on a known desktop, so dodging it has to happen
+        /// inside that same desktop. Without a region there is nothing to
+        /// dodge, and the panel keeps its long-standing home in the primary
+        /// monitor's top-right corner.
+        fn indicator_bounds(&self,
+                            loop_target: &ActiveEventLoop,
+                            region: Option<CaptureRect>) -> DesktopBounds {
+            if region.is_some() {
+                if let Some(b) = self.overlay_desktop { return b; }
+            }
+            let size = loop_target.primary_monitor()
+                .or_else(|| loop_target.available_monitors().next())
+                .map(|m| m.size())
+                .unwrap_or(winit::dpi::PhysicalSize::new(1920, 1080));
+            DesktopBounds::new(0, 0, size.width, size.height)
+        }
+
+        /// Stop the active recording, finalize the file, and tear down the
+        /// floating indicator if one is present.
+        fn stop_recording(&mut self) {
+            // Grabbed before `stop()` consumes it: when finalizing fails the
+            // clip is often still on disk and playable, and this is the only
+            // handle left to offer it to "Annotate last recording".
+            let pending = self.recorder.output_path().map(|p| p.to_path_buf());
+            match self.recorder.stop() {
+                Ok(path) => {
+                    eprintln!("Saved recording {}", path.display());
+                    if let Some(t) = &self.tray { t.set_recording(false); }
+                    notify("Framefang — recording saved",
+                        &format!("{}\n\nTray → \"Annotate last recording\" to draw on it.", path.display()),
+                        false);
+                    self.last_recording = Some(path);
+                }
+                Err(e) => {
+                    eprintln!("Stop recording failed: {e}");
+                    if let Some(t) = &self.tray { t.set_recording(false); }
+                    // A killed encoder still leaves bytes behind, and the error
+                    // text now names the file — so make the menu able to reach
+                    // it. Anything empty or missing is not offered: those are
+                    // the failures where there is genuinely nothing to open.
+                    if let Some(p) = pending.filter(|p| {
+                        std::fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false)
+                    }) {
+                        self.last_recording = Some(p);
+                    }
+                    // Surface it — a recording the user thought was running
+                    // produced no usable file. Same non-blocking pattern as
+                    // start_recording: threaded modal on Windows, toast elsewhere.
+                    let msg = format!("{e}");
+                    #[cfg(target_os = "windows")]
+                    {
+                        std::thread::spawn(move || {
+                            rfd::MessageDialog::new()
+                                .set_level(rfd::MessageLevel::Error)
+                                .set_title("Framefang — recording not saved")
+                                .set_description(msg)
+                                .show();
+                        });
+                    }
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        notify("Framefang — recording not saved", &msg, true);
+                    }
+                }
+            }
+            self.recording_view = None;
+        }
+
+        /// Tray → "Annotate last recording": open the most recent clip in
+        /// the editor. ffmpeg extracts the first frame at video resolution,
+        /// the user draws on it with the normal tools, and `commit` hands
+        /// back an annotations-only transparent overlay that
+        /// `burn_annotations` composites over the whole clip.
+        fn annotate_last_recording(&mut self, loop_target: &ActiveEventLoop) {
+            if self.capturing || self.overlay.is_some() { return; }
+            if self.recorder.is_recording() {
+                notify("Framefang — annotate", "Stop the current recording first.", true);
+                return;
+            }
+            let video = match self.last_recording.clone().filter(|p| p.exists())
+                .or_else(|| newest_recording(&recordings_directory_for(&self.settings)))
+            {
+                Some(p) => p,
+                None => {
+                    notify("Framefang — annotate",
+                        "No recording found — record something first.", true);
+                    return;
+                }
+            };
+            let frame = match extract_first_frame(&video) {
+                Ok(f) => f,
+                Err(e) => {
+                    notify("Framefang — annotate failed", &format!("{e}"), true);
+                    return;
+                }
+            };
+            // Clip length feeds the editor's timeline. A parse failure
+            // (Duration: N/A) just hides the timeline — annotate still
+            // works as the static whole-clip editor.
+            let duration = match probe_duration(&video) {
+                Ok(d)  => Some(d),
+                Err(e) => { eprintln!("framefang: duration probe failed: {e}"); None }
+            };
+            match Overlay::new_for_video(loop_target, frame, self.settings.clone(),
+                                         video.clone(), duration) {
+                Ok(ov) => {
+                    self.overlay        = Some(ov);
+                    self.video_annotate = Some(video);
+                }
+                Err(e) => notify("Framefang — annotate failed", &format!("{e}"), true),
+            }
+        }
+
+        /// Compose the per-window overlays from the editor's commit payload
+        /// and burn them over `video`, each gated to its own time window
+        /// (the untimed default is a single whole-clip overlay). Both steps
+        /// run on a background thread — composition spawns one ffmpeg seek
+        /// per distinct window start and re-encoding a long clip can take a
+        /// while; neither may freeze the tray/hotkey loop — and notifies on
+        /// completion. The annotated copy lands next to the original as
+        /// `<stem>_annotated.mp4`; the original is untouched.
+        fn burn_annotations(&mut self, video: PathBuf, commit: VideoCommit) {
+            let Some(ffmpeg) = crate::convert_video_form::locate_ffmpeg() else {
+                notify("Framefang — annotate failed",
+                    "ffmpeg not found — bundle it next to framefang or install it on PATH.",
+                    true);
+                return;
+            };
+            let out = annotated_output_path(&video);
+            notify("Framefang — annotating recording",
+                &format!("Re-encoding with your annotations…\n→ {}", out.display()),
+                false);
+            std::thread::spawn(move || {
+                let overlays = crate::editor::compose_overlay_groups(&commit, &video);
+                match run_annotation_burn(&ffmpeg, &video, &overlays, &out) {
+                    Ok(()) => notify("Framefang — annotated recording saved",
+                        &out.display().to_string(), false),
+                    Err(e) => notify("Framefang — annotate failed", &format!("{e}"), true),
+                }
+            });
+        }
+
+        /// Open the configured screenshot save directory in the user's
+        /// default file manager (xdg-open / open / Explorer). Mirrors C#
+        /// `TrayContext.OpenSaveFolder` so the tray menu item lands the
+        /// user where their screenshots actually live.
+        fn open_save_folder(&self) {
+            let dir = save_directory(&self.settings);
+            open_url(&dir.to_string_lossy());
+        }
+
+        fn open_recordings_folder(&self) {
+            let dir = recordings_directory_for(&self.settings);
+            std::fs::create_dir_all(&dir).ok();
+            open_url(&dir.to_string_lossy());
+        }
+
+        /// Open the native Settings dialog. Replaces the prior
+        /// rfd-MessageDialog kludge with a real custom view that supports
+        /// path pickers, toggle pills, hotkey rebinding and a theme cycle
+        /// control. The view is
+        /// constructed lazily so the GTK/Wayland surface only spins up when
+        /// the user actually clicks "Settings…". A second click while the
+        /// dialog is open just raises focus to the existing window.
+        fn show_settings(&mut self, loop_target: &ActiveEventLoop) {
+            if self.settings_view.is_some() { return; }
+            // Unregister the global hotkey while Settings is open so the
+            // rebind capture widget can receive the user's keystrokes
+            // (including the current PrintScreen) without triggering a
+            // capture. The hotkey is re-registered when the dialog closes,
+            // whether the user Saves or Cancels.
+            if let Some(hk) = self.hotkeys.as_mut() {
+                hk.unregister_all();
+            }
+            match SettingsView::new(loop_target, self.settings.clone()) {
+                Ok(view) => self.settings_view = Some(view),
+                Err(e)   => {
+                    eprintln!("Settings dialog failed to open: {e}");
+                    // Window failed to open — re-register the hotkeys so
+                    // the user isn't stranded with capture disabled.
+                    if let Some(hk) = self.hotkeys.as_mut() {
+                        apply_hotkeys(hk, &self.settings);
+                    }
+                }
+            }
+        }
+
+        /// Called from the window event router after the settings dialog
+        /// produces an outcome. `Saved` persists + re-registers the hotkey +
+        /// refreshes the tooltip; `Cancelled` drops the draft; `OpenJson`
+        /// opens settings.json and leaves the dialog open.
+        fn apply_settings_outcome(&mut self, outcome: SettingsOutcome) -> bool {
+            match outcome {
+                SettingsOutcome::Saved(new) => {
+                    self.settings = new;
+                    crate::palette::set(crate::palette::Scheme::parse(&self.settings.theme));
+                    if let Err(e) = self.settings.save() {
+                        eprintln!("Failed to persist settings: {e}");
+                        notify("Framefang — settings not saved",
+                            &framefang_core::failure::settings_write_failure(&e.to_string()), true);
+                    }
+                    if let Some(hk) = self.hotkeys.as_mut() {
+                        // A rebind the user just performed by hand is the
+                        // one failure they will definitely notice and least
+                        // expect an explanation for — on the portal backend
+                        // it can be refused outright. Say so where they are
+                        // looking, not on stderr.
+                        for (action, e) in apply_hotkeys(hk, &self.settings) {
+                            notify("Framefang — couldn't set that shortcut",
+                                   &format!("{}: {e}", action.label()), true);
+                        }
+                    }
+                    // Every surface that quotes a hotkey — the hover tooltip
+                    // and the menu rows — is rebuilt in place, so a rebind is
+                    // visible without restarting the app.
+                    if let Some(t) = &self.tray {
+                        if let Err(e) = t.set_tooltip(&tray_tooltip(&self.settings)) {
+                            eprintln!("Tray tooltip update failed: {e}");
+                        }
+                        t.set_hotkey_labels(&menu_labels(&self.settings, self.portal_hotkey));
+                    }
+                    true
+                }
+                SettingsOutcome::Cancelled => {
+                    // The Theme chips preview live; cancelling puts the saved
+                    // scheme back.
+                    crate::palette::set(crate::palette::Scheme::parse(&self.settings.theme));
+                    // No persistence, but `show_settings` unregistered the
+                    // global hotkeys on open — re-register the previous
+                    // bindings so the user can capture again.
+                    if let Some(hk) = self.hotkeys.as_mut() {
+                        apply_hotkeys(hk, &self.settings);
+                    }
+                    true
+                }
+                SettingsOutcome::OpenJson => {
+                    if let Some(p) = AppSettings::settings_path() {
+                        // Ensure the file exists so the editor has something
+                        // to open; create it from current draft if missing.
+                        if !p.exists() {
+                            let _ = self.settings.save();
+                        }
+                        open_url(&p.to_string_lossy());
+                    }
+                    false
+                }
+            }
+        }
+
+        /// Themed About modal — mirrors the brand chrome of Settings.
+        /// Lazily constructed; a second tray-click while the dialog is
+        /// open is a no-op.
+        fn show_about(&mut self, loop_target: &ActiveEventLoop) {
+            if self.about_view.is_some() { return; }
+            match AboutView::new(loop_target) {
+                Ok(v)  => self.about_view = Some(v),
+                Err(e) => eprintln!("About dialog failed to open: {e}"),
+            }
+        }
+
+        /// Put the welcome window up on the first launch, once.
+        ///
+        /// Sequenced after `ensure_tray` on purpose: the window's whole job is
+        /// to point at the tray icon, so it must not open before the icon
+        /// exists. When the tray failed to build, `ensure_tray` has already
+        /// raised the About window as the fallback surface and closing that
+        /// one quits — stacking a second window on top of it would only give
+        /// the user two things to dismiss and one misleading instruction.
+        fn maybe_show_first_run(&mut self, loop_target: &ActiveEventLoop) {
+            if !self.first_run || !self.tray_built { return; }
+            self.first_run = false;
+            if self.tray.is_none() { return; }
+            let save_dir = save_directory(&self.settings).to_string_lossy().to_string();
+            match FirstRunView::new(loop_target,
+                                    &self.settings.hotkey().describe(),
+                                    &save_dir,
+                                    self.wayland) {
+                Ok(v)  => self.firstrun_view = Some(v),
+                Err(e) => eprintln!("Welcome window failed to open: {e}"),
+            }
+        }
+
+        /// Themed Check-for-updates modal. Spins up a background curl on
+        /// open and shows the installed + latest tag side-by-side once the
+        /// fetch resolves. The "Open releases page" button always works
+        /// even if the fetch fails.
+        fn show_updates(&mut self, loop_target: &ActiveEventLoop) {
+            if self.updates_view.is_some() { return; }
+            match UpdatesView::new(loop_target) {
+                Ok(v)  => self.updates_view = Some(v),
+                Err(e) => eprintln!("Updates dialog failed to open: {e}"),
+            }
+        }
+
+        /// Open the themed image-conversion dialog. Lazy-constructed; a
+        /// second click while it's already open is a no-op so the user
+        /// can't accidentally stack windows.
+        fn show_convert_image(&mut self, loop_target: &ActiveEventLoop) {
+            if self.convert_image_view.is_some() { return; }
+            match ConvertImageView::new(loop_target) {
+                Ok(v)  => self.convert_image_view = Some(v),
+                Err(e) => eprintln!("Convert-image dialog failed to open: {e}"),
+            }
+        }
+
+        fn show_convert_video(&mut self, loop_target: &ActiveEventLoop) {
+            if self.convert_video_view.is_some() { return; }
+            match ConvertVideoView::new(loop_target) {
+                Ok(v)  => self.convert_video_view = Some(v),
+                Err(e) => eprintln!("Convert-video dialog failed to open: {e}"),
+            }
+        }
+
+        /// Kick off the in-process self-updater. The actual work runs on
+        /// a worker thread spawned by `self_updater::download_and_install`;
+        /// we just stash the join handle and poll it from `poll()`. On
+        /// success the worker calls `exit(0)` so the new binary takes
+        /// over — control here only returns on failure.
+        ///
+        /// While the job runs we close the updates dialog so the user
+        /// gets a visible "something is happening" via stderr / the new
+        /// binary taking over the tray. A future PR can wire a progress
+        /// modal here using the `on_progress` callback.
+        fn start_self_update(&mut self, asset_url: String, expected_sha256: Option<String>) {
+            if self.update_job.is_some() {
+                eprintln!("self-updater: an update is already in progress");
+                return;
+            }
+            // Drop the updates dialog so the user sees the app idle while
+            // we work; the relaunched binary will pick up where we left off.
+            self.updates_view = None;
+
+            // Desktop notification so the silent download (no progress modal
+            // yet) doesn't look like a no-op — the app relaunches a few
+            // seconds later when the swap completes.
+            notify(
+                "Framefang is updating",
+                "Downloading the new version. Framefang will restart automatically when it's ready.",
+                false,
+            );
+
+            eprintln!(
+                "self-updater: downloading {asset_url} (verify_sha256 = {})",
+                if expected_sha256.is_some() { "yes" } else { "no — skipping" }
+            );
+
+            let job = self_updater::download_and_install(
+                asset_url,
+                expected_sha256,
+                |downloaded, total| {
+                    // Progress callback runs on the worker thread; we
+                    // can't touch winit state from here. Cheap stderr
+                    // line is enough until we add a transient modal.
+                    match total {
+                        Some(t) if t > 0 => {
+                            eprintln!("self-updater: {downloaded} / {t} bytes");
+                        }
+                        _ => eprintln!("self-updater: {downloaded} bytes"),
+                    }
+                },
+            );
+            self.update_job = Some(job);
+        }
+
+        /// Pump the update-job handle. If it's finished, take the result
+        /// — a success arm here actually means the worker thread *failed*
+        /// after the relaunch, because on a real success the worker
+        /// calls `exit(0)` and never lets the JoinHandle resolve.
+        fn poll_update_job(&mut self) {
+            let finished = self.update_job
+                .as_ref()
+                .map(|h| h.is_finished())
+                .unwrap_or(false);
+            if !finished { return; }
+            let job = self.update_job.take().unwrap();
+            match job.join() {
+                Ok(Ok(())) => {
+                    // Reachable only if `spawn_and_exit` was prevented from
+                    // exiting — shouldn't happen, but log instead of panic.
+                    eprintln!("self-updater: job returned Ok without exiting");
+                }
+                Ok(Err(msg)) => {
+                    eprintln!("self-updater: failed: {msg}");
+                    rfd::MessageDialog::new()
+                        .set_level(rfd::MessageLevel::Error)
+                        .set_title("Framefang — update failed")
+                        .set_description(msg)
+                        .show();
+                }
+                Err(_) => {
+                    eprintln!("self-updater: worker thread panicked");
+                }
+            }
+        }
+    }
+
+    impl ApplicationHandler for TrayApp {
+        fn resumed(&mut self, loop_target: &ActiveEventLoop) {
+            // Earliest point at which the platform event loop is guaranteed to
+            // be running, which is what the tray status item needs.
+            self.ensure_tray(loop_target);
+        }
+
+        fn window_event(&mut self, _loop_target: &ActiveEventLoop, id: WindowId, ev: WindowEvent) {
+            // Route the event into the overlay editor if it owns the window.
+            // Anything else (close-requested on a phantom window, stray events
+            // from a destroyed surface) is silently dropped.
+            // Decide the routing target *before* consuming the event so we
+            // only dispatch once. Overlay wins if it owns the id; otherwise
+            // search the pinned-window list.
+            enum Target { Overlay, Pinned(usize), Settings, Recording, About, FirstRun, Updates, ConvertImage, ConvertVideo, Unknown }
+            let target = if self.overlay.as_ref().map(|ov| ov.window_id() == id).unwrap_or(false) {
+                Target::Overlay
+            } else if self.settings_view.as_ref().map(|s| s.window_id() == id).unwrap_or(false) {
+                Target::Settings
+            } else if self.recording_view.as_ref().map(|r| r.window_id() == id).unwrap_or(false) {
+                Target::Recording
+            } else if self.about_view.as_ref().map(|a| a.window_id() == id).unwrap_or(false) {
+                Target::About
+            } else if self.firstrun_view.as_ref().map(|f| f.window_id() == id).unwrap_or(false) {
+                Target::FirstRun
+            } else if self.updates_view.as_ref().map(|u| u.window_id() == id).unwrap_or(false) {
+                Target::Updates
+            } else if self.convert_image_view.as_ref().map(|c| c.window_id() == id).unwrap_or(false) {
+                Target::ConvertImage
+            } else if self.convert_video_view.as_ref().map(|c| c.window_id() == id).unwrap_or(false) {
+                Target::ConvertVideo
+            } else if let Some((i, _)) = self.pinned.iter().enumerate().find(|(_, p)| p.window_id() == id) {
+                Target::Pinned(i)
+            } else {
+                Target::Unknown
+            };
+
+            let mut drop_overlay = false;
+            let mut accepted:     Option<image::ImageBuffer<image::Rgba<u8>, Vec<u8>>> = None;
+            let mut accepted_video: Option<VideoCommit> = None;
+            let mut copied:       Option<image::ImageBuffer<image::Rgba<u8>, Vec<u8>>> = None;
+            let mut pinned_payload: Option<(image::ImageBuffer<image::Rgba<u8>, Vec<u8>>, (i32, i32))> = None;
+            let mut record_region: Option<(i32, i32, i32, i32)> = None;
+            let mut chosen: Option<Box<ChosenRegion>> = None;
+            let mut drop_pin: Option<usize> = None;
+            let mut settings_outcome: Option<SettingsOutcome> = None;
+
+            match target {
+                Target::Overlay => {
+                    if let Some(ov) = self.overlay.as_mut() {
+                        match ov.handle_event(ev) {
+                            OverlayOutcome::Continue        => {}
+                            OverlayOutcome::Cancelled       => { drop_overlay = true; }
+                            OverlayOutcome::Accepted(img)   => { drop_overlay = true; accepted = Some(img); }
+                            OverlayOutcome::AcceptedVideo(commit) => { drop_overlay = true; accepted_video = Some(commit); }
+                            OverlayOutcome::Copied(img)     => { drop_overlay = true; copied   = Some(img); }
+                            OverlayOutcome::CopiedOpen(img) => { copied = Some(img); }
+                            OverlayOutcome::Pinned(img, p)  => { drop_overlay = true; pinned_payload = Some((img, p)); }
+                            OverlayOutcome::RecordRegion(r) => { drop_overlay = true; record_region = Some(r); }
+                            OverlayOutcome::Chosen(c)       => { drop_overlay = true; chosen = Some(c); }
+                        }
+                    }
+                }
+                Target::Settings => {
+                    if let Some(view) = self.settings_view.as_mut() {
+                        view.handle_event(ev);
+                        if let Some(out) = view.outcome.take() {
+                            settings_outcome = Some(out);
+                        }
+                    }
+                }
+                Target::Recording => {
+                    let mut stop_now = false;
+                    if let Some(view) = self.recording_view.as_mut() {
+                        view.handle_event(ev);
+                        stop_now = view.stop_requested;
+                    }
+                    if stop_now { self.stop_recording(); }
+                }
+                Target::About => {
+                    let mut outcome: Option<AboutOutcome> = None;
+                    if let Some(view) = self.about_view.as_mut() {
+                        view.handle_event(ev);
+                        outcome = view.outcome.take();
+                    }
+                    if let Some(o) = outcome {
+                        match o {
+                            AboutOutcome::Closed => {
+                                self.about_view = None;
+                                // When the tray failed to build, this window
+                                // was the app's only visible surface and the
+                                // tray's Exit item — the sole exit path in the
+                                // crate — doesn't exist. Dismissing it has to
+                                // quit, or the process lingers unkillable from
+                                // the UI.
+                                if self.tray_built && self.tray.is_none() {
+                                    _loop_target.exit();
+                                }
+                            }
+                            AboutOutcome::OpenProject => open_url("https://github.com/winters27/framefang"),
+                            AboutOutcome::OpenAuthor  => open_url("https://github.com/winters27"),
+                            AboutOutcome::OpenUpdates => {
+                                self.about_view = None;
+                                self.show_updates(_loop_target);
+                                // Handing the fallback surface over to the
+                                // Updates dialog only works if that dialog
+                                // actually opened; if it didn't, nothing is
+                                // left on screen to quit from.
+                                if self.tray_built && self.tray.is_none()
+                                    && self.updates_view.is_none() {
+                                    _loop_target.exit();
+                                }
+                            }
+                        }
+                    }
+                }
+                Target::FirstRun => {
+                    let mut outcome: Option<FirstRunOutcome> = None;
+                    if let Some(view) = self.firstrun_view.as_mut() {
+                        view.handle_event(ev);
+                        outcome = view.outcome.take();
+                    }
+                    // Dismissing the welcome window leaves the app running in
+                    // the tray — that is the whole point of the window.
+                    if matches!(outcome, Some(FirstRunOutcome::Closed)) {
+                        self.firstrun_view = None;
+                    }
+                }
+                Target::Updates => {
+                    let mut outcome: Option<UpdatesOutcome> = None;
+                    if let Some(view) = self.updates_view.as_mut() {
+                        view.handle_event(ev);
+                        outcome = view.outcome.take();
+                    }
+                    if let Some(o) = outcome {
+                        match o {
+                            UpdatesOutcome::Closed => {
+                                self.updates_view = None;
+                                // Same last-surface rule as the About window:
+                                // reaching here from the no-tray fallback (About
+                                // -> "Check for updates" closes About) leaves
+                                // this dialog as the only way to reach the
+                                // process, so dismissing it has to quit.
+                                if self.tray_built && self.tray.is_none()
+                                    && self.about_view.is_none() {
+                                    _loop_target.exit();
+                                }
+                            }
+                            UpdatesOutcome::OpenReleases => open_url("https://github.com/winters27/framefang/releases"),
+                            UpdatesOutcome::OpenAsset(url) => open_url(&url),
+                            UpdatesOutcome::DownloadAndInstall { asset_url, expected_sha256 } => {
+                                self.start_self_update(asset_url, expected_sha256);
+                            }
+                            // Package-managed install (Snap, Flatpak, brew,
+                            // deb/rpm/AUR, Scoop): the dialog offered the
+                            // upgrade command instead of a download, so all
+                            // we do is put it on the clipboard.
+                            UpdatesOutcome::CopyCommand(cmd) => {
+                                match framefang_platform::copy_text(&cmd) {
+                                    Ok(()) => notify("Update command copied", &cmd, false),
+                                    // The command is the only thing this
+                                    // dialog offers on a package-managed
+                                    // install, so a failed copy must still
+                                    // show it somewhere the user can read.
+                                    Err(e) => notify("Framefang — copy failed",
+                                        &format!("Couldn't copy the update command to the clipboard: {e}\n\nRun this yourself:\n{cmd}"),
+                                        true),
+                                }
+                            }
+                        }
+                    }
+                }
+                Target::ConvertImage => {
+                    let mut outcome: Option<ConvertImageOutcome> = None;
+                    if let Some(view) = self.convert_image_view.as_mut() {
+                        view.handle_event(ev);
+                        outcome = view.outcome.take();
+                    }
+                    if matches!(outcome, Some(ConvertImageOutcome::Closed)) {
+                        self.convert_image_view = None;
+                    }
+                }
+                Target::ConvertVideo => {
+                    let mut outcome: Option<ConvertVideoOutcome> = None;
+                    if let Some(view) = self.convert_video_view.as_mut() {
+                        view.handle_event(ev);
+                        outcome = view.outcome.take();
+                    }
+                    if matches!(outcome, Some(ConvertVideoOutcome::Closed)) {
+                        self.convert_video_view = None;
+                    }
+                }
+                Target::Pinned(i) => {
+                    if let Some(p) = self.pinned.get_mut(i) {
+                        if p.handle_event(ev) {
+                            drop_pin = Some(i);
+                        }
+                    }
+                }
+                Target::Unknown => {}
+            }
+
+            if drop_overlay {
+                // Pull back any per-tool slider values the editor mutated
+                // (currently just `marker_opacity`) so the next capture
+                // session opens with the same value. The editor already
+                // persisted it to settings.json on mouseup; this keeps the
+                // tray's in-memory copy aligned.
+                if let Some(ov) = self.overlay.as_ref() {
+                    self.settings.marker_opacity = ov.settings().marker_opacity;
+                    self.settings.last_thickness = ov.settings().last_thickness;
+                    self.settings.last_text_size = ov.settings().last_text_size;
+                    self.settings.pixelate_block = ov.settings().pixelate_block;
+                    self.settings.tool_styles    = ov.settings().tool_styles.clone();
+                    self.settings.last_tool      = ov.settings().last_tool.clone();
+                    self.settings.palette_index  = ov.settings().palette_index;
+                }
+                self.overlay = None;
+                // A cancelled region-selection session must not leave its audio
+                // choice armed for whatever overlay commits next.
+                if record_region.is_none() { self.pending_region_audio = None; }
+                // A video-annotate session ends with its overlay. Only
+                // `AcceptedVideo` carries the burn payload (routed below) —
+                // Cancelled / Copied / Pinned just end the session.
+                if accepted.is_none() && accepted_video.is_none() { self.video_annotate = None; }
+            }
+            if let Some(i) = drop_pin { self.pinned.swap_remove(i); }
+            // The picker let go of the desktop; the picture opens in its own
+            // editor window where it was on screen.
+            if let Some(c) = chosen {
+                // Auto-copy: the picked region is on the clipboard before the
+                // editor even opens.
+                if self.settings.auto_copy { self.copy_final(c.picture.clone()); }
+                match Overlay::new_for_editor(_loop_target, *c, self.settings.clone()) {
+                    Ok(ov) => self.overlay = Some(ov),
+                    Err(e) => {
+                        eprintln!("Editor open failed: {e}");
+                        notify("Framefang — capture failed",
+                            &format!("The editor window wouldn't open: {e}"), true);
+                    }
+                }
+            }
+            if let Some(commit) = accepted_video {
+                if let Some(video) = self.video_annotate.take() {
+                    self.burn_annotations(video, commit);
+                }
+            }
+            if let Some(img) = accepted {
+                // Screenshot path only — video commits arrive as AcceptedVideo.
+                // Auto-copy: the finished picture replaces the raw one copied
+                // when the region was picked.
+                if self.settings.auto_copy { self.copy_final(img.clone()); }
+                self.save_final(img);
+            }
+            if let Some(img) = copied   { self.copy_final(img); }
+            if let Some((img, pos)) = pinned_payload {
+                if self.settings.auto_copy { self.copy_final(img.clone()); }
+                match PinView::new(_loop_target, img, pos) {
+                    Ok(pv)  => self.pinned.push(pv),
+                    Err(e)  => {
+                        eprintln!("Pin failed: {e}");
+                        notify("Framefang — pin failed",
+                            &framefang_core::failure::pin_failure(&e.to_string()), true);
+                    }
+                }
+            }
+            if let Some(out) = settings_outcome {
+                let close = self.apply_settings_outcome(out);
+                if close { self.settings_view = None; }
+            }
+            // Last, so the overlay window is already dropped: the encoder must
+            // not catch the dimmed selection surface in its first frames.
+            if let Some(rect) = record_region {
+                self.start_region_from_selection(rect, _loop_target);
+            }
+        }
+
+        fn about_to_wait(&mut self, loop_target: &ActiveEventLoop) {
+            // Backstop for platforms/versions where `resumed` never fires:
+            // no-op once the tray has been built.
+            self.ensure_tray(loop_target);
+            // Always after `ensure_tray`, and only here rather than in
+            // `resumed` too, so the welcome window can never be raised on a
+            // tick where the tray icon doesn't exist yet.
+            self.maybe_show_first_run(loop_target);
+            // Poll roughly 30Hz when idle.
+            let now = Instant::now();
+            if now.duration_since(self.last_tick) >= Duration::from_millis(33) {
+                self.poll(loop_target);
+                self.last_tick = now;
+            }
+            loop_target.set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(33)));
+        }
+    }
+
+    let event_loop = EventLoop::new().map_err(|e| anyhow!("EventLoop::new: {e}"))?;
+    event_loop.set_control_flow(ControlFlow::Wait);
+
+    let mut app = TrayApp {
+        settings,
+        hotkeys: hotkeys.take(),
+        tray: None,
+        tray_built: false,
+        wayland,
+        hotkey_error,
+        portal_hotkey,
+        recorder: Recorder::new(),
+        overlay: None,
+        pinned:  Vec::new(),
+        settings_view:  None,
+        recording_view: None,
+        about_view:     None,
+        first_run,
+        firstrun_view:  None,
+        updates_view:   None,
+        convert_image_view: None,
+        convert_video_view: None,
+        update_job: None,
+        last_tick: Instant::now(),
+        capturing: false,
+        last_recording: None,
+        overlay_desktop: None,
+        started_at: Instant::now(),
+        pending_region_audio: None,
+        video_annotate: None,
+    };
+
+    event_loop.run_app(&mut app).map_err(|e| anyhow!("run_app: {e}"))?;
+
+    let _ = app.settings.save();
+    Ok(())
+}
+
+// ── helpers ─────────────────────────────────────────────────────────────────
+
+fn save_capture(
+    settings: &mut AppSettings,
+    bmp: &image::ImageBuffer<image::Rgba<u8>, Vec<u8>>,
+) -> Result<PathBuf> {
+    let dir = save_directory(settings);
+    // Both failures below carry the path *and* the OS reason: this error text
+    // is what the user sees in the toast, and "save failed" on its own gives
+    // them nothing to fix.
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| anyhow!(framefang_core::failure::save_folder_failure(
+            &dir.display().to_string(), &e.to_string())))?;
+    let stamp = Local::now().format("%Y%m%d_%H%M%S");
+    let path  = dir.join(format!("framefang_{stamp}.png"));
+    bmp.save(&path)
+        .map_err(|e| anyhow!(framefang_core::failure::save_write_failure(
+            &path.display().to_string(), &e.to_string())))?;
+    if settings.save_directory.is_empty() {
+        settings.save_directory = dir.to_string_lossy().to_string();
+    }
+    Ok(path)
+}
+
+fn save_directory(s: &AppSettings) -> PathBuf {
+    if !s.save_directory.is_empty() {
+        let p = PathBuf::from(&s.save_directory);
+        if p.is_dir() { return p; }
+    }
+    if let Some(d) = directories::UserDirs::new().and_then(|u| u.picture_dir().map(|p| p.to_path_buf())) {
+        return d;
+    }
+    std::env::temp_dir()
+}
+
+/// Where MP4 recordings land. Honors `settings.recordings_directory` when set
+/// and the path is an existing dir; otherwise falls back to XDG Videos, then
+/// $HOME, then the OS temp dir. Distinct from `save_directory` because
+/// ~/Pictures is the wrong place for video clips on every desktop env.
+fn recordings_directory_for(s: &AppSettings) -> PathBuf {
+    if !s.recordings_directory.is_empty() {
+        let p = PathBuf::from(&s.recordings_directory);
+        if p.is_dir() { return p; }
+    }
+    if let Some(d) = directories::UserDirs::new()
+        .and_then(|u| u.video_dir().map(|p| p.to_path_buf())) {
+        return d;
+    }
+    if let Some(home) = directories::UserDirs::new().map(|u| u.home_dir().to_path_buf()) {
+        return home;
+    }
+    std::env::temp_dir()
+}
+
+/// Newest `.mp4` in the recordings folder by modification time — the
+/// "Annotate last recording" fallback when the app was restarted since the
+/// clip was recorded (so `last_recording` is None).
+fn newest_recording(dir: &std::path::Path) -> Option<PathBuf> {
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().map(|e| e.eq_ignore_ascii_case("mp4")) != Some(true) {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else { continue };
+        if best.as_ref().map(|(t, _)| modified > *t).unwrap_or(true) {
+            best = Some((modified, path));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// Pull the clip length out of ffmpeg's stderr input banner. The line is
+/// `  Duration: 00:00:12.34, start: 0.000000, bitrate: 1234 kb/s` —
+/// HH:MM:SS with two centisecond digits, or `N/A` for broken files.
+/// Returns `None` rather than erroring so callers can degrade to the
+/// static (no-timeline) editor instead of refusing to annotate.
+fn parse_ffmpeg_duration(stderr: &str) -> Option<f32> {
+    let line  = stderr.lines().find(|l| l.trim_start().starts_with("Duration:"))?;
+    let token = line.trim_start().strip_prefix("Duration:")?
+        .split(',').next()?.trim();
+    if token == "N/A" { return None; }
+    let mut parts = token.split(':');
+    let h: f32 = parts.next()?.parse().ok()?;
+    let m: f32 = parts.next()?.parse().ok()?;
+    let s: f32 = parts.next()?.parse().ok()?;
+    Some(h * 3600.0 + m * 60.0 + s)
+}
+
+/// Clip length in seconds via the ffmpeg input banner. ffprobe is not
+/// bundled, but plain `ffmpeg -i <video>` prints the same banner to
+/// stderr before bailing with "At least one output file must be
+/// specified" — the non-zero exit status is expected and ignored; only
+/// the banner matters.
+fn probe_duration(video: &std::path::Path) -> Result<f32> {
+    let ffmpeg = crate::convert_video_form::locate_ffmpeg()
+        .ok_or_else(|| anyhow!("ffmpeg not found — bundle it next to framefang or install it on PATH."))?;
+    let mut cmd = std::process::Command::new(&ffmpeg);
+    cmd.arg("-i").arg(video)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    // CREATE_NO_WINDOW: don't flash a console on Windows (same as every
+    // other ffmpeg spawn in the app).
+    #[cfg(windows)]
+    { use std::os::windows::process::CommandExt; cmd.creation_flags(0x0800_0000); }
+    let output = cmd.output().map_err(|e| anyhow!("ffmpeg failed to start: {e}"))?;
+    parse_ffmpeg_duration(&String::from_utf8_lossy(&output.stderr))
+        .ok_or_else(|| anyhow!("no Duration in ffmpeg banner for {}", video.display()))
+}
+
+/// Monotonic suffix for ffmpeg temp files — pid alone collides when one
+/// session extracts many scrub frames, or when a burn is still encoding
+/// on its worker thread while a newer session commits its own.
+static FRAME_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How long after start-up a second-launch capture request is ignored. Long
+/// enough to cover a login session starting Framefang twice (two autostart
+/// entries, a launcher that retries), short enough that a deliberate
+/// re-launch a moment after the tray icon appeared still works.
+const STARTUP_CAPTURE_GRACE: Duration = Duration::from_secs(10);
+
+/// Extract the frame at `secs` (clip seconds) at native resolution via
+/// ffmpeg. The PNG round-trips through the OS temp dir; the editor gets
+/// it as an RGBA buffer, exactly like a screenshot.
+pub(crate) fn extract_frame_at(
+    video: &std::path::Path,
+    secs:  f32,
+) -> Result<image::ImageBuffer<image::Rgba<u8>, Vec<u8>>> {
+    let ffmpeg = crate::convert_video_form::locate_ffmpeg()
+        .ok_or_else(|| anyhow!("ffmpeg not found — bundle it next to framefang or install it on PATH."))?;
+    let seq = FRAME_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let frame_png = std::env::temp_dir()
+        .join(format!("framefang_annotate_frame_{}_{seq}.png", std::process::id()));
+    let mut cmd = std::process::Command::new(&ffmpeg);
+    cmd.arg("-y");
+    // `-ss` before `-i` is the fast input seek (keyframe jump + decode to
+    // the exact timestamp). Omitted at 0.0 so the default first-frame
+    // path issues the exact argv it always has.
+    if secs > 0.0 { cmd.args(["-ss", &format!("{secs:.3}")]); }
+    cmd.arg("-i").arg(video)
+        .args(["-frames:v", "1", "-update", "1"])
+        .arg(&frame_png)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    // CREATE_NO_WINDOW: don't flash a console on Windows (same as every
+    // other ffmpeg spawn in the app).
+    #[cfg(windows)]
+    { use std::os::windows::process::CommandExt; cmd.creation_flags(0x0800_0000); }
+    let output = cmd.output()
+        .map_err(|e| anyhow!("ffmpeg failed to start: {e}"))?;
+    if !output.status.success() {
+        let tail = stderr_tail(&String::from_utf8_lossy(&output.stderr));
+        let _ = std::fs::remove_file(&frame_png);
+        return Err(anyhow!("could not read a frame from {}: {tail}", video.display()));
+    }
+    let img = image::open(&frame_png)
+        .map_err(|e| anyhow!("decoding extracted frame: {e}"))?
+        .into_rgba8();
+    let _ = std::fs::remove_file(&frame_png);
+    Ok(img)
+}
+
+/// Extract the first frame of `video` at native resolution via ffmpeg.
+/// The PNG round-trips through the OS temp dir; the editor gets it as an
+/// RGBA buffer, exactly like a screenshot.
+fn extract_first_frame(
+    video: &std::path::Path,
+) -> Result<image::ImageBuffer<image::Rgba<u8>, Vec<u8>>> {
+    extract_frame_at(video, 0.0)
+}
+
+/// `<dir>/<stem>_annotated.mp4`, next to the original clip.
+fn annotated_output_path(video: &std::path::Path) -> PathBuf {
+    let stem = video.file_stem().map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "framefang".to_owned());
+    video.parent().map(|p| p.to_path_buf())
+        .unwrap_or_else(std::env::temp_dir)
+        .join(format!("{stem}_annotated.mp4"))
+}
+
+/// The actual burn: one transparent overlay PNG per (start, end) group,
+/// each composited over the clip through its own `overlay` filter. Timed
+/// groups are gated with `enable=`; the whole-clip group (start 0, open
+/// end) gets a plain `overlay=0:0`, so the zero-interaction default
+/// produces the exact pre-timeline filtergraph. Audio copied through
+/// untouched. Encoder settings mirror the recorder (libx264 ultrafast,
+/// yuv420p for player compatibility). Runs on a worker thread — see
+/// `burn_annotations`.
+fn run_annotation_burn(
+    ffmpeg:   &std::path::Path,
+    video:    &std::path::Path,
+    overlays: &[OverlayGroup],
+    out:      &std::path::Path,
+) -> Result<()> {
+    if overlays.is_empty() {
+        return Err(anyhow!("nothing to burn — no overlay groups."));
+    }
+    // One temp PNG per group. pid + group index alone is NOT unique:
+    // burns run on detached worker threads, so committing a second
+    // annotate session while an earlier clip is still encoding reuses
+    // the same pid and indices — each burn also takes a FRAME_SEQ
+    // ticket, the same disambiguation scrub-frame extraction uses.
+    let seq = FRAME_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut pngs: Vec<PathBuf> = Vec::with_capacity(overlays.len());
+    for (i, (overlay, _, _)) in overlays.iter().enumerate() {
+        let png = std::env::temp_dir()
+            .join(format!("framefang_annotate_overlay_{}_{seq}_{i}.png", std::process::id()));
+        if let Err(e) = overlay.save(&png) {
+            for p in &pngs { let _ = std::fs::remove_file(p); }
+            return Err(anyhow!("writing overlay png: {e}"));
+        }
+        pngs.push(png);
+    }
+    let windows: Vec<(f32, Option<f32>)> =
+        overlays.iter().map(|(_, s, e)| (*s, *e)).collect();
+
+    let mut cmd = std::process::Command::new(ffmpeg);
+    cmd.args(["-y", "-i"]).arg(video);
+    for png in &pngs { cmd.arg("-i").arg(png); }
+    cmd.arg("-filter_complex").arg(overlay_filtergraph(&windows))
+        // `[0:a?]` — map audio only if the clip has any (video-only
+        // recordings produce no audio stream).
+        .args(["-map", "[v]", "-map", "0:a?",
+               "-c:v", "libx264", "-preset", "ultrafast",
+               "-pix_fmt", "yuv420p",
+               "-c:a", "copy",
+               "-movflags", "+faststart"])
+        .arg(out)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    { use std::os::windows::process::CommandExt; cmd.creation_flags(0x0800_0000); }
+    let output = cmd.output()
+        .map_err(|e| anyhow!("ffmpeg failed to start: {e}"));
+    for png in &pngs { let _ = std::fs::remove_file(png); }
+    let output = output?;
+    if !output.status.success() {
+        let tail = stderr_tail(&String::from_utf8_lossy(&output.stderr));
+        return Err(anyhow!("ffmpeg exited with {}: {tail}", output.status));
+    }
+    match std::fs::metadata(out) {
+        Ok(m) if m.len() > 0 => Ok(()),
+        _ => Err(anyhow!("ffmpeg reported success but {} is missing or empty.", out.display())),
+    }
+}
+
+/// Build the `-filter_complex` graph chaining one `overlay` per group:
+/// `[0:v][1:v]overlay=0:0:enable='gte(t,S0)*lt(t,E0)'[v0];[v0][2:v]…[v]`,
+/// last link always labelled `[v]` for `-map [v]`.
+///
+/// Quoting: this string is passed as a single Command argv entry (no
+/// shell), so the only parser involved is ffmpeg's filtergraph parser.
+/// There an unescaped `,` ends the filter's option list, so the commas
+/// inside `gte(t,…)` / `lt(t,…)` must be protected — single quotes at
+/// the filtergraph level, which the parser strips before the expression
+/// evaluator runs. Backslash-escaping each comma would also work; the
+/// quote form matches the ffmpeg documentation examples, while the
+/// unquoted form is rejected up front with `No such filter: '2.000'` —
+/// the comma is taken as a chain separator.
+///
+/// Window forms:
+///   (0.0, None)  → plain `overlay=0:0` — byte-identical to the
+///                  pre-timeline single-overlay graph.
+///   (s,   None)  → `enable='gte(t,S)'` — "until clip end" without
+///                  trusting the parsed duration to the centisecond.
+///   (s, Some(e)) → `enable='gte(t,S)*lt(t,E)'` — half-open [S, E),
+///                  matching `annotation_visible_at` exactly. ffmpeg's
+///                  `between()` is inclusive at BOTH ends, and a frame
+///                  landing exactly on E is the common case, not a
+///                  corner: the chip presets (3/5/10 s) sit right on the
+///                  30 fps frame grid of framefang's own recordings, so the
+///                  inclusive form burned one frame the preview said was
+///                  clean.
+fn overlay_filtergraph(windows: &[(f32, Option<f32>)]) -> String {
+    let mut chains = Vec::with_capacity(windows.len());
+    let mut prev = "0:v".to_owned();
+    for (i, (start, end)) in windows.iter().enumerate() {
+        let label = if i + 1 == windows.len() { "v".to_owned() } else { format!("v{i}") };
+        let gate = match end {
+            None if *start == 0.0 => String::new(),
+            None                  => format!(":enable='gte(t,{start:.3})'"),
+            Some(e)               => format!(":enable='gte(t,{start:.3})*lt(t,{e:.3})'"),
+        };
+        chains.push(format!("[{prev}][{}:v]overlay=0:0{gate}[{label}]", i + 1));
+        prev = label;
+    }
+    chains.join(";")
+}
+
+/// Last few non-empty stderr lines — enough to say *why* ffmpeg bailed
+/// without dumping its whole banner into a notification.
+fn stderr_tail(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let n = lines.len();
+    lines[n.saturating_sub(4)..].join(" | ")
+}
+
+fn tray_tooltip(s: &AppSettings) -> String {
+    format!("Framefang — press {} to capture", s.hotkey().describe())
+}
+
+/// Register every configured binding, reporting the ones the OS refused.
+///
+/// A chord another application already owns is the common case here, and it
+/// costs the user only that one shortcut — the tray menu still reaches every
+/// action — so this logs and moves on rather than failing the call.
+fn apply_hotkeys(hk: &mut HotkeyManager, s: &AppSettings) -> Vec<(HotkeyAction, framefang_platform::Error)> {
+    let failed = hk.register_all(&s.hotkey_bindings());
+    for (action, e) in &failed {
+        eprintln!("hotkey register failed for {}: {e} — use the tray menu instead",
+                  action.label());
+    }
+    // While Windows sends Print Screen to the Snipping Tool, the raw-input
+    // path would still hear it and open Framefang on top. Leave that key to
+    // the system until the user hands it over (Settings says how).
+    if crate::system_shortcuts::system_takes(&s.hotkey()) {
+        hk.without_second_path(HotkeyAction::Capture);
+    }
+    failed
+}
+
+/// Text of the tray rows that quote a hotkey. The binding rides along in
+/// parentheses so it is discoverable from the menu the user is already in,
+/// instead of only from the Settings dialog; an unbound optional action gets
+/// its plain label back.
+///
+/// On the portal backend the compositor has the last word on what the shortcut
+/// actually is — we can only ask (see `framefang_platform::hotkey_portal`) — so
+/// the labels mark it as requested rather than stating it as fact.
+fn menu_labels(s: &AppSettings, portal_hotkey: bool) -> MenuLabels {
+    MenuLabels {
+        capture:      hotkey_label(s, HotkeyAction::Capture, "Capture", portal_hotkey),
+        capture_full: hotkey_label(s, HotkeyAction::CaptureFullScreen, "Capture Full Screen", portal_hotkey),
+        record:       hotkey_label(s, HotkeyAction::ToggleRecording, "Record", portal_hotkey),
+    }
+}
+
+/// `"Record (Ctrl + Shift + R)"`, or bare `"Record"` when the action has no
+/// binding. The portal suffix is appended per row because every row that
+/// names a key is equally at the compositor's mercy in that session.
+fn hotkey_label(s: &AppSettings, action: HotkeyAction, base: &str, portal_hotkey: bool) -> String {
+    match s.hotkey_for(action) {
+        None     => base.to_owned(),
+        Some(hk) => {
+            let key = hk.describe();
+            if portal_hotkey {
+                format!("{base} ({key} - set by your desktop)")
+            } else {
+                format!("{base} ({key})")
+            }
+        }
+    }
+}
+
+/// One-phrase summary of the audio tracks a recording actually carries.
+fn audio_label_for(o: framefang_platform::recorder::RecordingOptions) -> &'static str {
+    match (o.mic, o.system_audio) {
+        (false, false) => "video only",
+        (true,  false) => "with microphone",
+        (false, true)  => "with system audio",
+        (true,  true)  => "with mic + system audio",
+    }
+}
+
+/// Names the audio sources the user asked for that the recorder couldn't
+/// actually open, for appending to the "recording started" toast. Empty
+/// string when the recording is exactly what was requested.
+fn audio_downgrade_note(requested: framefang_platform::recorder::RecordingOptions,
+                        effective: framefang_platform::recorder::RecordingOptions) -> String {
+    let lost_mic = requested.mic          && !effective.mic;
+    let lost_sys = requested.system_audio && !effective.system_audio;
+    match (lost_mic, lost_sys) {
+        (false, false) => String::new(),
+        (true,  true)  => "\n(no audio - neither source could be opened)".to_owned(),
+        (true,  false) => "\n(no microphone - the input device could not be opened)".to_owned(),
+        (false, true)  => "\n(no system audio - the audio server was not reachable)".to_owned(),
+    }
+}
+
+/// Open `url` in the user's default browser. Best-effort — failures are
+/// logged but the dialog already gave them the URL as plain text, so they
+/// can copy it manually.
+/// Send a desktop notification via `notify-send` on Linux, `osascript` on
+/// macOS, `powershell BurntToast` on Windows. Best-effort — silent failure
+/// if the binary isn't available. `urgent=true` keeps the toast on screen
+/// 5 s instead of 3 s.
+fn notify(title: &str, body: &str, urgent: bool) {
+    let timeout = if urgent { "5000" } else { "3000" };
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("notify-send")
+            .args(["-a", "Framefang", "-t", timeout, title, body])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!(
+            "display notification \"{}\" with title \"{}\"",
+            body.replace('"', "\\\""),
+            title.replace('"', "\\\""),
+        );
+        let _ = std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        return;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // PowerShell toast — no extra dep on the user side.
+        let script = format!(
+            "[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime] | Out-Null; \
+             [Windows.Data.Xml.Dom.XmlDocument,Windows.Data.Xml.Dom.XmlDocument,ContentType=WindowsRuntime] | Out-Null; \
+             $template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02); \
+             $template.GetElementsByTagName('text').Item(0).InnerText = '{}'; \
+             $template.GetElementsByTagName('text').Item(1).InnerText = '{}'; \
+             [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Framefang').Show($template);",
+            title.replace('\'', "''"),
+            body.replace('\'', "''"),
+        );
+        // CREATE_NO_WINDOW: without it, every toast flashes a black powershell
+        // console — including the ones fired on record start/stop.
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(0x0800_0000)
+            .spawn();
+        let _ = timeout;
+    }
+}
+
+/// Tell the tray's open popup menu and hidden-icons flyout to close *now*,
+/// so the screenshot we're about to take doesn't capture them. The settle
+/// sleep that follows gives Windows' menu-fade animation time to actually
+/// finish painting.
+#[cfg(target_os = "windows")]
+fn dismiss_tray_flyouts() {
+    use windows::core::w;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EndMenu, FindWindowW, ShowWindow, SW_HIDE,
+    };
+    unsafe {
+        // Closes any popup menu owned by the calling thread's foreground —
+        // this is what the tray menu actually is once we get the click event.
+        let _ = EndMenu();
+        // Hide the "show hidden icons" chevron flyout if the user opened it
+        // to reach our tray icon. Safe no-op if the window isn't present.
+        if let Ok(hwnd) = FindWindowW(w!("NotifyIconOverflowWindow"), None) {
+            if !hwnd.is_invalid() {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+        }
+    }
+}
+
+fn open_url(url: &str) {
+    use std::process::Command;
+    let opener = if cfg!(target_os = "windows") {
+        ("cmd",  vec!["/C", "start", "", url])
+    } else if cfg!(target_os = "macos") {
+        ("open", vec![url])
+    } else {
+        ("xdg-open", vec![url])
+    };
+    let mut cmd = Command::new(opener.0);
+    cmd.args(opener.1);
+    if let Err(e) = cmd.spawn() {
+        eprintln!("Couldn't open {url}: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn annotated_path_lands_next_to_source() {
+        let p = annotated_output_path(std::path::Path::new("/tmp/vids/framefang_20260606_101010.mp4"));
+        assert_eq!(p, PathBuf::from("/tmp/vids/framefang_20260606_101010_annotated.mp4"));
+    }
+
+    #[test]
+    fn stderr_tail_keeps_last_lines_only() {
+        let s = "banner\n\nline1\nline2\nline3\nline4\nline5\n";
+        let tail = stderr_tail(s);
+        assert_eq!(tail, "line2 | line3 | line4 | line5");
+        assert_eq!(stderr_tail(""), "");
+    }
+
+    #[test]
+    fn ffmpeg_banner_duration_parses() {
+        // Real banner shape: 2-space indent, comma-terminated field.
+        let stderr = "ffmpeg version 6.1.1 Copyright (c) 2000-2023 the FFmpeg developers\n\
+            Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'framefang_20260606_101010.mp4':\n\
+            \x20 Metadata:\n\
+            \x20   major_brand     : isom\n\
+            \x20 Duration: 00:00:12.34, start: 0.000000, bitrate: 1234 kb/s\n\
+            \x20 Stream #0:0[0x1](und): Video: h264 (High), yuv420p, 1920x1080\n";
+        let d = parse_ffmpeg_duration(stderr).unwrap();
+        assert!((d - 12.34).abs() < 0.01, "got {d}");
+        let hour = "  Duration: 01:02:03.45, start: 0.000000, bitrate: 5 kb/s\n";
+        let d = parse_ffmpeg_duration(hour).unwrap();
+        assert!((d - 3723.45).abs() < 0.01, "got {d}");
+    }
+
+    #[test]
+    fn ffmpeg_banner_duration_rejects_na_and_absent() {
+        assert_eq!(parse_ffmpeg_duration("  Duration: N/A, start: 0.000000, bitrate: N/A\n"), None);
+        assert_eq!(parse_ffmpeg_duration("no banner here\n"), None);
+        assert_eq!(parse_ffmpeg_duration(""), None);
+    }
+
+    #[test]
+    fn filtergraph_single_whole_clip_matches_pre_timeline_graph() {
+        // The zero-interaction default must produce the exact filter the
+        // static burn always used.
+        assert_eq!(overlay_filtergraph(&[(0.0, None)]), "[0:v][1:v]overlay=0:0[v]");
+    }
+
+    #[test]
+    fn filtergraph_chains_enable_windows() {
+        let graph = overlay_filtergraph(&[
+            (0.0, None),
+            (1.5, Some(4.5)),
+            (2.0, None),
+        ]);
+        assert_eq!(graph,
+            "[0:v][1:v]overlay=0:0[v0];\
+             [v0][2:v]overlay=0:0:enable='gte(t,1.500)*lt(t,4.500)'[v1];\
+             [v1][3:v]overlay=0:0:enable='gte(t,2.000)'[v]");
+    }
+
+    #[test]
+    fn newest_recording_picks_latest_mp4() {
+        let dir = std::env::temp_dir().join(format!("framefang_test_newest_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("a.mp4");
+        let new = dir.join("b.mp4");
+        let png = dir.join("c.png");
+        std::fs::write(&old, b"x").unwrap();
+        std::fs::write(&png, b"x").unwrap();
+        // Ensure a strictly newer mtime for b.mp4.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&new, b"x").unwrap();
+        assert_eq!(newest_recording(&dir), Some(new));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

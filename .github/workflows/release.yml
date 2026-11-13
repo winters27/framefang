@@ -1,0 +1,123 @@
+# Build Framefang for Windows and publish a GitHub Release.
+#
+# Runs when a version tag (v1.2.3) is pushed, and by hand from the Actions tab
+# (a hand run builds and keeps the files as workflow artifacts, but publishes
+# nothing).
+#
+# Release assets, named the way the in-app updater looks for them
+# (crates/framefang-app/src/updates_form.rs, pick_asset_url):
+#   Framefang.msi                  installer (WiX 3, per-machine)
+#   framefang-windows-x86_64.zip   portable: framefang.exe only
+#   SHA256SUMS                     sha256 of each asset, checked before install
+#
+# FFmpeg is not bundled: recording and conversion use the user's own ffmpeg.
+#
+# Release notes come from release-notes/<tag>.md when that file exists.
+
+name: Release
+
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows x86_64
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: framefang-rs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: framefang-rs }
+
+      - name: Test
+        run: cargo test --workspace --release
+
+      - name: Build
+        run: cargo build --release --bin framefang
+
+      - name: Check the version matches the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart('v')
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          if ($tag -ne $ver) { throw "Tag v$tag does not match Cargo.toml version $ver" }
+
+      - name: Stage the portable zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist\framefang | Out-Null
+          Copy-Item target\release\framefang.exe dist\framefang\
+          Compress-Archive -Path dist\framefang\* -DestinationPath dist\framefang-windows-x86_64.zip
+
+      # WiX 3.14.1 from the WiX project's own release, so the build does not
+      # depend on what the runner image happens to have installed.
+      - name: Get WiX 3.14
+        shell: pwsh
+        run: |
+          $wix = Join-Path $env:RUNNER_TEMP 'wix'
+          New-Item -ItemType Directory -Force -Path "$wix\bin" | Out-Null
+          $zip = Join-Path $env:RUNNER_TEMP 'wix314-binaries.zip'
+          Invoke-WebRequest -Uri 'https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip' -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath "$wix\bin"
+          echo "WIX=$wix\" >> $env:GITHUB_ENV
+          echo "$wix\bin" >> $env:GITHUB_PATH
+
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --locked --version 0.3.9
+
+      - name: Build Framefang.msi
+        shell: pwsh
+        run: |
+          cargo wix --package framefang-app `
+                    --no-build `
+                    --nocapture `
+                    --include wix\main.wxs `
+                    --output dist\Framefang.msi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: framefang-windows
+          path: |
+            framefang-rs/dist/Framefang.msi
+            framefang-rs/dist/framefang-windows-x86_64.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: windows
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: framefang-windows
+          path: dist
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum Framefang.msi framefang-windows-x86_64.zip > SHA256SUMS && cat SHA256SUMS
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          notes="release-notes/${TAG}.md"
+          if [ -f "$notes" ]; then set -- --notes-file "$notes"; else set -- --notes "Framefang ${TAG}"; fi
+          gh release create "$TAG" \
+            --title "Framefang ${TAG}" \
+            "$@" \
+            dist/Framefang.msi dist/framefang-windows-x86_64.zip dist/SHA256SUMS

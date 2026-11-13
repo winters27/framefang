@@ -1,0 +1,61 @@
+[workspace]
+resolver = "2"
+members  = [
+    "crates/framefang-core",
+    "crates/framefang-platform",
+    "crates/framefang-app",
+]
+
+[workspace.package]
+version      = "1.0.0"
+edition      = "2021"
+authors      = ["winters27"]
+license      = "Apache-2.0"
+repository   = "https://github.com/winters27/framefang"
+description  = "Fast screenshots with annotations — native, cross-platform"
+rust-version = "1.80"
+
+[workspace.dependencies]
+# Serialization / files
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+directories = "6"
+chrono      = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+# Imaging / clipboard
+image       = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "webp"] }
+arboard     = "3"
+
+# Platform integrations
+xcap          = "0.9"
+global-hotkey = "0.7"
+tray-icon     = "0.23"
+
+# UI
+iced = { version = "0.14", features = ["canvas", "image", "tokio", "advanced"] }
+# Native message + file-picker dialogs (GTK on Linux, native APIs on Win/macOS).
+# Only used today for the About modal and the Settings folder picker; will be
+# joined by a real settings UI when the iced port lands.
+rfd  = "0.15"
+# Overlay editor stack — CPU framebuffer + anti-aliased 2D drawing.
+# softbuffer pushes pixels to a winit window without GPU; tiny-skia gives us
+# alpha-blended fills, strokes, and rounded rects for the selection chrome
+# and (eventually) annotation tools.
+softbuffer = "0.4"
+tiny-skia  = "0.11"
+
+# Errors
+thiserror = "1"
+anyhow    = "1"
+
+# Hashing — used by the in-process self-updater to verify a downloaded
+# release binary against the SHA256SUMS published alongside it.
+sha2 = "0.10"
+
+# These knobs apply to release builds of any crate in the workspace.
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+strip         = "symbols"
+panic         = "abort"

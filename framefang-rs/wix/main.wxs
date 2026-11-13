@@ -1,0 +1,166 @@
+<?xml version='1.0' encoding='utf-8'?>
+<!--
+  Framefang Windows installer (WiX 3.x schema, fed by `cargo wix`).
+
+  This file was bootstrapped by `cargo wix init` (cargo-wix v0.3+) and then
+  tweaked by hand. To regenerate from scratch, delete this file and re-run
+  `cargo wix init` on Windows with WiX 3.x on PATH — but prefer manual
+  edits so the UpgradeCode GUID and ProductCode stay stable across builds
+  (winget + chocolatey both pin to a fixed UpgradeCode/ProductCode pair).
+  The UpgradeCode is Framefang's own (new for 1.0.0): sharing Kashot's would
+  make this MSI uninstall an installed Kashot as an "older version".
+
+  Inputs at build time:
+    - $(var.CargoTargetBinDir)\framefang.exe       built by `cargo build` (release profile)
+    - $(var.CargoProjectName) == "framefang-app"   — supplied by `cargo wix`
+    - License.rtf in this directory             — shown in the install wizard
+
+  Outputs:
+    - target\wix\Framefang.msi  (renamed to Framefang.msi for the GitHub Release)
+
+  Notes:
+    - Scope is per-machine; install dir is %ProgramFiles%\Framefang.
+    - Adds a Start Menu shortcut; NO auto-start (the app exposes that in
+      its own Settings dialog — keeping installer + in-app preference from
+      fighting each other).
+    - The icon is the same Framefang.ico shipped in the repo root under
+      icons/Framefang.ico; copied into framefang-rs/wix/Framefang.ico by CI so the
+      bind path resolves on the runner.
+-->
+<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
+
+    <Product
+        Id='*'
+        Name='Framefang'
+        UpgradeCode='EF6E048C-A0C6-4413-ADE6-679F0E461580'
+        Manufacturer='winters27'
+        Language='1033'
+        Codepage='1252'
+        Version='$(var.Version)'>
+
+        <Package Id='*'
+            Keywords='Installer'
+            Description='Framefang — fast screenshots with annotations'
+            Manufacturer='winters27'
+            InstallerVersion='450'
+            Languages='1033'
+            Compressed='yes'
+            InstallScope='perMachine'
+            SummaryCodepage='1252' />
+
+        <MajorUpgrade
+            Schedule='afterInstallInitialize'
+            DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.' />
+
+        <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1' />
+        <Property Id='DiskPrompt' Value='Framefang Installation' />
+
+        <Directory Id='TARGETDIR' Name='SourceDir'>
+            <Directory Id='ProgramFiles64Folder' Name='PFiles'>
+                <Directory Id='APPLICATIONFOLDER' Name='Framefang'>
+                    <Component Id='License' Guid='*' Win64='yes'>
+                        <File Id='LicenseFile'
+                              Name='License.rtf'
+                              DiskId='1'
+                              Source='$(sys.SOURCEFILEDIR)License.rtf'
+                              KeyPath='yes' />
+                    </Component>
+
+                    <Component Id='binary0' Guid='*' Win64='yes'>
+                        <File
+                            Id='exe0'
+                            Name='framefang.exe'
+                            DiskId='1'
+                            Source='$(var.CargoTargetBinDir)\framefang.exe'
+                            KeyPath='yes' />
+                    </Component>
+
+                    <!--
+                      No ffmpeg in the installer: recording and video
+                      conversion use the ffmpeg on PATH (locate_ffmpeg), so
+                      the MSI stays small and ships no GPL binary.
+                    -->
+                </Directory>
+            </Directory>
+
+            <Directory Id='ProgramMenuFolder'>
+                <Directory Id='ApplicationProgramsFolder' Name='Framefang'>
+                    <Component Id='StartMenuShortcut' Guid='D1084C35-9CC7-44EF-9A63-AC5E84CAD8CE' Win64='yes'>
+                        <Shortcut Id='FramefangStartMenuShortcut'
+                                  Name='Framefang'
+                                  Description='Fast screenshots with annotations'
+                                  Target='[APPLICATIONFOLDER]framefang.exe'
+                                  WorkingDirectory='APPLICATIONFOLDER'
+                                  Icon='ProductIcon.ico' />
+                        <RemoveFolder Id='RemoveApplicationProgramsFolder'
+                                      Directory='ApplicationProgramsFolder'
+                                      On='uninstall' />
+                        <RegistryValue Root='HKCU'
+                                       Key='Software\Framefang\Framefang'
+                                       Name='installed'
+                                       Type='integer'
+                                       Value='1'
+                                       KeyPath='yes' />
+                    </Component>
+                </Directory>
+            </Directory>
+        </Directory>
+
+        <Feature
+            Id='Binaries'
+            Title='Application'
+            Description='Installs the Framefang binary.'
+            Level='1'
+            ConfigurableDirectory='APPLICATIONFOLDER'
+            AllowAdvertise='no'
+            Display='expand'
+            Absent='disallow'>
+
+            <ComponentRef Id='License' />
+            <ComponentRef Id='binary0' />
+            <ComponentRef Id='StartMenuShortcut' />
+        </Feature>
+
+        <!-- Add/Remove Programs entries. -->
+        <Icon Id='ProductIcon.ico' SourceFile='$(sys.SOURCEFILEDIR)Framefang.ico' />
+        <Property Id='ARPPRODUCTICON' Value='ProductIcon.ico' />
+        <Property Id='ARPHELPLINK' Value='https://github.com/winters27/framefang' />
+        <Property Id='ARPURLINFOABOUT' Value='https://github.com/winters27/framefang' />
+        <Property Id='ARPNOREPAIR' Value='1' />
+        <!-- ARPNOMODIFY is declared by WixUI_InstallDir; redeclaring it
+             trips LGHT0091 "Duplicate symbol 'Property:ARPNOMODIFY'"
+             at link time. Leave it to the UI extension. -->
+
+        <!--
+          Wizard UI: WixUI_InstallDir gives the user a chance to pick an
+          alternate install location, which matches what users expect from
+          a per-machine MSI. Pages: License, InstallDir, Confirm.
+
+          ExitDialog gets a "Launch Framefang" checkbox (checked by default).
+          Without this, fresh installs + in-app updates leave the user
+          staring at a closed installer with no Framefang running — they
+          have to hunt for the Start Menu shortcut to relaunch.
+          WixShellExec + Impersonate='yes' runs the .exe as the original
+          (non-elevated) user, not as SYSTEM.
+        -->
+        <UI>
+            <UIRef Id='WixUI_InstallDir' />
+            <Publish Dialog='ExitDialog'
+                     Control='Finish'
+                     Event='DoAction'
+                     Value='LaunchFramefang'>WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1</Publish>
+        </UI>
+        <Property Id='WIXUI_INSTALLDIR' Value='APPLICATIONFOLDER' />
+        <Property Id='WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT' Value='Launch Framefang' />
+        <Property Id='WIXUI_EXITDIALOGOPTIONALCHECKBOX' Value='1' />
+        <Property Id='WixShellExecTarget' Value='[#exe0]' />
+        <CustomAction Id='LaunchFramefang'
+                      BinaryKey='WixCA'
+                      DllEntry='WixShellExec'
+                      Execute='immediate'
+                      Impersonate='yes' />
+        <WixVariable Id='WixUILicenseRtf' Value='$(sys.SOURCEFILEDIR)License.rtf' />
+
+    </Product>
+
+</Wix>

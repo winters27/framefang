@@ -1,0 +1,54 @@
+# Build output (C#)
+**/bin/
+**/obj/
+*.user
+*.suo
+
+# Build output (Rust)
+**/target/
+Cargo.lock.*
+
+# Rust packaging staging — only the framefang-rs/dist/ subdir, NOT root /dist/
+# (root /dist/ holds package-channel metadata: winget, choco, scoop, brew, etc.)
+/framefang-rs/dist/
+
+# Visual Studio
+.vs/
+*.swp
+
+# Published artifacts
+publish/
+*.pdb
+*.msi
+*.wixpdb
+*.snap
+*.AppImage
+preview.png
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+
+# Local dev
+*.log
+
+# Local-only files: deployment runbooks, DNS / domain notes,
+# editor / agent session state, anything specific to the
+# maintainer's environment. Never push.
+.local/
+*.local
+*.local.*
+.claude/
+.cursor/
+.aider*
+.copilot/
+DEPLOY.md
+DEPLOY-*.md
+deploy.md
+SECRETS.md
+.env
+.env.*
