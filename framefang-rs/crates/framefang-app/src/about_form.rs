@@ -218,18 +218,14 @@ impl AboutView {
         // The dialog draws into its own buffer, placed below the title strip.
         let win_h = (h.get() as usize).saturating_sub(crate::chrome::TITLE_H as usize);
         let mut buf = vec![0u32; win_w * win_h];
-        for y in 0..win_h {
-            let band = if (y as i32) < HEADER_H { BG_TOP() } else { BG_BODY() };
-            for x in 0..win_w { buf[y * win_w + x] = band; }
-        }
-        crate::palette::header_rule(&mut buf, win_w, win_h, HEADER_H);
+        crate::hud::backdrop(&mut buf, win_w, win_h, HEADER_H);
         let _ = PANEL_BORDER();
         let _ = TEXT_DIM();
 
         let mut surf = BufferSurface { buf: &mut buf, w: win_w as i32, h: win_h as i32 };
 
         // Title strip.
-        draw_text(&mut surf, PAD, 22, 2, "FRAMEFANG // ABOUT", argb_to_framefang(LASER()));
+        crate::hud::heading(surf.buf, win_w, win_h, PAD, 22, "FRAMEFANG // ABOUT");
         // ASCII separator only — bitmap_font.rs ships glyphs for 0x20..=0x7E,
         // so a U+00B7 middle dot would render as `?`.
         let version = format!("v{}  //  the lightweight screenshot tool", env!("CARGO_PKG_VERSION"));
@@ -284,7 +280,7 @@ fn render_btn<S: painter::Surface>(surf: &mut S, b: &Btn, hovered: bool) {
     let (x, y, w, h) = b.rect;
     let is_primary = b.kind == BtnKind::Close;
     let border = if is_primary { LASER() } else if hovered { LASER_DIM() } else { PANEL_BORDER() };
-    let fill   = if is_primary && hovered { 0x0000_2818 } else if hovered { HOVER_FILL() } else { 0x0000_0000 };
+    let fill   = if is_primary && hovered { PRIMARY_FILL() } else if hovered { HOVER_FILL() } else { 0x0000_0000 };
     if fill != 0 { fill_rect(surf, x, y, w, h, argb_to_framefang(fill)); }
     stroke_rect_argb(surf, x, y, w, h, argb_to_framefang(border));
     let tw = bitmap_font::measure(b.label, 1);

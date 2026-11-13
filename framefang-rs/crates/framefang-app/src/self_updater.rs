@@ -347,23 +347,12 @@ fn extract_zip(archive: &Path) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("create scratch dir {}: {e}", dir.display()))?;
 
-    // On Windows we have PowerShell's Expand-Archive guaranteed; on
-    // Linux / macOS the system `unzip` is the path of least resistance.
-    // We pick at compile-time so we never spawn a missing tool.
+    // Windows: its own tar.exe (see `unzip_windows`); Linux / macOS: the
+    // system `unzip`. Picked at compile time so we never spawn a missing
+    // tool.
     #[cfg(target_os = "windows")]
     {
-        let cmd = format!(
-            "Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force",
-            archive.display().to_string().replace('\'', "''"),
-            dir.display().to_string().replace('\'', "''"),
-        );
-        let status = Command::new("powershell")
-            .args(["-NoProfile", "-Command", &cmd])
-            .status()
-            .map_err(|e| format!("powershell spawn: {e}"))?;
-        if !status.success() {
-            return Err(format!("Expand-Archive exited with {status} extracting {}", archive.display()));
-        }
+        unzip_windows(archive, &dir)?;
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -384,10 +373,32 @@ fn extract_zip(archive: &Path) -> Result<PathBuf, String> {
         .ok_or_else(|| format!("`{want}` not found inside {}", archive.display()))
 }
 
+/// Unpack a zip on Windows with Windows' own `tar.exe` (in System32 since
+/// Windows 10 1803; it reads zip files), with no console window.
+///
+/// Not PowerShell's Expand-Archive: started from a PowerShell 7 terminal,
+/// the Windows PowerShell 5.1 we'd launch inherits 7's module path, loads
+/// 7's Expand-Archive, fails inside it, and still exits 0, so a download
+/// looked empty ("no ffmpeg.exe in it"). Found 2026-11-13.
+#[cfg(target_os = "windows")]
+pub(crate) fn unzip_windows(zip: &Path, to: &Path) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    std::fs::create_dir_all(to).map_err(|e| format!("create {}: {e}", to.display()))?;
+    // System32's tar by full path, never a different tar earlier on PATH.
+    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+    let tar = Path::new(&root).join("System32").join("tar.exe");
+    let status = Command::new(&tar)
+        .arg("-xf").arg(zip).arg("-C").arg(to)
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .status()
+        .map_err(|e| format!("{}: {e}", tar.display()))?;
+    if status.success() { Ok(()) } else { Err(format!("couldn't unpack {}", zip.display())) }
+}
+
 /// Depth-first walk; returns the first file whose name matches `want`.
 /// Archives we ship are small (one binary + maybe a README) so this is
 /// fine without a hand-rolled iterator.
-fn find_named(root: &Path, want: &str) -> Option<PathBuf> {
+pub(crate) fn find_named(root: &Path, want: &str) -> Option<PathBuf> {
     let entries = std::fs::read_dir(root).ok()?;
     for entry in entries.flatten() {
         let path = entry.path();
@@ -406,7 +417,7 @@ fn find_named(root: &Path, want: &str) -> Option<PathBuf> {
 
 // ── verification ────────────────────────────────────────────────────────────
 
-fn verify_sha256(path: &Path, expected_hex: &str) -> Result<(), String> {
+pub(crate) fn verify_sha256(path: &Path, expected_hex: &str) -> Result<(), String> {
     let mut f = std::fs::File::open(path)
         .map_err(|e| format!("open {} for hashing: {e}", path.display()))?;
     let mut hasher = Sha256::new();

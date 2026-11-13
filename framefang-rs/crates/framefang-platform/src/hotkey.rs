@@ -153,6 +153,15 @@ impl HotkeyManager {
                 let mut failed = Vec::new();
                 let mut held = Vec::new();
                 for &(action, hk) in bindings {
+                    // A key `global-hotkey` has no name for (the Menu key,
+                    // browser and launch keys) can't be registered, but raw
+                    // input hears any key: it becomes a raw-input-only
+                    // binding rather than a refused one. It does not stop the
+                    // key's own action, since raw input only listens.
+                    if raw.is_some() && vk_to_code(hk.virtual_key).is_none() {
+                        held.push((action, hk));
+                        continue;
+                    }
                     match grab_one(inner, hk) {
                         Ok(item) => { current.push((action, item)); held.push((action, hk)); }
                         Err(e)   => failed.push((action, e)),
@@ -266,6 +275,30 @@ fn grab_one(inner: &GlobalHotKeyManager, hk: Hotkey) -> Result<HotKey> {
 /// the default hotkey there is Cmd+Shift+`7` (`0x37`) rather than Print Screen.
 fn vk_to_code(vk: u32) -> Option<Code> {
     Some(match vk {
+        // F13-F24
+        0x7C => Code::F13, 0x7D => Code::F14, 0x7E => Code::F15, 0x7F => Code::F16,
+        0x80 => Code::F17, 0x81 => Code::F18, 0x82 => Code::F19, 0x83 => Code::F20,
+        0x84 => Code::F21, 0x85 => Code::F22, 0x86 => Code::F23, 0x87 => Code::F24,
+        // Numpad
+        0x60 => Code::Numpad0, 0x61 => Code::Numpad1, 0x62 => Code::Numpad2,
+        0x63 => Code::Numpad3, 0x64 => Code::Numpad4, 0x65 => Code::Numpad5,
+        0x66 => Code::Numpad6, 0x67 => Code::Numpad7, 0x68 => Code::Numpad8,
+        0x69 => Code::Numpad9, 0x6A => Code::NumpadMultiply, 0x6B => Code::NumpadAdd,
+        0x6D => Code::NumpadSubtract, 0x6E => Code::NumpadDecimal, 0x6F => Code::NumpadDivide,
+        0x90 => Code::NumLock,
+        // Punctuation
+        0xBA => Code::Semicolon, 0xBB => Code::Equal, 0xBC => Code::Comma,
+        0xBD => Code::Minus, 0xBE => Code::Period, 0xBF => Code::Slash,
+        0xC0 => Code::Backquote, 0xDB => Code::BracketLeft, 0xDC => Code::Backslash,
+        0xDD => Code::BracketRight, 0xDE => Code::Quote,
+        // Pause, Scroll Lock, media and volume keys
+        0x13 => Code::Pause, 0x91 => Code::ScrollLock,
+        0xAD => Code::AudioVolumeMute, 0xAE => Code::AudioVolumeDown, 0xAF => Code::AudioVolumeUp,
+        0xB0 => Code::MediaTrackNext, 0xB1 => Code::MediaTrackPrevious,
+        0xB2 => Code::MediaStop, 0xB3 => Code::MediaPlayPause,
+        // Not here, so raw input carries them on Windows: Menu (0x5D), Sleep
+        // (0x5F), the browser and launch keys (0xA6-0xAC, 0xB4-0xB7) and the
+        // extra key on European keyboards (0xE2).
         0x08 => Code::Backspace,
         0x09 => Code::Tab,
         0x0D => Code::Enter,
@@ -312,4 +345,22 @@ fn vk_to_code(vk: u32) -> Option<Code> {
         },
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Keys `global-hotkey` 0.7 has no `Code` for on Windows; raw input
+    /// carries them there instead.
+    const RAW_ONLY: &[u32] = &[0x5D, 0x5F, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xB4, 0xB5, 0xB6, 0xB7, 0xE2];
+
+    #[test]
+    fn every_key_settings_offers_registers_or_rides_raw_input() {
+        for info in framefang_core::settings::KEYS {
+            let mapped = vk_to_code(info.vk).is_some();
+            assert!(mapped != RAW_ONLY.contains(&info.vk),
+                "{} (0x{:02X}): mapped={mapped}, listed raw-only={}", info.label, info.vk, RAW_ONLY.contains(&info.vk));
+        }
+    }
 }

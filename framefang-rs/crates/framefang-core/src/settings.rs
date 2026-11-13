@@ -96,48 +96,97 @@ impl Modifiers {
     }
 }
 
-/// Map a Win32 virtual-key code to a short, user-facing label.
-///
-/// Canonical source for VK → label rendering shared by the Settings dialog,
-/// the tray tooltip, and any future UI surface. Returns `None` for codes the
-/// rebind widget doesn't know how to display so callers can render an
-/// "(0xNN)" fallback. Keep this list in sync with `vk_to_code` in
-/// `framefang-platform::hotkey` — anything `vk_to_code` accepts should have a
-/// label here.
+/// One key a hotkey can use: its Win32 virtual-key code (the settings.json
+/// wire format), the name Settings shows, and whether it may be bound alone.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyInfo {
+    pub vk: u32,
+    pub label: &'static str,
+    /// A key that is not for typing or moving around (Print Screen, F-keys,
+    /// Pause, media keys) works on its own. A typing key (letters, digits,
+    /// punctuation, Space, arrows, the numpad) needs Ctrl, Alt, Shift or Win
+    /// with it: bound alone, it would stop typing that character everywhere.
+    pub alone: bool,
+}
+
+const fn k(vk: u32, label: &'static str, alone: bool) -> KeyInfo { KeyInfo { vk, label, alone } }
+
+/// Every key Settings can bind, in one place: the rebind widget, the labels,
+/// the "needs a modifier" guard and the platform registration all read it.
+/// Labels are ASCII (the 5x7 bitmap font has nothing else).
+pub const KEYS: &[KeyInfo] = &[
+    k(0x08, "Backspace", false), k(0x09, "Tab", false), k(0x0D, "Enter", false),
+    k(0x13, "Pause", true), k(0x14, "CapsLock", false), k(0x1B, "Esc", false),
+    k(0x20, "Space", false),
+    k(0x21, "PageUp", false), k(0x22, "PageDown", false), k(0x23, "End", false), k(0x24, "Home", false),
+    k(0x25, "Left", false), k(0x26, "Up", false), k(0x27, "Right", false), k(0x28, "Down", false),
+    k(0x2C, "PrintScreen", true), k(0x2D, "Insert", true), k(0x2E, "Delete", false),
+    k(0x30, "0", false), k(0x31, "1", false), k(0x32, "2", false), k(0x33, "3", false), k(0x34, "4", false),
+    k(0x35, "5", false), k(0x36, "6", false), k(0x37, "7", false), k(0x38, "8", false), k(0x39, "9", false),
+    k(0x41, "A", false), k(0x42, "B", false), k(0x43, "C", false), k(0x44, "D", false), k(0x45, "E", false),
+    k(0x46, "F", false), k(0x47, "G", false), k(0x48, "H", false), k(0x49, "I", false), k(0x4A, "J", false),
+    k(0x4B, "K", false), k(0x4C, "L", false), k(0x4D, "M", false), k(0x4E, "N", false), k(0x4F, "O", false),
+    k(0x50, "P", false), k(0x51, "Q", false), k(0x52, "R", false), k(0x53, "S", false), k(0x54, "T", false),
+    k(0x55, "U", false), k(0x56, "V", false), k(0x57, "W", false), k(0x58, "X", false), k(0x59, "Y", false),
+    k(0x5A, "Z", false),
+    k(0x5D, "Menu", true), k(0x5F, "Sleep", true),
+    k(0x60, "Num 0", false), k(0x61, "Num 1", false), k(0x62, "Num 2", false), k(0x63, "Num 3", false),
+    k(0x64, "Num 4", false), k(0x65, "Num 5", false), k(0x66, "Num 6", false), k(0x67, "Num 7", false),
+    k(0x68, "Num 8", false), k(0x69, "Num 9", false),
+    k(0x6A, "Num *", false), k(0x6B, "Num +", false), k(0x6D, "Num -", false), k(0x6E, "Num .", false),
+    k(0x6F, "Num /", false),
+    k(0x70, "F1", true), k(0x71, "F2", true), k(0x72, "F3", true), k(0x73, "F4", true),
+    k(0x74, "F5", true), k(0x75, "F6", true), k(0x76, "F7", true), k(0x77, "F8", true),
+    k(0x78, "F9", true), k(0x79, "F10", true), k(0x7A, "F11", true), k(0x7B, "F12", true),
+    k(0x7C, "F13", true), k(0x7D, "F14", true), k(0x7E, "F15", true), k(0x7F, "F16", true),
+    k(0x80, "F17", true), k(0x81, "F18", true), k(0x82, "F19", true), k(0x83, "F20", true),
+    k(0x84, "F21", true), k(0x85, "F22", true), k(0x86, "F23", true), k(0x87, "F24", true),
+    k(0x90, "NumLock", false), k(0x91, "ScrollLock", true),
+    k(0xA6, "Browser Back", true), k(0xA7, "Browser Forward", true), k(0xA8, "Browser Refresh", true),
+    k(0xA9, "Browser Stop", true), k(0xAA, "Browser Search", true), k(0xAB, "Favorites", true),
+    k(0xAC, "Browser Home", true),
+    k(0xAD, "Mute", true), k(0xAE, "Volume Down", true), k(0xAF, "Volume Up", true),
+    k(0xB0, "Next Track", true), k(0xB1, "Previous Track", true), k(0xB2, "Stop", true),
+    k(0xB3, "Play/Pause", true),
+    k(0xB4, "Mail", true), k(0xB5, "Media", true), k(0xB6, "App 1", true), k(0xB7, "App 2", true),
+    k(0xBA, ";", false), k(0xBB, "=", false), k(0xBC, ",", false), k(0xBD, "-", false),
+    k(0xBE, ".", false), k(0xBF, "/", false), k(0xC0, "`", false),
+    k(0xDB, "[", false), k(0xDC, "\\", false), k(0xDD, "]", false), k(0xDE, "'", false),
+    k(0xE2, "<>", false),
+];
+
+/// The entry for `vk`, if Settings knows the key.
+pub fn key_info(vk: u32) -> Option<&'static KeyInfo> {
+    KEYS.iter().find(|i| i.vk == vk)
+}
+
+/// Map a Win32 virtual-key code to a short, user-facing label, or `None` for
+/// a key not in [`KEYS`] (callers show "(0xNN)").
 pub fn vk_label(vk: u32) -> Option<&'static str> {
-    Some(match vk {
-        0x08 => "Backspace",
-        0x09 => "Tab",
-        0x0D => "Enter",
-        0x14 => "CapsLock",
-        0x1B => "Esc",
-        0x20 => "Space",
-        0x21 => "PageUp",
-        0x22 => "PageDown",
-        0x23 => "End",
-        0x24 => "Home",
-        0x25 => "Left",
-        0x26 => "Up",
-        0x27 => "Right",
-        0x28 => "Down",
-        0x2C => "PrintScreen",
-        0x2D => "Insert",
-        0x2E => "Delete",
-        0x91 => "ScrollLock",
-        0x13 => "Pause",
-        0x30 => "0", 0x31 => "1", 0x32 => "2", 0x33 => "3", 0x34 => "4",
-        0x35 => "5", 0x36 => "6", 0x37 => "7", 0x38 => "8", 0x39 => "9",
-        0x41 => "A", 0x42 => "B", 0x43 => "C", 0x44 => "D", 0x45 => "E",
-        0x46 => "F", 0x47 => "G", 0x48 => "H", 0x49 => "I", 0x4A => "J",
-        0x4B => "K", 0x4C => "L", 0x4D => "M", 0x4E => "N", 0x4F => "O",
-        0x50 => "P", 0x51 => "Q", 0x52 => "R", 0x53 => "S", 0x54 => "T",
-        0x55 => "U", 0x56 => "V", 0x57 => "W", 0x58 => "X", 0x59 => "Y",
-        0x5A => "Z",
-        0x70 => "F1",  0x71 => "F2",  0x72 => "F3",  0x73 => "F4",
-        0x74 => "F5",  0x75 => "F6",  0x76 => "F7",  0x77 => "F8",
-        0x78 => "F9",  0x79 => "F10", 0x7A => "F11", 0x7B => "F12",
-        _ => return None,
-    })
+    key_info(vk).map(|i| i.label)
+}
+
+/// Whether `vk` with no modifier makes a sensible hotkey. Keys we don't know
+/// are treated as special keys and allowed.
+pub fn bindable_alone(vk: u32) -> bool {
+    key_info(vk).map_or(true, |i| i.alone)
+}
+
+/// The modifiers that keep a typing key from typing. Shift doesn't count
+/// (Shift+S types a capital S), and on macOS neither does Option (Option+S
+/// types a symbol).
+pub fn typing_safe_modifiers() -> Modifiers {
+    if cfg!(target_os = "macos") {
+        Modifiers::SUPER | Modifiers::CONTROL
+    } else {
+        Modifiers::CONTROL | Modifiers::ALT | Modifiers::SUPER
+    }
+}
+
+/// Whether `hk` would take a key away from typing: a typing key (see
+/// [`KeyInfo::alone`]) with none of [`typing_safe_modifiers`].
+pub fn blocks_typing(hk: &Hotkey) -> bool {
+    !bindable_alone(hk.virtual_key) && !hk.modifiers.intersects(typing_safe_modifiers())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -409,6 +458,33 @@ mod tests {
         assert_eq!(s.last_tool, s2.last_tool);
         assert_eq!(s.last_color_argb, s2.last_color_argb);
         assert_eq!(s.hotkey_virtual_key, s2.hotkey_virtual_key);
+    }
+
+    #[test]
+    fn the_key_table_is_unique_ascii_and_guards_typing_keys() {
+        let mut seen = std::collections::HashSet::new();
+        for i in KEYS {
+            assert!(seen.insert(i.vk), "vk 0x{:02X} listed twice", i.vk);
+            assert!(i.label.bytes().all(|b| (0x20..=0x7E).contains(&b)), "{} is not ASCII", i.label);
+        }
+        for vk in [0x2C, 0x13, 0x7C, 0x87, 0x5D, 0xB3, 0x70] {
+            assert!(bindable_alone(vk), "0x{vk:02X} should work alone");
+        }
+        for vk in [0x41, 0x31, 0x20, 0x25, 0x0D, 0x60, 0xBA, 0x08] {
+            assert!(!bindable_alone(vk), "0x{vk:02X} is a typing key");
+        }
+        assert!(bindable_alone(0xE8), "unknown keys are special keys");
+        assert_eq!(vk_label(0x7C), Some("F13"));
+    }
+
+    #[test]
+    fn a_typing_key_needs_a_modifier_that_stops_it_typing() {
+        let hk = |m: Modifiers, vk: u32| Hotkey { modifiers: m, virtual_key: vk };
+        assert!(blocks_typing(&hk(Modifiers::empty(), 0x53)), "S alone types S");
+        assert!(blocks_typing(&hk(Modifiers::SHIFT, 0x53)), "Shift+S types a capital S");
+        assert!(!blocks_typing(&hk(Modifiers::CONTROL | Modifiers::SHIFT, 0x53)));
+        assert!(!blocks_typing(&hk(Modifiers::empty(), 0x2C)), "Print Screen types nothing");
+        assert!(!blocks_typing(&hk(Modifiers::SHIFT, 0x7C)), "Shift+F13 is fine");
     }
 
     #[test]

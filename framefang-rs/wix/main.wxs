@@ -7,8 +7,8 @@
   `cargo wix init` on Windows with WiX 3.x on PATH — but prefer manual
   edits so the UpgradeCode GUID and ProductCode stay stable across builds
   (winget + chocolatey both pin to a fixed UpgradeCode/ProductCode pair).
-  The UpgradeCode is Framefang's own (new for 1.0.0): sharing Kashot's would
-  make this MSI uninstall an installed Kashot as an "older version".
+  The UpgradeCode is Framefang's own (new for 1.0.0) and must never change:
+  every Framefang MSI upgrades the ones before it through it.
 
   Inputs at build time:
     - $(var.CargoTargetBinDir)\framefang.exe       built by `cargo build` (release profile)

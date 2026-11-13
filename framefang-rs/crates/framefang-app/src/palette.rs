@@ -194,6 +194,16 @@ pub fn TEXT_DIM() -> u32 { c().text_dim }
 pub fn TOGGLE_OFF() -> u32 { c().toggle_off }
 pub fn TOGGLE_OFF_K() -> u32 { c().toggle_off_knob }
 pub fn SCROLLBAR_BG() -> u32 { c().scrollbar_bg }
+/// Behind a primary button on hover, or an armed one (a rebind listening):
+/// a faint wash of the accent over the page.
+pub fn PRIMARY_FILL() -> u32 {
+    let (a, b) = (c().accent, c().bg_body);
+    let mix = |s: u32| {
+        let (fa, fb) = (((a >> s) & 0xFF) as f32, ((b >> s) & 0xFF) as f32);
+        (fb + (fa - fb) * 0.16).round() as u32
+    };
+    (mix(16) << 16) | (mix(8) << 8) | mix(0)
+}
 
 // ── colors that never change ────────────────────────────────────────────────
 
@@ -203,41 +213,9 @@ pub const DANGER: u32 = 0x00_FF_5C_3A;
 pub const WARN: u32 = 0x00_FF_B0_20;
 pub const OK_TINT: u32 = 0x00_3D_F5_C8;
 
-/// The rule under a dialog header: a 1 px line in the accent, faded at both
-/// ends so it reads as light rather than a drawn border.
-pub fn header_rule(buf: &mut [u32], win_w: usize, win_h: usize, y: i32) {
-    if y < 0 || y as usize >= win_h || win_w == 0 { return; }
-    let accent = LASER();
-    let row = y as usize * win_w;
-    for x in 0..win_w {
-        let t = x as f32 / (win_w - 1).max(1) as f32;
-        // Fade over the outer 12 % at each end.
-        let edge = (t.min(1.0 - t) / 0.12).min(1.0);
-        let d = buf[row + x];
-        let mix = |shift: u32| {
-            let s = ((accent >> shift) & 0xFF) as f32;
-            let b = ((d >> shift) & 0xFF) as f32;
-            (b + (s - b) * edge * 0.85).round() as u32
-        };
-        buf[row + x] = (mix(16) << 16) | (mix(8) << 8) | mix(0);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_header_rule_fades_out_at_both_ends() {
-        let w = 200;
-        let bg = BG_TOP();
-        let mut buf = vec![bg; w * 3];
-        header_rule(&mut buf, w, 3, 1);
-        assert_eq!(buf[w], bg, "left end is the background");
-        assert_eq!(buf[2 * w - 1], bg, "right end is the background");
-        assert_ne!(buf[w + w / 2], bg, "the middle is lit");
-        assert_eq!(buf[0], bg, "other rows untouched");
-    }
 
     #[test]
     fn stored_names_round_trip_and_old_values_fall_back_to_pink() {

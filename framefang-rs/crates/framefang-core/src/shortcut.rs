@@ -46,10 +46,13 @@ pub fn keysym_name(vk: u32) -> Option<&'static str> {
         "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m",
         "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z",
     ];
-    /// Keysym names for `VK_F1`..`VK_F12` (0x70..=0x7B).
-    const FKEYS: [&str; 12] = [
+    /// Keysym names for `VK_F1`..`VK_F24` (0x70..=0x87).
+    const FKEYS: [&str; 24] = [
         "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
+        "F13", "F14", "F15", "F16", "F17", "F18", "F19", "F20", "F21", "F22", "F23", "F24",
     ];
+    /// Keysym names for `VK_NUMPAD0`..`VK_NUMPAD9` (0x60..=0x69).
+    const KEYPAD: [&str; 10] = ["KP_0", "KP_1", "KP_2", "KP_3", "KP_4", "KP_5", "KP_6", "KP_7", "KP_8", "KP_9"];
 
     Some(match vk {
         0x08 => "BackSpace",
@@ -75,7 +78,49 @@ pub fn keysym_name(vk: u32) -> Option<&'static str> {
         0x91 => "Scroll_Lock",
         0x30..=0x39 => DIGITS[(vk - 0x30) as usize],
         0x41..=0x5A => LETTERS[(vk - 0x41) as usize],
-        0x70..=0x7B => FKEYS[(vk - 0x70) as usize],
+        0x70..=0x87 => FKEYS[(vk - 0x70) as usize],
+        0x60..=0x69 => KEYPAD[(vk - 0x60) as usize],
+        0x6A => "KP_Multiply",
+        0x6B => "KP_Add",
+        0x6D => "KP_Subtract",
+        0x6E => "KP_Decimal",
+        0x6F => "KP_Divide",
+        0x90 => "Num_Lock",
+        0x5D => "Menu",
+        // Media, browser and launch keys carry XFree86 names in XKB.
+        0x5F => "XF86Sleep",
+        0xA6 => "XF86Back",
+        0xA7 => "XF86Forward",
+        0xA8 => "XF86Refresh",
+        0xA9 => "XF86Stop",
+        0xAA => "XF86Search",
+        0xAB => "XF86Favorites",
+        0xAC => "XF86HomePage",
+        0xAD => "XF86AudioMute",
+        0xAE => "XF86AudioLowerVolume",
+        0xAF => "XF86AudioRaiseVolume",
+        0xB0 => "XF86AudioNext",
+        0xB1 => "XF86AudioPrev",
+        0xB2 => "XF86AudioStop",
+        0xB3 => "XF86AudioPlay",
+        0xB4 => "XF86Mail",
+        0xB5 => "XF86AudioMedia",
+        0xB6 => "XF86MyComputer",
+        0xB7 => "XF86Calculator",
+        // Punctuation: the unshifted keysym on a US layout.
+        0xBA => "semicolon",
+        0xBB => "equal",
+        0xBC => "comma",
+        0xBD => "minus",
+        0xBE => "period",
+        0xBF => "slash",
+        0xC0 => "grave",
+        0xDB => "bracketleft",
+        0xDC => "backslash",
+        0xDD => "bracketright",
+        0xDE => "apostrophe",
+        // The extra key beside left Shift on European keyboards.
+        0xE2 => "less",
         _ => return None,
     })
 }

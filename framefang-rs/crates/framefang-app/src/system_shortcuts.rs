@@ -38,7 +38,7 @@ pub fn page() -> Option<Page> {
     {
         Some(Page {
             line: "Windows' own Print Screen shortcut",
-            button: "OPEN WINDOWS SETTING",
+            button: "OPEN WINDOWS SETTINGS",
             target: Target::WindowsKeyboard,
         })
     }
@@ -80,6 +80,10 @@ fn linux_page(desktop: &str) -> Option<Page> {
 }
 
 impl Page {
+    /// Windows' page, which Settings explains as a guide card rather than a
+    /// one-line link.
+    pub fn is_windows(&self) -> bool { matches!(self.target, Target::WindowsKeyboard) }
+
     pub fn open(&self) -> Result<(), String> {
         match self.target {
             Target::WindowsKeyboard => open_windows_keyboard(),
@@ -134,15 +138,65 @@ fn print_screen_page_from<'a>(index_files: impl IntoIterator<Item = &'a str>) ->
     }
 }
 
+/// Windows' settings index files (`AllSystemSettings_*.xml`), as text.
 #[cfg(windows)]
-fn print_screen_page() -> &'static str {
+fn index_files() -> Vec<String> {
     let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
     let dir = std::path::Path::new(&root).join("ImmersiveControlPanel").join("Settings");
-    let files: Vec<String> = std::fs::read_dir(dir).into_iter().flatten().flatten()
+    std::fs::read_dir(dir).into_iter().flatten().flatten()
         .filter(|e| e.file_name().to_string_lossy().starts_with("AllSystemSettings_"))
         .filter_map(|e| std::fs::read_to_string(e.path()).ok())
-        .collect();
+        .collect()
+}
+
+#[cfg(windows)]
+fn print_screen_page() -> &'static str {
+    let files = index_files();
     print_screen_page_from(files.iter().map(String::as_str))
+}
+
+/// What Windows calls the Print Screen switch, in English. The real wording
+/// is read from Windows itself (`switch_name`), in the user's language.
+const SWITCH_NAME_EN: &str = "Use the Print screen key to open screen capture";
+
+/// The resource reference Windows' index gives as the switch's name, e.g.
+/// `@{windows?ms-resource://.../UsePrintScreenKeyForSnippingEnabled3/Description}`.
+fn switch_name_resource(index_xml: &str) -> Option<&str> {
+    let at = index_xml.find("UsePrintScreenKeyForSnippingEnabled")?;
+    let rest = &index_xml[at..];
+    let start = rest.find("<Description>")? + "<Description>".len();
+    let end = start + rest[start..].find("</Description>")?;
+    let value = rest[start..end].trim();
+    (value.starts_with("@{") && value.contains("UsePrintScreenKeyForSnippingEnabled")).then_some(value)
+}
+
+/// The switch's name exactly as this Windows shows it (its language, its
+/// build's wording), so the guide in Settings matches what the user sees.
+pub fn switch_name() -> String {
+    #[cfg(windows)]
+    {
+        use windows::core::HSTRING;
+        use windows::Win32::UI::Shell::SHLoadIndirectString;
+        for xml in index_files() {
+            let Some(res) = switch_name_resource(&xml) else { continue };
+            let mut buf = [0u16; 512];
+            if unsafe { SHLoadIndirectString(&HSTRING::from(res), &mut buf, None) }.is_ok() {
+                let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+                let name = String::from_utf16_lossy(&buf[..len]);
+                if !name.trim().is_empty() { return name; }
+            }
+        }
+    }
+    SWITCH_NAME_EN.to_owned()
+}
+
+/// Where the switch lives, as a path through Windows Settings.
+pub fn windows_page_path() -> &'static str {
+    #[cfg(windows)]
+    {
+        if print_screen_page() == PRINT_SCREEN_PAGE_OLD { return "Accessibility > Keyboard"; }
+    }
+    "Bluetooth & devices > Keyboard"
 }
 
 #[cfg(windows)]
@@ -237,6 +291,20 @@ mod tests {
         assert_eq!(print_screen_page_in(moved), Some(PRINT_SCREEN_PAGE_NEW));
         assert_eq!(print_screen_page_in(old), Some(PRINT_SCREEN_PAGE_OLD));
         assert_eq!(print_screen_page_in("<PageID>SettingsPageDevicesKeyboard</PageID>"), None);
+    }
+
+    #[test]
+    fn the_switch_name_comes_from_its_own_index_entry() {
+        let xml = "<Filename>AAA_SystemSettings_Accessibility_SoundSentry</Filename>\
+            <Description>@{windows?ms-resource://X/SearchResources/SystemSettings_Accessibility_SoundSentry/Description}</Description>\
+            <Filename>AAA_SystemSettings_Accessibility_UsePrintScreenKeyForSnippingEnabled3</Filename>\
+            <PageID>SettingsPageDevicesKeyboard</PageID>\
+            <Description>@{windows?ms-resource://X/SearchResources/SystemSettings_Accessibility_UsePrintScreenKeyForSnippingEnabled3/Description}</Description>";
+        assert_eq!(switch_name_resource(xml),
+            Some("@{windows?ms-resource://X/SearchResources/SystemSettings_Accessibility_UsePrintScreenKeyForSnippingEnabled3/Description}"));
+        // Never another setting's name.
+        assert_eq!(switch_name_resource("<Filename>UsePrintScreenKeyForSnippingEnabled</Filename><Description>plain</Description>"), None);
+        assert!(!switch_name().trim().is_empty());
     }
 
     #[test]

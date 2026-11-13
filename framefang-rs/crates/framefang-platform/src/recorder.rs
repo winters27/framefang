@@ -552,19 +552,33 @@ impl Drop for Recorder {
 
 // ── ffmpeg lookup (shared by Linux + Windows) ───────────────────────────────
 
-/// Locate a usable `ffmpeg` binary. Mirrors `framefang-app`'s `locate_ffmpeg`
-/// but lives in `framefang-platform` so the recorder doesn't pull a reverse
-/// dependency on the app crate. Search order:
+/// Where Framefang keeps the FFmpeg it downloads for people who have none:
+/// `%LOCALAPPDATA%\Framefang\ffmpeg\ffmpeg.exe`. Windows only; elsewhere
+/// FFmpeg comes from the system's package manager.
+pub fn downloaded_ffmpeg_path() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("LOCALAPPDATA")
+            .map(|d| PathBuf::from(d).join("Framefang").join("ffmpeg").join("ffmpeg.exe"))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+}
+
+/// Locate a usable `ffmpeg` binary: the one lookup recording, conversion and
+/// Settings all share. Search order:
 ///
-///   1. Next to our own executable (installer bundle layout).
+///   1. Next to our own executable (a local build's copy).
 ///   2. macOS `.app/Contents/Resources/ffmpeg`.
-///   3. `PATH`.
+///   3. `PATH`, so an FFmpeg the user already has always wins.
+///   4. The copy Framefang downloaded (`downloaded_ffmpeg_path`).
 ///
 /// Returns `None` if no candidate is found — callers fall back to plain
 /// `"ffmpeg"` so the existing "ffmpeg not found in PATH" error message still
 /// surfaces from `Command::spawn`.
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn locate_ffmpeg() -> Option<PathBuf> {
+pub fn locate_ffmpeg() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
     let bundle_name = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
@@ -585,7 +599,7 @@ fn locate_ffmpeg() -> Option<PathBuf> {
             if candidate.is_file() { return Some(candidate); }
         }
     }
-    None
+    downloaded_ffmpeg_path().filter(|p| p.is_file())
 }
 
 // ── platform spawn / signal ─────────────────────────────────────────────────

@@ -439,29 +439,26 @@ impl ConvertImageView {
         // The dialog draws into its own buffer, placed below the title strip.
         let win_h = (h.get() as usize).saturating_sub(crate::chrome::TITLE_H as usize);
         let mut buf = vec![0u32; win_w * win_h];
-        for y in 0..win_h {
-            let band = if (y as i32) < HEADER_H { BG_TOP() } else { BG_BODY() };
-            for x in 0..win_w { buf[y * win_w + x] = band; }
-        }
-        crate::palette::header_rule(&mut buf, win_w, win_h, HEADER_H);
+        crate::hud::backdrop(&mut buf, win_w, win_h, HEADER_H);
         let _ = PANEL_BORDER();
 
         let mut surf = BufferSurface { buf: &mut buf, w: win_w as i32, h: win_h as i32 };
 
         // Title.
-        draw_text(&mut surf, PAD, 22, 2, "FRAMEFANG // CONVERT IMAGE", argb_to_framefang(LASER()));
+        crate::hud::heading(surf.buf, win_w, win_h, PAD, 22, "FRAMEFANG // CONVERT IMAGE");
         draw_text(&mut surf, PAD, 50, 1, "Re-encode PNG / JPG / WEBP / BMP without leaving the tray.",
                   argb_to_framefang(TEXT_MUTED()));
 
-        // Section headers.
+        // Section headers, numbered in the order shown.
+        let mut sec = 0;
         if let Some(r) = self.rows.iter().find(|r| r.kind == WidgetKind::Source) {
-            section_header(&mut surf, "SOURCE", r.rect.1 - 22);
+            section_header(&mut surf, &mut sec, "SOURCE", r.rect.1 - 22);
         }
         if let Some(r) = self.rows.iter().find(|r| r.kind == WidgetKind::FormatPng) {
-            section_header(&mut surf, "FORMAT", r.rect.1 - 22);
+            section_header(&mut surf, &mut sec, "FORMAT", r.rect.1 - 22);
         }
         if let Some(r) = self.rows.iter().find(|r| r.kind == WidgetKind::ResizeSource) {
-            section_header(&mut surf, "RESIZE  (downscale only)", r.rect.1 - 22);
+            section_header(&mut surf, &mut sec, "RESIZE  (downscale only)", r.rect.1 - 22);
         }
         // QUALITY section is meaningful only for formats with a quality
         // knob (JPG / WEBP). For PNG / BMP we skip both the section
@@ -469,7 +466,7 @@ impl ConvertImageView {
         // a permanently-disabled control with an "n/a" placeholder.
         if self.format.supports_quality() {
             if let Some(r) = self.rows.iter().find(|r| r.kind == WidgetKind::Quality) {
-                section_header(&mut surf, "QUALITY", r.rect.1 - 22);
+                section_header(&mut surf, &mut sec, "QUALITY", r.rect.1 - 22);
             }
         }
 
@@ -497,20 +494,11 @@ impl ConvertImageView {
     }
 }
 
-fn section_header<S: painter::Surface>(surf: &mut S, text: &str, y: i32) {
-    draw_text(surf, PAD, y, 1, text, argb_to_framefang(SECTION_TINT()));
-    let tw = bitmap_font::measure(text, 1);
-    let rule_x0 = PAD + tw + 10;
-    let rule_x1 = WIN_W as i32 - PAD;
-    let rule_y  = y + bitmap_font::GLYPH_H / 2;
-    for x in rule_x0..rule_x1 {
-        surf.write(x, rule_y, [
-            ((HEADER_RULE() >> 16) & 0xFF) as u8,
-            ((HEADER_RULE() >>  8) & 0xFF) as u8,
-            ( HEADER_RULE()        & 0xFF) as u8,
-            0xFF,
-        ]);
-    }
+/// The next section label (`hud::section`), numbered in the order they
+/// appear: `n` counts the ones already drawn this frame.
+fn section_header(surf: &mut BufferSurface, n: &mut usize, text: &str, y: i32) {
+    *n += 1;
+    crate::hud::section(surf.buf, surf.w as usize, surf.h as usize, PAD, WIN_W as i32 - PAD, y, *n, text);
 }
 
 fn render_row<S: painter::Surface>(
@@ -527,7 +515,7 @@ fn render_row<S: painter::Surface>(
     if matches!(row.kind, WidgetKind::Convert | WidgetKind::Close) {
         let is_primary = row.kind == WidgetKind::Convert;
         let border = if is_primary { LASER() } else if hovered { LASER_DIM() } else { PANEL_BORDER() };
-        let fill   = if is_primary && hovered { 0x0000_2818 } else if hovered { HOVER_FILL() } else { 0x0000_0000 };
+        let fill   = if is_primary && hovered { PRIMARY_FILL() } else if hovered { HOVER_FILL() } else { 0x0000_0000 };
         if fill != 0 { fill_rect(surf, rx, ry, rw, rh, argb_to_framefang(fill)); }
         stroke_rect_argb(surf, rx, ry, rw, rh, argb_to_framefang(border));
         let tw = bitmap_font::measure(row.label, 1);

@@ -177,16 +177,12 @@ impl FirstRunView {
         // The dialog draws into its own buffer, placed below the title strip.
         let win_h = (h.get() as usize).saturating_sub(crate::chrome::TITLE_H as usize);
         let mut buf = vec![0u32; win_w * win_h];
-        for y in 0..win_h {
-            let band = if (y as i32) < HEADER_H { BG_TOP() } else { BG_BODY() };
-            for x in 0..win_w { buf[y * win_w + x] = band; }
-        }
-        crate::palette::header_rule(&mut buf, win_w, win_h, HEADER_H);
+        crate::hud::backdrop(&mut buf, win_w, win_h, HEADER_H);
 
         let mut surf = BufferSurface { buf: &mut buf, w: win_w as i32, h: win_h as i32 };
 
         // Title strip.
-        draw_text(&mut surf, PAD, 22, 2, "FRAMEFANG // WELCOME", argb_to_framefang(LASER()));
+        crate::hud::heading(surf.buf, win_w, win_h, PAD, 22, "FRAMEFANG // WELCOME");
         let version = format!("v{}  //  first run", env!("CARGO_PKG_VERSION"));
         draw_text(&mut surf, PAD, 50, 1, &version, argb_to_framefang(TEXT_MUTED()));
 
@@ -214,7 +210,7 @@ impl FirstRunView {
         }
 
         let (bx, by, bw, bh) = self.btn;
-        if self.hover { fill_rect(&mut surf, bx, by, bw, bh, argb_to_framefang(0x0000_2818)); }
+        if self.hover { fill_rect(&mut surf, bx, by, bw, bh, argb_to_framefang(PRIMARY_FILL())); }
         stroke_rect_argb(&mut surf, bx, by, bw, bh, argb_to_framefang(LASER()));
         let label = "Got it";
         let tw = bitmap_font::measure(label, 1);

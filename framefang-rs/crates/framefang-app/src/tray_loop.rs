@@ -73,9 +73,11 @@ pub fn run() -> Result<()> {
             // The registration succeeds even when the system takes the key
             // first, so this is the only way to know presses will never arrive.
             if hotkey_error.is_none() && crate::system_shortcuts::system_takes(&settings.hotkey()) {
-                hotkey_error = Some("Windows' Snipping Tool has the Print Screen key. \
-                                     Open Framefang Settings and use the button under Hotkeys \
-                                     to hand it over.".to_owned());
+                hotkey_error = Some(format!(
+                    "Windows is using Print Screen for its own capture. In Settings > {}, \
+                     turn off \u{201C}{}\u{201D}. Framefang's Settings has a button that opens it.",
+                    crate::system_shortcuts::windows_page_path(),
+                    crate::system_shortcuts::switch_name()));
             }
             Some(hk)
         }
@@ -274,6 +276,8 @@ pub fn run() -> Result<()> {
                     }
                 }
             }
+            // An open Settings window follows the FFmpeg download's progress.
+            if let Some(v) = self.settings_view.as_mut() { v.tick(); }
             // Collected before dispatch so the manager borrow is done with
             // by the time an action mutates `self`.
             let fired = self.hotkeys.as_ref().map(|hk| hk.drain_pressed()).unwrap_or_default();
@@ -669,6 +673,7 @@ pub fn run() -> Result<()> {
                     "Stop the current recording before starting another one.", true);
                 return;
             }
+            if !self.have_ffmpeg(loop_target, "Recording") { return; }
             let dir   = recordings_directory_for(&self.settings);
             let stamp = Local::now().format("%Y%m%d_%H%M%S");
             let out   = dir.join(format!("framefang_{stamp}.mp4"));
@@ -883,9 +888,7 @@ pub fn run() -> Result<()> {
         /// `<stem>_annotated.mp4`; the original is untouched.
         fn burn_annotations(&mut self, video: PathBuf, commit: VideoCommit) {
             let Some(ffmpeg) = crate::convert_video_form::locate_ffmpeg() else {
-                notify("Framefang — annotate failed",
-                    "ffmpeg not found — bundle it next to framefang or install it on PATH.",
-                    true);
+                notify("Framefang — annotate failed", crate::ffmpeg_fetch::missing_message(), true);
                 return;
             };
             let out = annotated_output_path(&video);
@@ -925,6 +928,30 @@ pub fn run() -> Result<()> {
         /// the user actually clicks "Settings…". A second click while the
         /// dialog is open just raises focus to the existing window.
         fn show_settings(&mut self, loop_target: &ActiveEventLoop) {
+            self.open_settings(loop_target, false);
+        }
+
+        /// Whether FFmpeg is there for `what` ("Recording", "Video
+        /// conversion"). When it isn't: on Windows, say so and open Settings
+        /// with the FFmpeg row lit and its Download button ready; elsewhere,
+        /// say how to install it.
+        fn have_ffmpeg(&mut self, loop_target: &ActiveEventLoop, what: &str) -> bool {
+            if crate::convert_video_form::locate_ffmpeg().is_some() { return true; }
+            if crate::ffmpeg_fetch::offered() {
+                notify(&format!("Framefang — {what} needs FFmpeg"),
+                       "Download it from Settings with one click. If you already have FFmpeg, add it to PATH.",
+                       false);
+                match self.settings_view.as_mut() {
+                    Some(v) => v.draw_attention_to_ffmpeg(),
+                    None => self.open_settings(loop_target, true),
+                }
+            } else {
+                notify(&format!("Framefang — {what} needs FFmpeg"), crate::ffmpeg_fetch::missing_message(), true);
+            }
+            false
+        }
+
+        fn open_settings(&mut self, loop_target: &ActiveEventLoop, ffmpeg_attention: bool) {
             if self.settings_view.is_some() { return; }
             // Unregister the global hotkey while Settings is open so the
             // rebind capture widget can receive the user's keystrokes
@@ -934,7 +961,7 @@ pub fn run() -> Result<()> {
             if let Some(hk) = self.hotkeys.as_mut() {
                 hk.unregister_all();
             }
-            match SettingsView::new(loop_target, self.settings.clone()) {
+            match SettingsView::new(loop_target, self.settings.clone(), ffmpeg_attention) {
                 Ok(view) => self.settings_view = Some(view),
                 Err(e)   => {
                     eprintln!("Settings dialog failed to open: {e}");
@@ -1067,6 +1094,7 @@ pub fn run() -> Result<()> {
 
         fn show_convert_video(&mut self, loop_target: &ActiveEventLoop) {
             if self.convert_video_view.is_some() { return; }
+            if !self.have_ffmpeg(loop_target, "Video conversion") { return; }
             match ConvertVideoView::new(loop_target) {
                 Ok(v)  => self.convert_video_view = Some(v),
                 Err(e) => eprintln!("Convert-video dialog failed to open: {e}"),
@@ -1585,7 +1613,7 @@ fn parse_ffmpeg_duration(stderr: &str) -> Option<f32> {
 /// the banner matters.
 fn probe_duration(video: &std::path::Path) -> Result<f32> {
     let ffmpeg = crate::convert_video_form::locate_ffmpeg()
-        .ok_or_else(|| anyhow!("ffmpeg not found — bundle it next to framefang or install it on PATH."))?;
+        .ok_or_else(|| anyhow!(crate::ffmpeg_fetch::missing_message()))?;
     let mut cmd = std::process::Command::new(&ffmpeg);
     cmd.arg("-i").arg(video)
         .stdin(std::process::Stdio::null())
@@ -1619,7 +1647,7 @@ pub(crate) fn extract_frame_at(
     secs:  f32,
 ) -> Result<image::ImageBuffer<image::Rgba<u8>, Vec<u8>>> {
     let ffmpeg = crate::convert_video_form::locate_ffmpeg()
-        .ok_or_else(|| anyhow!("ffmpeg not found — bundle it next to framefang or install it on PATH."))?;
+        .ok_or_else(|| anyhow!(crate::ffmpeg_fetch::missing_message()))?;
     let seq = FRAME_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let frame_png = std::env::temp_dir()
         .join(format!("framefang_annotate_frame_{}_{seq}.png", std::process::id()));
