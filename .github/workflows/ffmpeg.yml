@@ -1,0 +1,143 @@
+# Build the trimmed FFmpeg that Framefang offers to download on Windows, for
+# people who don't have FFmpeg installed already.
+#
+# Run by hand from the Actions tab. It compiles one static ffmpeg.exe with
+# FFmpeg's own codecs and filters plus only the three outside libraries
+# Framefang uses: x264 (H.264), libvpx (VP9) and opus. No ffplay, ffprobe,
+# docs or network code. The result is published as a GitHub Release tagged
+# `ffmpeg-<version>` (never marked "latest", so the app's update check keeps
+# seeing only app releases), with:
+#
+#   framefang-ffmpeg-windows-x86_64.zip   ffmpeg.exe + its license + BUILD.txt
+#   SHA256SUMS                            checked by the app before it unpacks
+#   ffmpeg-<version>.tar.xz               FFmpeg's source (GPL)
+#   msys2-sources/*.src.tar.zst           x264, libvpx, opus and zlib sources
+#
+# The app looks for the tag `ffmpeg-<version>` named in
+# crates/framefang-app/src/ffmpeg_fetch.rs (FFMPEG_TAG).
+
+name: FFmpeg
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  FFMPEG_VERSION: '7.1.2'
+
+jobs:
+  windows:
+    name: Build ffmpeg.exe (Windows x86_64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            make diffutils nasm tar xz zip curl
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-x264
+            mingw-w64-x86_64-libvpx
+            mingw-w64-x86_64-opus
+            mingw-w64-x86_64-zlib
+
+      - name: Get the FFmpeg source
+        run: |
+          curl -fL --retry 3 -o "ffmpeg-$FFMPEG_VERSION.tar.xz" "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz"
+          tar xf "ffmpeg-$FFMPEG_VERSION.tar.xz"
+
+      - name: Configure
+        run: |
+          cd "ffmpeg-$FFMPEG_VERSION"
+          ./configure \
+            --pkg-config-flags=--static \
+            --extra-ldflags=-static \
+            --enable-static --disable-shared \
+            --enable-gpl \
+            --enable-libx264 --enable-libvpx --enable-libopus --enable-zlib \
+            --disable-ffplay --disable-ffprobe \
+            --disable-doc --disable-debug --disable-network \
+            --disable-iconv --disable-bzlib --disable-lzma --disable-sdl2 \
+            --enable-small \
+            | tee ../configure.log
+
+      - name: Build
+        run: |
+          cd "ffmpeg-$FFMPEG_VERSION"
+          make -j"$(nproc)"
+          strip ffmpeg.exe
+          ls -l ffmpeg.exe
+
+      # Everything Framefang asks ffmpeg for. A missing piece fails here,
+      # not on a user's machine.
+      - name: Check it has what Framefang uses
+        run: |
+          cd "ffmpeg-$FFMPEG_VERSION"
+          ./ffmpeg.exe -hide_banner -version | head -1
+          for e in libx264 libvpx-vp9 libopus aac gif png bmp; do
+            ./ffmpeg.exe -hide_banner -encoders | grep -qw "$e" || { echo "missing encoder $e"; exit 1; }
+          done
+          ./ffmpeg.exe -hide_banner -devices | grep -qw gdigrab || { echo "missing gdigrab"; exit 1; }
+          for f in overlay pad amix palettegen paletteuse scale fps; do
+            ./ffmpeg.exe -hide_banner -filters | grep -qw "$f" || { echo "missing filter $f"; exit 1; }
+          done
+          for m in mp4 mov webm matroska gif f32le s16le rawvideo; do
+            ./ffmpeg.exe -hide_banner -muxers -demuxers 2>/dev/null | grep -qw "$m" || ./ffmpeg.exe -hide_banner -formats | grep -qw "$m" || { echo "missing format $m"; exit 1; }
+          done
+          # Fully static: MinGW's own runtime DLLs (libwinpthread, libgcc,
+          # libstdc++, libx264...) are all named lib*.dll; none may be needed.
+          objdump -p ffmpeg.exe | grep "DLL Name" | tee ../dlls.txt
+          if grep -iE "DLL Name: lib" ../dlls.txt; then
+            echo "ffmpeg.exe needs a MinGW DLL; it must link statically"; exit 1
+          fi
+
+      - name: Package
+        run: |
+          mkdir -p dist/pkg dist/msys2-sources
+          cp "ffmpeg-$FFMPEG_VERSION/ffmpeg.exe" dist/pkg/
+          cp "ffmpeg-$FFMPEG_VERSION/COPYING.GPLv2" dist/pkg/LICENSE.txt
+          {
+            echo "Framefang's FFmpeg $FFMPEG_VERSION for Windows x86_64"
+            echo "Built by github.com/${GITHUB_REPOSITORY} workflow run ${GITHUB_RUN_ID}"
+            echo
+            echo "License: GPL-2.0-or-later (FFmpeg with libx264). Source for FFmpeg and"
+            echo "every library linked in is attached to the same GitHub Release."
+            echo
+            echo "Libraries (MSYS2 MINGW64 packages):"
+            pacman -Q mingw-w64-x86_64-x264 mingw-w64-x86_64-libvpx mingw-w64-x86_64-opus mingw-w64-x86_64-zlib
+            echo
+            echo "FFmpeg source sha256: $(sha256sum ffmpeg-$FFMPEG_VERSION.tar.xz | cut -d' ' -f1)"
+            echo
+            echo "Configure:"
+            grep -m1 "^configure" "ffmpeg-$FFMPEG_VERSION/ffbuild/config.log" || head -1 "ffmpeg-$FFMPEG_VERSION/ffbuild/config.log"
+          } > dist/pkg/BUILD.txt
+          (cd dist/pkg && zip -9 ../framefang-ffmpeg-windows-x86_64.zip ffmpeg.exe LICENSE.txt BUILD.txt)
+          cp "ffmpeg-$FFMPEG_VERSION.tar.xz" dist/
+          # Corresponding source for the linked libraries, as MSYS2 publishes it.
+          for p in x264 libvpx opus zlib; do
+            pv=$(pacman -Q "mingw-w64-x86_64-$p" | awk '{print $2}')
+            curl -fL --retry 3 -o "dist/msys2-sources/mingw-w64-$p-$pv.src.tar.zst" \
+              "https://repo.msys2.org/mingw/sources/mingw-w64-$p-$pv.src.tar.zst" \
+              || echo "warning: no source package for $p $pv"
+          done
+          (cd dist && sha256sum framefang-ffmpeg-windows-x86_64.zip > SHA256SUMS && cat SHA256SUMS)
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="ffmpeg-$FFMPEG_VERSION"
+          gh release create "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "FFmpeg $FFMPEG_VERSION for Framefang" \
+            --notes "The trimmed FFmpeg Framefang downloads on Windows when none is installed. GPL-2.0-or-later; sources attached. Built by workflow run ${GITHUB_RUN_ID}." \
+            --latest=false \
+            dist/framefang-ffmpeg-windows-x86_64.zip dist/SHA256SUMS \
+            "dist/ffmpeg-$FFMPEG_VERSION.tar.xz" dist/msys2-sources/*
