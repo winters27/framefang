@@ -129,15 +129,23 @@ jobs:
           done
           (cd dist && sha256sum framefang-ffmpeg-windows-x86_64.zip > SHA256SUMS && cat SHA256SUMS)
 
+      # In PowerShell: GitHub's `gh` CLI is on the runner's own PATH, not
+      # inside the MSYS2 shell the build steps use.
       - name: Publish
+        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="ffmpeg-$FFMPEG_VERSION"
-          gh release create "$tag" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "FFmpeg $FFMPEG_VERSION for Framefang" \
-            --notes "The trimmed FFmpeg Framefang downloads on Windows when none is installed. GPL-2.0-or-later; sources attached. Built by workflow run ${GITHUB_RUN_ID}." \
-            --latest=false \
-            dist/framefang-ffmpeg-windows-x86_64.zip dist/SHA256SUMS \
-            "dist/ffmpeg-$FFMPEG_VERSION.tar.xz" dist/msys2-sources/*
+          $tag = "ffmpeg-$env:FFMPEG_VERSION"
+          $files = @(
+            'dist/framefang-ffmpeg-windows-x86_64.zip',
+            'dist/SHA256SUMS',
+            "dist/ffmpeg-$env:FFMPEG_VERSION.tar.xz"
+          ) + (Get-ChildItem dist/msys2-sources -File).FullName
+          gh release create $tag `
+            --repo $env:GITHUB_REPOSITORY `
+            --title "FFmpeg $env:FFMPEG_VERSION for Framefang" `
+            --notes "The trimmed FFmpeg Framefang downloads on Windows when none is installed. GPL-2.0-or-later; sources attached. Built by workflow run $env:GITHUB_RUN_ID." `
+            --latest=false `
+            @files
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
