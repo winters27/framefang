@@ -107,6 +107,20 @@ impl AppSettings {
             .collect()
     }
 
+    /// The capture chord with the switch key added, so holding that key with
+    /// the capture key still fires a capture (one that does the other thing,
+    /// see `opens_editor`). `None` when the capture chord already holds that
+    /// modifier (the drag release still reads it) or when another action is
+    /// bound to the result, which then keeps it.
+    pub fn capture_switch_chord(&self) -> Option<Hotkey> {
+        let base = self.hotkey_for(HotkeyAction::Capture)?;
+        let m = self.switch_key().modifier();
+        if base.modifiers.contains(m) { return None; }
+        let chord = Hotkey { modifiers: base.modifiers | m, virtual_key: base.virtual_key };
+        let taken = self.hotkey_bindings().iter().any(|(_, hk)| *hk == chord);
+        (!taken).then_some(chord)
+    }
+
     /// First pair of actions bound to the same chord, if any.
     ///
     /// Two actions sharing a chord is not something the OS can resolve — on
@@ -312,6 +326,21 @@ mod tests {
                                    hk(every_mod, 0x2C));
         assert_eq!(widest, HotkeyAction::CaptureFullScreen.label().len());
         assert!(msg.len() <= 99, "{} chars: {msg}", msg.len());
+    }
+
+    #[test]
+    fn the_switch_chord_adds_the_switch_key_unless_taken() {
+        let mut s = AppSettings::default();
+        s.set_hotkey_for(HotkeyAction::Capture, Some(hk(Modifiers::empty(), 0x2C)));
+        assert_eq!(s.capture_switch_chord(), Some(hk(Modifiers::SHIFT, 0x2C)));
+        s.switch_key = "Ctrl".into();
+        assert_eq!(s.capture_switch_chord(), Some(hk(Modifiers::CONTROL, 0x2C)));
+        // Full screen already owns Ctrl+PrtSc: it keeps it.
+        s.set_hotkey_for(HotkeyAction::CaptureFullScreen, Some(hk(Modifiers::CONTROL, 0x2C)));
+        assert_eq!(s.capture_switch_chord(), None);
+        // A capture chord that already holds the key needs no second chord.
+        s.set_hotkey_for(HotkeyAction::Capture, Some(hk(Modifiers::CONTROL | Modifiers::SHIFT, 0x50)));
+        assert_eq!(s.capture_switch_chord(), None);
     }
 
     #[test]

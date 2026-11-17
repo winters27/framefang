@@ -220,6 +220,17 @@ pub struct AppSettings {
     #[serde(rename = "CloseAfterCopy", default)]
     pub close_after_copy: bool,
 
+    /// What a region capture does when the drag is let go: open the editor
+    /// (the default), or put the picture on the clipboard and close.
+    #[serde(rename = "OpenEditor", default = "default_true")]
+    pub open_editor: bool,
+
+    /// The key that, held with the capture key or as the drag is let go,
+    /// makes that one capture do the other thing: `"Shift"`, `"Ctrl"` or
+    /// `"Alt"` (see [`SwitchKey`]).
+    #[serde(rename = "SwitchKey", default = "default_switch_key")]
+    pub switch_key: String,
+
     /// Each tool's own color and stroke width, keyed by `Tool::name`.
     /// A tool with no entry uses `ToolStyle::default_for`.
     #[serde(rename = "ToolStyles", default)]
@@ -282,6 +293,8 @@ impl Default for AppSettings {
             pixelate_block:      default_pixelate_block(),
             auto_copy:           false,
             close_after_copy:    false,
+            open_editor:         true,
+            switch_key:          default_switch_key(),
             tool_styles:         Default::default(),
             save_directory:      String::new(),
             recordings_directory: String::new(),
@@ -297,6 +310,49 @@ impl Default for AppSettings {
             marker_opacity:      default_marker_opacity(),
         }
     }
+}
+
+fn default_true()        -> bool    { true }
+fn default_switch_key()  -> String  { SwitchKey::Shift.name().to_owned() }
+
+/// The key that flips one capture between opening the editor and just
+/// copying. Modifiers only: they can be held through a drag without typing
+/// anything, and the region picker gives none of them a meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwitchKey { Shift, Ctrl, Alt }
+
+impl SwitchKey {
+    pub const ALL: [SwitchKey; 3] = [SwitchKey::Shift, SwitchKey::Ctrl, SwitchKey::Alt];
+
+    /// The stored word. Anything unknown reads as Shift.
+    pub fn parse(s: &str) -> SwitchKey {
+        SwitchKey::ALL.into_iter().find(|k| k.name().eq_ignore_ascii_case(s)).unwrap_or(SwitchKey::Shift)
+    }
+
+    pub fn name(self) -> &'static str {
+        match self { SwitchKey::Shift => "Shift", SwitchKey::Ctrl => "Ctrl", SwitchKey::Alt => "Alt" }
+    }
+
+    /// The key's name as this platform's keyboards print it (Option on a Mac).
+    pub fn label(self) -> &'static str {
+        match self {
+            SwitchKey::Alt if cfg!(target_os = "macos") => "Opt",
+            k => k.name(),
+        }
+    }
+
+    /// The same key as a hotkey modifier bit.
+    pub fn modifier(self) -> Modifiers {
+        match self { SwitchKey::Shift => Modifiers::SHIFT, SwitchKey::Ctrl => Modifiers::CONTROL, SwitchKey::Alt => Modifiers::ALT }
+    }
+}
+
+impl AppSettings {
+    pub fn switch_key(&self) -> SwitchKey { SwitchKey::parse(&self.switch_key) }
+
+    /// Whether a region capture opens the editor, given whether the switch
+    /// key was held for it.
+    pub fn opens_editor(&self, switch_held: bool) -> bool { self.open_editor != switch_held }
 }
 
 fn default_tool()        -> String  { "Pen".to_owned() }
@@ -626,6 +682,26 @@ mod tests {
         assert!(!old.close_after_copy, "Copy keeps the editor open unless asked");
         let on: AppSettings = serde_json::from_str("{\"AutoCopy\":true}").unwrap();
         assert!(on.auto_copy);
+    }
+
+    #[test]
+    fn a_capture_opens_the_editor_unless_set_or_switched_otherwise() {
+        // A file from before the setting existed keeps opening the editor.
+        let old: AppSettings = serde_json::from_str("{}").unwrap();
+        assert!(old.open_editor);
+        assert_eq!(old.switch_key(), SwitchKey::Shift);
+        assert!(old.opens_editor(false));
+        assert!(!old.opens_editor(true), "holding the key skips the editor");
+        // Copy-only: holding the key is how to get the editor.
+        let copy: AppSettings = serde_json::from_str("{\"OpenEditor\":false,\"SwitchKey\":\"Alt\"}").unwrap();
+        assert!(!copy.opens_editor(false));
+        assert!(copy.opens_editor(true));
+        assert_eq!(copy.switch_key(), SwitchKey::Alt);
+        let back: AppSettings = serde_json::from_str(&serde_json::to_string(&copy).unwrap()).unwrap();
+        assert_eq!((back.open_editor, back.switch_key()), (false, SwitchKey::Alt));
+        // Unknown words fall back to Shift rather than to no key.
+        assert_eq!(SwitchKey::parse("Hyper"), SwitchKey::Shift);
+        for k in SwitchKey::ALL { assert_eq!(SwitchKey::parse(k.name()), k); }
     }
 
     #[test]

@@ -620,9 +620,13 @@ pub struct Overlay {
     /// The shape last applied to the editor window, so the region is only
     /// rebuilt when what is drawn around the picture changes.
     shape: Vec<crate::window_shape::Rect>,
-    /// The editor window starts hidden and is shown after its first frame,
-    /// once it has been cut to shape.
+    /// Whether the window is on screen yet. On Windows every overlay starts
+    /// cloaked and is uncloaked after its first frame (`reveal`); on X11 the
+    /// editor window starts hidden and is shown once it has been cut to shape.
     shown: bool,
+    /// The capture's hold key was down when the hotkey fired, so this
+    /// capture does the opposite of the After-a-capture setting.
+    pub hold_at_press: bool,
     /// True when annotating a video frame (`new_for_video`): the selection
     /// is locked to the full frame, Esc cancels outright, and `commit`
     /// returns the deferred `VideoCommit` payload instead of a cropped
@@ -774,6 +778,17 @@ impl Overlay {
         // This frame cuts the shape and then shows the window.
         me.redraw();
         Ok(me)
+    }
+
+    /// Whether the switch key flips this capture: held when the hotkey fired,
+    /// or held now, as the drag is let go.
+    fn switch_held(&self) -> bool {
+        use framefang_core::settings::SwitchKey;
+        self.hold_at_press || match self.settings.switch_key() {
+            SwitchKey::Shift => self.mods.shift_key(),
+            SwitchKey::Ctrl  => self.mods.control_key(),
+            SwitchKey::Alt   => self.mods.alt_key(),
+        }
     }
 
     /// The selection is fixed: the video frame, or the editor's picture.
@@ -935,6 +950,12 @@ impl Overlay {
                 .with_position(PhysicalPosition::new(0i32, 0i32))
                 .with_fullscreen(Some(Fullscreen::Borderless(primary)))
         };
+        // Windows: sized and placed while hidden, then shown cloaked, so
+        // nothing of the window reaches the screen until its first frame is
+        // drawn (`reveal`). Without this it popped up at the default size
+        // and grew out from the top left.
+        let cloak = crate::reveal::SUPPORTED;
+        let attrs = if cloak { attrs.with_visible(false) } else { attrs };
 
         let window = loop_target
             .create_window(attrs)
@@ -948,6 +969,10 @@ impl Overlay {
             window.set_outer_position(PhysicalPosition::new(desktop_origin.0, desktop_origin.1));
             let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(
                 desktop_size.0.max(1), desktop_size.1.max(1)));
+        }
+        if cloak {
+            crate::reveal::cloak(&window);
+            window.set_visible(true);
         }
 
         window.set_cursor(CursorIcon::Crosshair);
@@ -1008,7 +1033,8 @@ impl Overlay {
             settings,
             editor_mode: false,
             shape: Vec::new(),
-            shown: windowed.is_none() || !crate::window_shape::supported(),
+            shown: !cloak && (windowed.is_none() || !crate::window_shape::supported()),
+            hold_at_press: false,
             video_mode,
             record_mode: false,
             video_path,
@@ -2148,6 +2174,13 @@ impl Overlay {
                     self.selection = Some(r);
                     self.state     = State::Selected;
                     if self.is_picker() {
+                        // Copy-only capture: the picture goes to the
+                        // clipboard and nothing opens.
+                        if !self.settings.opens_editor(self.switch_held()) {
+                            if let Some(rect) = self.selection_in_bitmap() {
+                                return OverlayOutcome::Copied(crop(&self.screenshot, rect));
+                            }
+                        }
                         if let Some(out) = self.hand_off() { return out; }
                     }
                 }
@@ -2819,7 +2852,11 @@ impl Overlay {
         }
         if !self.shown {
             self.shown = true;
-            self.window.set_visible(true);
+            if crate::reveal::SUPPORTED {
+                crate::reveal::uncloak(&self.window);
+            } else {
+                self.window.set_visible(true);
+            }
             self.window.focus_window();
         }
         if let Some(log) = self.frame_log.as_mut() {

@@ -40,7 +40,7 @@ use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 use framefang_core::{AppSettings, Hotkey, Modifiers as HkMods};
 use framefang_core::color::Rgba as FramefangRgba;
 use framefang_core::hotkeys::{conflict_message, HotkeyAction};
-use framefang_core::settings::vk_label;
+use framefang_core::settings::{vk_label, SwitchKey};
 
 use crate::bitmap_font;
 use crate::painter;
@@ -56,11 +56,11 @@ const WIN_W: u32 = 640;
 // padding band rather than the taller footer strip the convert dialogs
 // reserve: the only message this dialog shows inline is the hotkey-conflict
 // one, and that renders under the HOTKEYS block next to the rows it is
-// about. The window doesn't scroll, and must fit a 768-tall screen plus a
-// title bar and a 40-48 px panel. Its height follows its rows
-// (`content_height`): the sections end at y = 566 without the Windows
-// Print Screen card and 636 with it, plus this bottom band. The
-// inter-row gap is 6 px rather than the 8 px the other dialogs use.
+// about. The window doesn't scroll. Its height follows its rows
+// (`content_height`); with the Windows Print Screen card and the
+// After-a-capture row it needs an 808 px screen once the title bar and a
+// 48 px panel are counted (768 until that row). The inter-row gap is 6 px
+// rather than the 8 px the other dialogs use.
 const BOTTOM_BAND: i32 = 16;
 /// Windows' Print Screen guide under HOTKEYS, shown only while the capture
 /// key is plain Print Screen (the only key Windows' switch affects): a card a
@@ -87,6 +87,13 @@ const EDIT_W:   i32 = 112;
 const HEADER_BTN_GAP: i32 = 8;
 /// Between the Theme row's color chips.
 const THEME_CHIP_GAP: i32 = 8;
+/// The After-a-capture row: "Open the editor" and "Copy only", then the
+/// three switch keys, right-aligned. Chips in a group sit `CHIP_GAP` apart,
+/// the two groups at least `GROUP_GAP` apart, so they read as two choices.
+const MODE_CHIP_W: (i32, i32) = (110, 76);
+const KEY_CHIP_W: i32 = 48;
+const CHIP_GAP: i32 = 6;
+const GROUP_GAP: i32 = 16;
 const BTN_H: i32 = 30;
 // Buttons that sit inside a hotkey row, right-anchored: REBIND on the edge,
 // CLEAR to its left on the two optional actions.
@@ -120,6 +127,13 @@ enum WidgetKind {
     /// One color-scheme chip. Picking it previews at once; Cancel reverts.
     ThemeChoice(crate::palette::Scheme),
     StartWithOs,
+    /// The After-a-capture row's label and caption. The chips beside it are
+    /// the controls.
+    AfterCapture,
+    /// Open the editor (`true`) or just copy (`false`) when a drag ends.
+    AfterCaptureChoice(bool),
+    /// The key that, held, makes one capture do the other thing.
+    SwitchKeyChoice(SwitchKey),
     /// Every screenshot goes to the clipboard as it is taken.
     AutoCopy,
     /// The editor's Copy also closes the editor. Shown under AutoCopy.
@@ -482,7 +496,7 @@ impl SettingsView {
             // A hotkey error takes the system line's place, button included.
             if r.kind == WidgetKind::SystemShortcut && self.error.is_some() { return None; }
             // Only a label; its chips are the controls.
-            if r.kind == WidgetKind::Theme { return None; }
+            if matches!(r.kind, WidgetKind::Theme | WidgetKind::AfterCapture) { return None; }
             // A read-out, and a button that is live only when there is
             // something to download.
             if r.kind == WidgetKind::Ffmpeg { return None; }
@@ -538,6 +552,13 @@ impl SettingsView {
                 // The whole window redraws in it now, so the choice is seen
                 // before it is saved.
                 crate::palette::set(scheme);
+            }
+            WidgetKind::AfterCapture => {}
+            WidgetKind::AfterCaptureChoice(editor) => {
+                self.draft.open_editor = editor;
+            }
+            WidgetKind::SwitchKeyChoice(key) => {
+                self.draft.switch_key = key.name().to_owned();
             }
             WidgetKind::AutoCopy => {
                 self.draft.auto_copy = !self.draft.auto_copy;
@@ -628,7 +649,24 @@ impl SettingsView {
         rows.push(Row { kind: WidgetKind::FfmpegDownload, label: "DOWNLOAD",
                         rect: (x + row_w - 4 - FFMPEG_BTN_W, y + 4, FFMPEG_BTN_W, ROW_H - 8) });
         y += ROW_H + ROW_GAP;
-        rows.push(Row { kind: WidgetKind::AutoCopy,         label: "Copy screenshots automatically", rect: (x, y, row_w, ROW_H) }); y += ROW_H + ROW_GAP;
+        // After a capture: two choices, then the key that flips one capture
+        // to the other, each a group of chips across the value column.
+        rows.push(Row { kind: WidgetKind::AfterCapture, label: "After a capture", rect: (x, y, row_w, ROW_H) });
+        let (chip_y, chip_h) = (y + 4, ROW_H - 8);
+        let mut cx = x + LABEL_W;
+        for (editor, label, w) in [(true, "Open the editor", MODE_CHIP_W.0), (false, "Copy only", MODE_CHIP_W.1)] {
+            rows.push(Row { kind: WidgetKind::AfterCaptureChoice(editor), label, rect: (cx, chip_y, w, chip_h) });
+            cx += w + CHIP_GAP;
+        }
+        // The keys end where the fields and buttons above and below end.
+        let keys_w = KEY_CHIP_W * SwitchKey::ALL.len() as i32 + CHIP_GAP * (SwitchKey::ALL.len() as i32 - 1);
+        cx = x + row_w - 4 - keys_w;
+        for key in SwitchKey::ALL {
+            rows.push(Row { kind: WidgetKind::SwitchKeyChoice(key), label: key.label(), rect: (cx, chip_y, KEY_CHIP_W, chip_h) });
+            cx += KEY_CHIP_W + CHIP_GAP;
+        }
+        y += ROW_H + ROW_GAP;
+        rows.push(Row { kind: WidgetKind::AutoCopy,        label: "Copy screenshots automatically", rect: (x, y, row_w, ROW_H) }); y += ROW_H + ROW_GAP;
         rows.push(Row { kind: WidgetKind::CloseAfterCopy,   label: "Close the editor after copying", rect: (x, y, row_w, ROW_H) }); y += ROW_H + 22;
 
         // HOTKEYS — one row per action: a display box filling the left part
@@ -767,6 +805,10 @@ impl SettingsView {
             }
             if let WidgetKind::ThemeChoice(scheme) = row.kind {
                 render_theme_chip(&mut surf, row, scheme, hovered, &self.draft);
+                continue;
+            }
+            if matches!(row.kind, WidgetKind::AfterCaptureChoice(_) | WidgetKind::SwitchKeyChoice(_)) {
+                render_choice_chip(&mut surf, row, hovered, &self.draft);
                 continue;
             }
             if row.kind == WidgetKind::Ffmpeg {
@@ -1080,6 +1122,16 @@ fn render_row<S: painter::Surface>(
         return;
     }
 
+    // ── After a capture: the label, and under it what the held key does ────
+    if row.kind == WidgetKind::AfterCapture {
+        let gap = rh - 2 * bitmap_font::GLYPH_H;
+        let top = ry + gap / 3;
+        draw_text(surf, rx + 6, top, 1, row.label, argb_to_framefang(TEXT_BRIGHT));
+        draw_text(surf, rx + 6, top + bitmap_font::GLYPH_H + gap / 3, 1, &switch_caption(draft),
+                  argb_to_framefang(TEXT_MUTED()));
+        return;
+    }
+
     // ── Setting rows ───────────────────────────────────────────────────────
     if hovered { fill_rect(surf, rx, ry, rw, rh, argb_to_framefang(HOVER_FILL())); }
 
@@ -1189,6 +1241,37 @@ fn render_row<S: painter::Surface>(
         }
         _ => {}
     }
+}
+
+/// What holding the switch key does, under the After-a-capture label.
+fn switch_caption(draft: &AppSettings) -> String {
+    let key = draft.switch_key().label();
+    if draft.open_editor {
+        format!("Hold {key} to copy only")
+    } else {
+        format!("Hold {key} to open the editor")
+    }
+}
+
+/// An After-a-capture chip. The picked one is filled and framed; the picked
+/// switch key is framed a step quieter than the picked mode, since the mode
+/// is the main choice and the key only refines it.
+fn render_choice_chip<S: painter::Surface>(surf: &mut S, row: &Row, hovered: bool, draft: &AppSettings) {
+    let (rx, ry, rw, rh) = row.rect;
+    let (chosen, accent) = match row.kind {
+        WidgetKind::AfterCaptureChoice(editor) => (draft.open_editor == editor, LASER()),
+        WidgetKind::SwitchKeyChoice(key) => (draft.switch_key() == key, LASER_DIM()),
+        _ => return,
+    };
+    if chosen || hovered {
+        fill_rect(surf, rx, ry, rw, rh, argb_to_framefang(HOVER_FILL()));
+    }
+    let border = if chosen { accent } else if hovered { LASER_DIM() } else { FIELD_BORDER() };
+    stroke_rect_argb(surf, rx, ry, rw, rh, argb_to_framefang(border));
+    let tw = bitmap_font::measure(row.label, 1);
+    let color = if chosen { TEXT_BRIGHT } else { TEXT_MUTED() };
+    draw_text(surf, rx + (rw - tw) / 2, ry + (rh - bitmap_font::GLYPH_H) / 2, 1,
+              row.label, argb_to_framefang(color));
 }
 
 /// A color-scheme chip: the scheme's own accent as a swatch, then its name.
@@ -1526,6 +1609,7 @@ mod tests {
             let indent = match r.kind {
                 WidgetKind::CloseAfterCopy => SUB_INDENT,
                 WidgetKind::SaveFolder | WidgetKind::RecordingsFolder | WidgetKind::Ffmpeg | WidgetKind::AutoCopy
+                | WidgetKind::AfterCapture
                 | WidgetKind::HotkeyDisplay(_) | WidgetKind::Theme | WidgetKind::StartWithOs => 0,
                 _ => continue,
             };
@@ -1568,7 +1652,11 @@ mod tests {
         let theme2 = without.iter().find(|r| r.kind == WidgetKind::Theme).unwrap();
         assert_eq!(theme2.rect.1 - (last_hotkey.rect.1 + ROW_H), 40, "same spacing as the other sections");
         assert!(content_height(&without) < content_height(&rows));
-        assert!(content_height(&rows) + crate::chrome::TITLE_H as u32 + 48 <= 768, "fits a 768 px screen");
+        // The After-a-capture row (2026-11-17) took the last 40 px a 768 px
+        // screen had: with the card it now needs about 808 (title bar and a
+        // 48 px taskbar included), so 1366x768 cuts off the bottom row. Pinned
+        // so the next row is a deliberate choice too.
+        assert!(content_height(&rows) + crate::chrome::TITLE_H as u32 + 48 <= 808, "fits an 808 px screen");
     }
 
     #[test]
@@ -1592,6 +1680,39 @@ mod tests {
             // A theme chip holds an 8 px swatch, a 6 px gap and the name.
             if matches!(r.kind, WidgetKind::ThemeChoice(_)) {
                 assert!(8 + 6 + bitmap_font::measure(r.label, 1) + MIN_GAP <= r.rect.2, "{}", r.label);
+            }
+            // An After-a-capture chip keeps 8 px either side of its word.
+            if matches!(r.kind, WidgetKind::AfterCaptureChoice(_) | WidgetKind::SwitchKeyChoice(_)) {
+                assert!(bitmap_font::measure(r.label, 1) + 16 <= r.rect.2, "{}", r.label);
+            }
+        }
+    }
+
+    #[test]
+    fn the_after_capture_chips_stay_in_the_value_column_with_their_caption_clear() {
+        let rows = SettingsView::build_rows(None, false);
+        let row = rows.iter().find(|r| r.kind == WidgetKind::AfterCapture).unwrap();
+        let chips: Vec<&Row> = rows.iter()
+            .filter(|r| matches!(r.kind, WidgetKind::AfterCaptureChoice(_) | WidgetKind::SwitchKeyChoice(_)))
+            .collect();
+        assert_eq!(chips.len(), 5);
+        let right = row.rect.0 + row.rect.2 - 4;
+        // The keys end flush with the row's other controls, a clear gap
+        // after the two modes.
+        assert_eq!(chips[4].rect.0 + chips[4].rect.2, right);
+        assert!(chips[2].rect.0 - (chips[1].rect.0 + chips[1].rect.2) >= GROUP_GAP);
+        for c in &chips {
+            assert!(c.rect.0 >= row.rect.0 + LABEL_W && c.rect.0 + c.rect.2 <= right, "{} leaves the row", c.label);
+            assert!(c.rect.1 >= row.rect.1 && c.rect.1 + c.rect.3 <= row.rect.1 + ROW_H);
+        }
+        // The caption under the label, at its longest, ends before the chips.
+        let mut s = AppSettings::default();
+        for open_editor in [true, false] {
+            for key in SwitchKey::ALL {
+                s.open_editor = open_editor;
+                s.switch_key = key.name().into();
+                let caption = switch_caption(&s);
+                assert!(6 + bitmap_font::measure(&caption, 1) + MIN_GAP <= LABEL_W, "\"{caption}\"");
             }
         }
     }

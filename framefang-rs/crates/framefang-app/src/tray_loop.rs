@@ -357,6 +357,10 @@ pub fn run() -> Result<()> {
         fn capture_inner(&mut self, loop_target: &ActiveEventLoop, user_delay: Duration, settle: bool) {
             if self.capturing || self.overlay.is_some() { return; }
             self.capturing = true;
+            // Read now, while the hotkey is still down: holding the switch
+            // key with it makes this capture do the other thing.
+            let switch_at_press = !settle && user_delay.is_zero()
+                && switch_key_down(self.settings.switch_key());
 
             if !user_delay.is_zero() {
                 eprintln!("Capturing in {} second{}…",
@@ -425,6 +429,7 @@ pub fn run() -> Result<()> {
                         loop_target, shot.geometry(), shot.bitmap, self.settings.clone()) {
                         Ok(mut ov) => {
                             ov.set_display_map(shot.map);
+                            ov.hold_at_press = switch_at_press;
                             self.overlay = Some(ov);
                         }
                         Err(e) => {
@@ -1415,8 +1420,11 @@ pub fn run() -> Result<()> {
             // editor window where it was on screen.
             if let Some(c) = chosen {
                 // Auto-copy: the picked region is on the clipboard before the
-                // editor even opens.
-                if self.settings.auto_copy { self.copy_final(c.picture.clone()); }
+                // editor even opens. A copy-only user who held the switch key
+                // for the editor gets the copy too.
+                if self.settings.auto_copy || !self.settings.open_editor {
+                    self.copy_final(c.picture.clone());
+                }
                 match Overlay::new_for_editor(_loop_target, *c, self.settings.clone()) {
                     Ok(ov) => self.overlay = Some(ov),
                     Err(e) => {
@@ -1830,7 +1838,26 @@ fn tray_tooltip(s: &AppSettings) -> String {
 /// costs the user only that one shortcut — the tray menu still reaches every
 /// action — so this logs and moves on rather than failing the call.
 fn apply_hotkeys(hk: &mut HotkeyManager, s: &AppSettings) -> Vec<(HotkeyAction, framefang_platform::Error)> {
-    let failed = hk.register_all(&s.hotkey_bindings());
+    let bindings = s.hotkey_bindings();
+    // Windows: the capture key with the switch key held is a capture too, so
+    // the switch key can be held with it (`switch_key_down` reads which).
+    // Other platforms read the switch key only as the drag is let go.
+    let switch = if cfg!(windows) { s.capture_switch_chord() } else { None };
+    let mut failed = match switch {
+        Some(chord) => {
+            let mut with = bindings.clone();
+            with.push((HotkeyAction::Capture, chord));
+            hk.register_all(&with)
+        }
+        None => hk.register_all(&bindings),
+    };
+    // A refused switch chord (another program owns it) must not cost the
+    // capture key itself: register without it, which reports only real
+    // failures.
+    if switch.is_some() && failed.iter().any(|(a, _)| *a == HotkeyAction::Capture) {
+        eprintln!("switch-key capture chord unavailable; holding it as the drag ends still works");
+        failed = hk.register_all(&bindings);
+    }
     for (action, e) in &failed {
         eprintln!("hotkey register failed for {}: {e} — use the tray menu instead",
                   action.label());
@@ -1842,6 +1869,21 @@ fn apply_hotkeys(hk: &mut HotkeyManager, s: &AppSettings) -> Vec<(HotkeyAction, 
         hk.without_second_path(HotkeyAction::Capture);
     }
     failed
+}
+
+/// Whether `key` is held right now, anywhere on the desktop. Windows only;
+/// elsewhere the overlay reads it as the drag is let go.
+fn switch_key_down(key: framefang_core::settings::SwitchKey) -> bool {
+    #[cfg(windows)]
+    {
+        use framefang_core::settings::SwitchKey;
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
+        let vk = match key { SwitchKey::Shift => VK_SHIFT, SwitchKey::Ctrl => VK_CONTROL, SwitchKey::Alt => VK_MENU };
+        // High bit: down at this moment.
+        unsafe { (GetAsyncKeyState(vk.0 as i32) as u16 & 0x8000) != 0 }
+    }
+    #[cfg(not(windows))]
+    { let _ = key; false }
 }
 
 /// Text of the tray rows that quote a hotkey. The binding rides along in

@@ -30,6 +30,7 @@ mod hud;
 mod palette;
 mod pin;
 mod recording_indicator;
+mod reveal;
 mod self_updater;
 mod settings_form;
 mod system_shortcuts;
