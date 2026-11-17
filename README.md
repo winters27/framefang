@@ -2,7 +2,7 @@
 <!-- Centered HTML header and wide table rows are deliberate on GitHub. -->
 
 <p align="center">
-  <img src=".github/assets/social-preview.png" alt="Framefang, a screenshot tool for Windows written in pure Rust" width="820">
+  <img src=".github/assets/social-preview.png" alt="Framefang: capture, annotate, paste" width="820">
 </p>
 
 <p align="center">
@@ -67,10 +67,6 @@ against its published checksum. Or install it yourself:
 ```powershell
 winget install Gyan.FFmpeg
 ```
-
-<p align="center">
-  <img src=".github/assets/settings.png" alt="Framefang Settings: After a capture set to Copy only, hold Shift to open the editor" width="560">
-</p>
 
 ## Keyboard shortcuts
 
