@@ -8,7 +8,6 @@
 <p align="center">
   <a href="https://github.com/winters27/framefang/releases/latest"><img src="https://img.shields.io/github/v/release/winters27/framefang?color=FC0C7A&label=release" alt="Latest release"></a>
   <a href="https://github.com/winters27/framefang/releases"><img src="https://img.shields.io/github/downloads/winters27/framefang/total?color=FC0C7A&label=downloads" alt="Downloads"></a>
-  <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0B090C" alt="Windows 10 and 11">
   <img src="https://img.shields.io/badge/built%20with-Rust-0B090C?logo=rust" alt="Built with Rust">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-0B090C" alt="Apache 2.0 license"></a>
 </p>
@@ -16,7 +15,7 @@
 <h3 align="center">A snappy screenshot and annotation tool, built in pure Rust.</h3>
 
 <p align="center">
-  Press Print Screen, drag over what you want, paste it anywhere.
+  Press a key, drag over what you want, paste it anywhere.
 </p>
 
 <p align="center">
@@ -29,9 +28,8 @@
 
 ## Highlights
 
-Framefang is a lightweight **Snipping Tool alternative** for Windows 10 and
-11. It sits quietly in the tray, and a screenshot takes about as long as
-dragging a box.
+Framefang sits quietly in the tray until you press its key. A screenshot
+takes about as long as dragging a box.
 
 - **Instant freeze.** The screen freezes the moment you press the key, so
   open menus and tooltips stay in the shot.
@@ -43,18 +41,18 @@ dragging a box.
 
 ## Download
 
-Get it from the [latest release](https://github.com/winters27/framefang/releases/latest).
+Grab it from the [latest release](https://github.com/winters27/framefang/releases/latest).
 Framefang updates itself from the tray menu.
 
-| File | What it is |
+| Platform | Get it |
 | --- | --- |
-| **`Framefang.msi`** | The installer. Start here. |
-| `framefang-windows-x86_64.zip` | Portable: just `framefang.exe`, no install. |
+| **Windows** | **`Framefang.msi`** installer, or the portable `framefang-windows-x86_64.zip` |
+| **macOS, Linux** | [Build from source](#building-from-source) for now |
 
 > [!TIP]
-> Windows 11 sends Print Screen to the Snipping Tool by default. Framefang's
-> Settings shows the exact Windows switch to turn off, with a button that
-> opens its page. Or bind any other key you like.
+> On Windows 11, Print Screen opens the Snipping Tool by default. Framefang's
+> Settings shows the exact switch to turn off, with a button that opens its
+> page. Or bind any other key you like.
 
 ## Features
 
@@ -67,7 +65,7 @@ Framefang updates itself from the tray menu.
 | **Copy only** | Captures go straight to the clipboard, ready to paste into chat, email or docs. |
 | **Screen recorder** | Record the screen or a region to MP4, with system audio and microphone. |
 | **Converters** | Images (PNG, JPG, WEBP, BMP) and videos (MP4, MOV, WEBM, MKV, GIF). |
-| **Any hotkey** | Print Screen, F13 to F24, Pause, media keys, or any chord with Ctrl, Alt or Win. |
+| **Any hotkey** | Any key or chord, including Print Screen, F13 to F24, Pause and media keys. |
 | **Color schemes** | Pink, Green, Cyan or Yellow, with a retro terminal look. |
 
 > [!NOTE]
@@ -85,7 +83,7 @@ Framefang updates itself from the tray menu.
 
 | Key | Does |
 | --- | --- |
-| `Print Screen` | Capture a region (rebind it in Settings) |
+| Capture key | Capture a region (set it in Settings) |
 | Hold `Shift` | Flip between editor and copy only, once |
 | `Esc` | Cancel |
 
@@ -112,11 +110,11 @@ loop and does it quickly, with no uploaders, accounts or workflows to set up.
 ## FAQ
 
 <details>
-<summary><b>How do I make Print Screen open Framefang instead of the Snipping Tool?</b></summary>
+<summary><b>On Windows 11, how do I make Print Screen open Framefang?</b></summary>
 
 Open Framefang's Settings. While Print Screen is your capture key, it shows
-the Windows switch to turn off (Bluetooth & devices > Keyboard on Windows 11)
-and a button that opens that page.
+the system switch to turn off (Bluetooth & devices > Keyboard) and a button
+that opens that page.
 
 </details>
 
@@ -155,12 +153,12 @@ cargo test --release --workspace
 cargo build --release -p framefang-app
 ```
 
-The app lands in `framefang-rs/target/release/framefang.exe`. A local build
-copies the `ffmpeg` on `PATH` (or the one `FRAMEFANG_FFMPEG` names) next to
-it. Releases are built by GitHub Actions when a `v*` tag is pushed.
+The app lands in `framefang-rs/target/release/`. A local build copies the
+`ffmpeg` on `PATH` (or the one `FRAMEFANG_FFMPEG` names) next to it.
+Releases are built by GitHub Actions when a `v*` tag is pushed.
 
-Linux and macOS share most of the code, but have no release builds yet and
-are untested.
+The macOS and Linux builds share the same code but are not tested yet, so
+reports are welcome.
 
 ## License
 
