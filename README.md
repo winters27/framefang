@@ -30,8 +30,8 @@
 ## Highlights
 
 Framefang is a lightweight **Snipping Tool alternative** for Windows 10 and
-11. It waits in the tray using about 16 MB of memory, and a screenshot takes
-about as long as dragging a box.
+11. It sits quietly in the tray, and a screenshot takes about as long as
+dragging a box.
 
 - **Instant freeze.** The screen freezes the moment you press the key, so
   open menus and tooltips stay in the shot.
@@ -72,8 +72,8 @@ Framefang updates itself from the tray menu.
 
 > [!NOTE]
 > Recording and video conversion need FFmpeg. Settings can download
-> Framefang's own trimmed build (about 10 MB, checked against its published
-> checksum), or you can install it yourself:
+> Framefang's own trimmed build, checked against its published checksum, or
+> you can install it yourself:
 >
 > ```powershell
 > winget install Gyan.FFmpeg
