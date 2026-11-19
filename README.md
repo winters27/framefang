@@ -47,7 +47,13 @@ Framefang updates itself from the tray menu.
 | Platform | Get it |
 | --- | --- |
 | **Windows** | **`Framefang.msi`** installer, or **`Framefang-portable.exe`** to run without installing |
-| **macOS, Linux** | [Build from source](#building-from-source) for now |
+| **macOS** | **`Framefang-macos-arm64.dmg`** (Apple silicon) or **`Framefang-macos-x64.dmg`** (Intel) |
+| **Linux** | **`Framefang-linux-x86_64.AppImage`**, or the portable `Framefang-linux-x86_64-portable.tar.gz` / `Framefang-linux-arm64-portable.tar.gz` |
+
+> [!NOTE]
+> The macOS and Linux builds are new, so reports are welcome. The Mac app isn't
+> signed by Apple yet: the first time, open it from **System Settings > Privacy
+> & Security > Open Anyway**.
 
 > [!TIP]
 > On Windows 11, Print Screen opens the Snipping Tool by default. Framefang's
@@ -164,7 +170,8 @@ The app lands in `framefang-rs/target/release/`. A local build copies the
 `ffmpeg` on `PATH` (or the one `FRAMEFANG_FFMPEG` names) next to it.
 Releases are built by GitHub Actions when a `v*` tag is pushed.
 
-The macOS and Linux builds share the same code but are not tested yet, so
+Every release is built for Windows, macOS and Linux from this same code. The
+macOS and Linux builds pass their tests in CI but are new on real machines, so
 reports are welcome.
 
 ## License
