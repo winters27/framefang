@@ -37,6 +37,7 @@ mod settings_form;
 mod system_shortcuts;
 mod toast;
 mod tray_loop;
+mod tray_menu;
 mod updates_form;
 mod window_shape;
 

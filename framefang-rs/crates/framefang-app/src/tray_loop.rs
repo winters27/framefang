@@ -144,6 +144,13 @@ pub fn run() -> Result<()> {
         /// The "Copied to clipboard" pill after a copy that closed the
         /// capture window. Dropped by `about_to_wait` once it has faded.
         toast:      Option<crate::toast::Toast>,
+        /// The tray icon's menu in the color scheme (Windows), while open.
+        tray_menu:  Option<crate::tray_menu::TrayMenu>,
+        /// When `tray_menu` last closed. A click on the icon right after it
+        /// closed is the click that closed it, so it must not reopen it.
+        tray_menu_closed: Option<Instant>,
+        /// The Sound chosen in the tray menu, for the next time it opens.
+        tray_sound: framefang_platform::recorder::RecordingOptions,
         /// The editor eyedropper's color-pick session over the frozen
         /// screen, while it is open. Its answer goes back to `overlay`.
         color_pick: Option<Overlay>,
@@ -227,7 +234,7 @@ pub fn run() -> Result<()> {
                 Ok(t) => self.tray = Some(t),
                 Err(e) => {
                     eprintln!("tray init failed: {e}");
-                    notify("Frame Fang — no tray icon",
+                    notify("Frame Fang: no tray icon",
                         &format!("{e}\n\nThe About window is open instead; closing it quits Frame Fang."),
                         true);
                     self.show_about(loop_target);
@@ -246,7 +253,7 @@ pub fn run() -> Result<()> {
             // just works — and the old unconditional "Wayland can't do this"
             // notice is no longer true.
             if let Some(reason) = self.hotkey_error.take() {
-                notify("Frame Fang — capture shortcut unavailable", &reason, true);
+                notify("Frame Fang: capture shortcut unavailable", &reason, true);
             }
         }
 
@@ -254,34 +261,17 @@ pub fn run() -> Result<()> {
             // Drive any platform-native loop the tray depends on (GTK on
             // Linux). Must run before try_recv so menu-click signals have a
             // chance to land in the channel.
-            if let Some(tray) = &self.tray {
-                tray.pump_events();
-                match tray.try_recv() {
-                    TrayEvent::None                  => {}
-                    TrayEvent::Capture               => self.capture(loop_target),
-                    TrayEvent::CaptureFullScreen     => self.capture_full_screen(true),
-                    TrayEvent::CaptureDelayed(secs)  => self.capture_after(loop_target, Duration::from_secs(secs as u64)),
-                    TrayEvent::CancelPending         => {} // handled inline by the delay loop
-                    TrayEvent::StartRecording(opts)  => self.start_recording(opts, loop_target, None),
-                    TrayEvent::StartRegionRecording(opts) => self.begin_region_recording(opts, loop_target),
-                    TrayEvent::StopRecording         => self.stop_recording(),
-                    TrayEvent::AnnotateLastRecording => self.annotate_last_recording(loop_target),
-                    TrayEvent::OpenSaveFolder        => self.open_save_folder(),
-                    TrayEvent::OpenRecordingsFolder  => self.open_recordings_folder(),
-                    TrayEvent::Settings              => self.show_settings(loop_target),
-                    TrayEvent::About                 => self.show_about(loop_target),
-                    TrayEvent::CheckForUpdates       => self.show_updates(loop_target),
-                    TrayEvent::ConvertImage          => self.show_convert_image(loop_target),
-                    TrayEvent::ConvertVideo          => self.show_convert_video(loop_target),
-                    TrayEvent::Exit                  => {
-                        // Stop any active recording before tearing down so
-                        // the MP4 moov atom gets finalized. Best-effort —
-                        // if it errors we still exit.
-                        let _ = self.recorder.stop();
-                        loop_target.exit();
-                    }
+            let (ev, click) = match &self.tray {
+                Some(tray) => {
+                    tray.pump_events();
+                    (tray.try_recv(), tray.take_click())
                 }
-            }
+                None => (TrayEvent::None, None),
+            };
+            self.run_tray_event(ev, loop_target);
+            if let Some(c) = click { self.tray_clicked(c, loop_target); }
+            if let Some(m) = self.tray_menu.as_mut() { m.tick(); }
+            self.finish_tray_menu(loop_target);
             // An open Settings window follows the FFmpeg download's progress.
             if let Some(v) = self.settings_view.as_mut() { v.tick(); }
             // Collected before dispatch so the manager borrow is done with
@@ -320,7 +310,7 @@ pub fn run() -> Result<()> {
                 eprintln!("Recording stopped unexpectedly: {e}");
                 if let Some(t) = &self.tray { t.set_recording(false); }
                 self.recording_view = None;
-                notify("Frame Fang — recording stopped unexpectedly", &format!("{e}"), true);
+                notify("Frame Fang: recording stopped unexpectedly", &format!("{e}"), true);
             }
             // Keep the recording indicator's flashing dot animating even
             // when there's no mouse activity over its window.
@@ -335,6 +325,76 @@ pub fn run() -> Result<()> {
             // failure to the user (success exits the process from inside
             // the worker, so we'd never see a successful join here).
             self.poll_update_job();
+        }
+
+        /// Do what a tray menu row asks, from the native menu or the app's own.
+        fn run_tray_event(&mut self, ev: TrayEvent, loop_target: &ActiveEventLoop) {
+            match ev {
+                TrayEvent::None                  => {}
+                TrayEvent::Capture               => self.capture(loop_target),
+                TrayEvent::CaptureFullScreen     => self.capture_full_screen(true),
+                TrayEvent::CaptureDelayed(secs)  => self.capture_after(loop_target, Duration::from_secs(secs as u64)),
+                TrayEvent::CancelPending         => {} // handled inline by the delay loop
+                TrayEvent::StartRecording(opts)  => self.start_recording(opts, loop_target, None),
+                TrayEvent::StartRegionRecording(opts) => self.begin_region_recording(opts, loop_target),
+                TrayEvent::StopRecording         => self.stop_recording(),
+                TrayEvent::AnnotateLastRecording => self.annotate_last_recording(loop_target),
+                TrayEvent::OpenSaveFolder        => self.open_save_folder(),
+                TrayEvent::OpenRecordingsFolder  => self.open_recordings_folder(),
+                TrayEvent::Settings              => self.show_settings(loop_target),
+                TrayEvent::About                 => self.show_about(loop_target),
+                TrayEvent::CheckForUpdates       => self.show_updates(loop_target),
+                TrayEvent::ConvertImage          => self.show_convert_image(loop_target),
+                TrayEvent::ConvertVideo          => self.show_convert_video(loop_target),
+                TrayEvent::Exit                  => {
+                    // Stop any active recording before tearing down so
+                    // the MP4 moov atom gets finalized. Best-effort —
+                    // if it errors we still exit.
+                    let _ = self.recorder.stop();
+                    loop_target.exit();
+                }
+            }
+        }
+
+        /// A click on the tray icon (Windows): open the app's menu there, or
+        /// close it if it is open, like a native menu.
+        fn tray_clicked(&mut self, click: framefang_platform::tray::TrayClick, loop_target: &ActiveEventLoop) {
+            if self.tray_menu.is_some() {
+                self.tray_menu = None;
+                self.tray_menu_closed = Some(Instant::now());
+                return;
+            }
+            // The press on the icon took focus from the open menu, which
+            // closed it; this is the same click coming up.
+            if self.tray_menu_closed.is_some_and(|t| t.elapsed() < Duration::from_millis(350)) {
+                return;
+            }
+            let key = |a: HotkeyAction| self.settings.hotkey_for(a).map(|h| h.describe());
+            let state = crate::tray_menu::MenuState {
+                capture_key: key(HotkeyAction::Capture),
+                full_key: key(HotkeyAction::CaptureFullScreen),
+                record_key: key(HotkeyAction::ToggleRecording),
+                recording: self.recorder.is_recording(),
+                sound: self.tray_sound,
+            };
+            match crate::tray_menu::TrayMenu::new(loop_target, (click.x, click.y), state) {
+                Ok(m) => self.tray_menu = Some(m),
+                Err(e) => {
+                    eprintln!("framefang: tray menu: {e}");
+                    if let Some(t) = &self.tray { t.show_native_menu(); }
+                }
+            }
+        }
+
+        /// Act on the tray menu's answer once it has one: it closes first, so
+        /// it is off the screen before whatever was picked starts.
+        fn finish_tray_menu(&mut self, loop_target: &ActiveEventLoop) {
+            let Some(out) = self.tray_menu.as_mut().and_then(|m| m.outcome.take()) else { return };
+            if let Some(m) = self.tray_menu.take() { self.tray_sound = m.sound(); }
+            self.tray_menu_closed = Some(Instant::now());
+            if let crate::tray_menu::MenuOutcome::Run(ev) = out {
+                self.run_tray_event(ev, loop_target);
+            }
         }
 
         fn capture(&mut self, loop_target: &ActiveEventLoop) {
@@ -398,19 +458,15 @@ pub fn run() -> Result<()> {
             // Brief settle delay so the tray menu / flyout can fully dismiss
             // before xcap shoots the desktop. On top of any user-facing delay.
             //
-            // Windows needs more: the tray context menu has a fade-out
-            // animation (~200–400ms depending on SPI_GETMENUFADE), and if the
-            // click came through the hidden-icons chevron the whole
-            // NotifyIconOverflowWindow stays mapped until we dismiss it. We
-            // force both to close, then wait long enough for the fade to
-            // finish — otherwise the screenshot captures a ghost of the menu.
+            // Windows: if the click came through the hidden-icons chevron,
+            // the NotifyIconOverflowWindow stays up until we dismiss it, so
+            // close it and give it a moment (`TRAY_MENU_SETTLE`).
             //
-            // The hotkey skips all of it: it was 700 ms of dead time between
-            // the key press and the frozen screen.
+            // The hotkey skips all of it: no menu, nothing to wait out.
             #[cfg(target_os = "windows")]
             if settle {
                 dismiss_tray_flyouts();
-                std::thread::sleep(Duration::from_millis(700));
+                std::thread::sleep(TRAY_MENU_SETTLE);
             }
             #[cfg(not(target_os = "windows"))]
             if settle { std::thread::sleep(Duration::from_millis(250)); }
@@ -448,14 +504,14 @@ pub fn run() -> Result<()> {
                         }
                         Err(e) => {
                             eprintln!("Overlay open failed: {e}");
-                            notify("Frame Fang — capture failed",
+                            notify("Frame Fang: capture failed",
                                 &format!("The editor window wouldn't open: {e}"), true);
                         }
                     }
                 }
                 Err(e) => {
                     eprintln!("Capture failed: {e}");
-                    notify("Frame Fang — capture failed", &format!("{e}"), true);
+                    notify("Frame Fang: capture failed", &format!("{e}"), true);
                 }
             }
 
@@ -470,7 +526,7 @@ pub fn run() -> Result<()> {
                                   opts: framefang_platform::recorder::RecordingOptions,
                                   loop_target: &ActiveEventLoop) {
             if self.recorder.is_recording() {
-                notify("Frame Fang — already recording",
+                notify("Frame Fang: already recording",
                     "Stop the current recording before starting another one.", true);
                 return;
             }
@@ -483,7 +539,7 @@ pub fn run() -> Result<()> {
             #[cfg(target_os = "windows")]
             {
                 dismiss_tray_flyouts();
-                std::thread::sleep(Duration::from_millis(700));
+                std::thread::sleep(TRAY_MENU_SETTLE);
             }
             #[cfg(not(target_os = "windows"))]
             std::thread::sleep(Duration::from_millis(250));
@@ -504,7 +560,7 @@ pub fn run() -> Result<()> {
                         Err(e) => {
                             self.pending_region_audio = None;
                             eprintln!("Region selector open failed: {e}");
-                            notify("Frame Fang — recording failed",
+                            notify("Frame Fang: recording failed",
                                 &format!("The region selector wouldn't open: {e}"), true);
                         }
                     }
@@ -515,7 +571,7 @@ pub fn run() -> Result<()> {
                     // reason to fall back to a full-screen recording the user
                     // didn't ask for.
                     eprintln!("Region selector capture failed: {e}");
-                    notify("Frame Fang — recording failed",
+                    notify("Frame Fang: recording failed",
                         &format!("Couldn't read the screen to pick a region: {e}"), true);
                 }
             }
@@ -534,13 +590,13 @@ pub fn run() -> Result<()> {
             let opts = self.pending_region_audio.take()
                 .unwrap_or(framefang_platform::recorder::RecordingOptions::NONE);
             let Some(bounds) = self.overlay_desktop else {
-                notify("Frame Fang — recording failed",
+                notify("Frame Fang: recording failed",
                     "Lost track of the screen the region was picked on.", true);
                 return;
             };
             let Some(rect) = record_rect_from_selection(selection, bounds) else {
-                notify("Frame Fang — region too small",
-                    "Pick a larger area — a recording needs at least 16x16 pixels.", true);
+                notify("Frame Fang: region too small",
+                    "Pick a larger area. A recording needs at least 16x16 pixels.", true);
                 return;
             };
             // The overlay window is already dropped, but the compositor still
@@ -563,12 +619,11 @@ pub fn run() -> Result<()> {
             self.toast = None;
 
             // Same settle delay as capture_after so the tray menu / flyout fully
-            // dismisses before xcap shoots the desktop — otherwise the menu's
-            // fade-out ghost lands in the screenshot.
+            // dismisses before xcap shoots the desktop.
             #[cfg(target_os = "windows")]
             if settle {
                 dismiss_tray_flyouts();
-                std::thread::sleep(Duration::from_millis(700));
+                std::thread::sleep(TRAY_MENU_SETTLE);
             }
             #[cfg(not(target_os = "windows"))]
             if settle { std::thread::sleep(Duration::from_millis(250)); }
@@ -581,18 +636,18 @@ pub fn run() -> Result<()> {
                     match save_capture(&mut self.settings, &img) {
                         Ok(path) => {
                             eprintln!("Saved full screen {}", path.display());
-                            notify("Frame Fang — full screen saved",
+                            notify("Frame Fang: full screen saved",
                                 &format!("{}", path.display()), false);
                         }
                         Err(e) => {
                             eprintln!("Save failed: {e}");
-                            notify("Frame Fang — screenshot not saved", &format!("{e}"), true);
+                            notify("Frame Fang: screenshot not saved", &format!("{e}"), true);
                         }
                     }
                 }
                 Err(e) => {
                     eprintln!("Capture failed: {e}");
-                    notify("Frame Fang — capture failed", &format!("{e}"), true);
+                    notify("Frame Fang: capture failed", &format!("{e}"), true);
                 }
             }
 
@@ -610,12 +665,12 @@ pub fn run() -> Result<()> {
             match save_capture(&mut self.settings, &img) {
                 Ok(path) => {
                     eprintln!("Saved {}", path.display());
-                    notify("Frame Fang — screenshot saved",
+                    notify("Frame Fang: screenshot saved",
                         &format!("{}", path.display()), false);
                 }
                 Err(e) => {
                     eprintln!("Save failed: {e}");
-                    notify("Frame Fang — screenshot not saved", &format!("{e}"), true);
+                    notify("Frame Fang: screenshot not saved", &format!("{e}"), true);
                 }
             }
         }
@@ -645,7 +700,7 @@ pub fn run() -> Result<()> {
                     };
                     if let Err(e) = clip.set_image(data) {
                         eprintln!("Clipboard copy failed: {e}");
-                        notify("Frame Fang — copy failed",
+                        notify("Frame Fang: copy failed",
                             &framefang_core::failure::clipboard_failure(&e.to_string()), true);
                         false
                     } else {
@@ -655,7 +710,7 @@ pub fn run() -> Result<()> {
                 }
                 Err(e) => {
                     eprintln!("Clipboard unavailable: {e}");
-                    notify("Frame Fang — copy failed",
+                    notify("Frame Fang: copy failed",
                         &framefang_core::failure::clipboard_failure(&e.to_string()), true);
                     false
                 }
@@ -679,12 +734,12 @@ pub fn run() -> Result<()> {
                 Ok(path) => {
                     if self.settings.auto_copy { self.copy_final(img.clone()); }
                     eprintln!("Saved {}", path.display());
-                    notify("Frame Fang — screenshot saved", &format!("{}", path.display()), false);
+                    notify("Frame Fang: screenshot saved", &format!("{}", path.display()), false);
                     true
                 }
                 Err(e) => {
                     eprintln!("Save failed: {e}");
-                    notify("Frame Fang — screenshot not saved", &format!("{e}"), true);
+                    notify("Frame Fang: screenshot not saved", &format!("{e}"), true);
                     false
                 }
             }
@@ -724,7 +779,7 @@ pub fn run() -> Result<()> {
             // in every capture session — including one opened while a
             // recording is running — so this has to say so, not just log.
             if self.recorder.is_recording() {
-                notify("Frame Fang — already recording",
+                notify("Frame Fang: already recording",
                     "Stop the current recording before starting another one.", true);
                 return;
             }
@@ -785,7 +840,7 @@ pub fn run() -> Result<()> {
                     } else {
                         "Use the tray menu to finish."
                     };
-                    notify("Frame Fang — recording started",
+                    notify("Frame Fang: recording started",
                         &format!("{scope} - {audio_label}{dropped}\nSaving to {}\n\n{stop_hint}",
                             out.display()),
                         true);
@@ -805,14 +860,14 @@ pub fn run() -> Result<()> {
                         std::thread::spawn(move || {
                             rfd::MessageDialog::new()
                                 .set_level(rfd::MessageLevel::Error)
-                                .set_title("Frame Fang — recording failed")
+                                .set_title("Frame Fang: recording failed")
                                 .set_description(msg)
                                 .show();
                         });
                     }
                     #[cfg(not(target_os = "windows"))]
                     {
-                        notify("Frame Fang — recording failed", &msg, true);
+                        notify("Frame Fang: recording failed", &msg, true);
                     }
                 }
             }
@@ -848,7 +903,7 @@ pub fn run() -> Result<()> {
                 Ok(path) => {
                     eprintln!("Saved recording {}", path.display());
                     if let Some(t) = &self.tray { t.set_recording(false); }
-                    notify("Frame Fang — recording saved",
+                    notify("Frame Fang: recording saved",
                         &format!("{}\n\nTray → \"Annotate last recording\" to draw on it.", path.display()),
                         false);
                     self.last_recording = Some(path);
@@ -874,14 +929,14 @@ pub fn run() -> Result<()> {
                         std::thread::spawn(move || {
                             rfd::MessageDialog::new()
                                 .set_level(rfd::MessageLevel::Error)
-                                .set_title("Frame Fang — recording not saved")
+                                .set_title("Frame Fang: recording not saved")
                                 .set_description(msg)
                                 .show();
                         });
                     }
                     #[cfg(not(target_os = "windows"))]
                     {
-                        notify("Frame Fang — recording not saved", &msg, true);
+                        notify("Frame Fang: recording not saved", &msg, true);
                     }
                 }
             }
@@ -896,7 +951,7 @@ pub fn run() -> Result<()> {
         fn annotate_last_recording(&mut self, loop_target: &ActiveEventLoop) {
             if self.capturing || self.overlay.is_some() { return; }
             if self.recorder.is_recording() {
-                notify("Frame Fang — annotate", "Stop the current recording first.", true);
+                notify("Frame Fang: annotate", "Stop the current recording first.", true);
                 return;
             }
             let video = match self.last_recording.clone().filter(|p| p.exists())
@@ -904,15 +959,15 @@ pub fn run() -> Result<()> {
             {
                 Some(p) => p,
                 None => {
-                    notify("Frame Fang — annotate",
-                        "No recording found — record something first.", true);
+                    notify("Frame Fang: annotate",
+                        "No recording found. Record something first.", true);
                     return;
                 }
             };
             let frame = match extract_first_frame(&video) {
                 Ok(f) => f,
                 Err(e) => {
-                    notify("Frame Fang — annotate failed", &format!("{e}"), true);
+                    notify("Frame Fang: annotate failed", &format!("{e}"), true);
                     return;
                 }
             };
@@ -929,7 +984,7 @@ pub fn run() -> Result<()> {
                     self.overlay        = Some(ov);
                     self.video_annotate = Some(video);
                 }
-                Err(e) => notify("Frame Fang — annotate failed", &format!("{e}"), true),
+                Err(e) => notify("Frame Fang: annotate failed", &format!("{e}"), true),
             }
         }
 
@@ -943,19 +998,19 @@ pub fn run() -> Result<()> {
         /// `<stem>_annotated.mp4`; the original is untouched.
         fn burn_annotations(&mut self, video: PathBuf, commit: VideoCommit) {
             let Some(ffmpeg) = crate::convert_video_form::locate_ffmpeg() else {
-                notify("Frame Fang — annotate failed", crate::ffmpeg_fetch::missing_message(), true);
+                notify("Frame Fang: annotate failed", crate::ffmpeg_fetch::missing_message(), true);
                 return;
             };
             let out = annotated_output_path(&video);
-            notify("Frame Fang — annotating recording",
+            notify("Frame Fang: annotating recording",
                 &format!("Re-encoding with your annotations…\n→ {}", out.display()),
                 false);
             std::thread::spawn(move || {
                 let overlays = crate::editor::compose_overlay_groups(&commit, &video);
                 match run_annotation_burn(&ffmpeg, &video, &overlays, &out) {
-                    Ok(()) => notify("Frame Fang — annotated recording saved",
+                    Ok(()) => notify("Frame Fang: annotated recording saved",
                         &out.display().to_string(), false),
-                    Err(e) => notify("Frame Fang — annotate failed", &format!("{e}"), true),
+                    Err(e) => notify("Frame Fang: annotate failed", &format!("{e}"), true),
                 }
             });
         }
@@ -993,7 +1048,7 @@ pub fn run() -> Result<()> {
         fn have_ffmpeg(&mut self, loop_target: &ActiveEventLoop, what: &str) -> bool {
             if crate::convert_video_form::locate_ffmpeg().is_some() { return true; }
             if crate::ffmpeg_fetch::offered() {
-                notify(&format!("Frame Fang — {what} needs FFmpeg"),
+                notify(&format!("Frame Fang: {what} needs FFmpeg"),
                        "Download it from Settings with one click. If you already have FFmpeg, add it to PATH.",
                        false);
                 match self.settings_view.as_mut() {
@@ -1001,7 +1056,7 @@ pub fn run() -> Result<()> {
                     None => self.open_settings(loop_target, true),
                 }
             } else {
-                notify(&format!("Frame Fang — {what} needs FFmpeg"), crate::ffmpeg_fetch::missing_message(), true);
+                notify(&format!("Frame Fang: {what} needs FFmpeg"), crate::ffmpeg_fetch::missing_message(), true);
             }
             false
         }
@@ -1040,7 +1095,7 @@ pub fn run() -> Result<()> {
                     crate::palette::set(crate::palette::Scheme::parse(&self.settings.theme));
                     if let Err(e) = self.settings.save() {
                         eprintln!("Failed to persist settings: {e}");
-                        notify("Frame Fang — settings not saved",
+                        notify("Frame Fang: settings not saved",
                             &framefang_core::failure::settings_write_failure(&e.to_string()), true);
                     }
                     if let Some(hk) = self.hotkeys.as_mut() {
@@ -1050,7 +1105,7 @@ pub fn run() -> Result<()> {
                         // it can be refused outright. Say so where they are
                         // looking, not on stderr.
                         for (action, e) in apply_hotkeys(hk, &self.settings) {
-                            notify("Frame Fang — couldn't set that shortcut",
+                            notify("Frame Fang: couldn't set that shortcut",
                                    &format!("{}: {e}", action.label()), true);
                         }
                     }
@@ -1250,8 +1305,10 @@ pub fn run() -> Result<()> {
             // Decide the routing target *before* consuming the event so we
             // only dispatch once. Overlay wins if it owns the id; otherwise
             // search the pinned-window list.
-            enum Target { Overlay, ColorPick, Pinned(usize), Settings, Recording, About, FirstRun, Updates, ConvertImage, ConvertVideo, Toast, Unknown }
-            let target = if self.color_pick.as_ref().is_some_and(|c| c.window_id() == id) {
+            enum Target { Overlay, ColorPick, Pinned(usize), Settings, Recording, About, FirstRun, Updates, ConvertImage, ConvertVideo, Toast, TrayMenu, Unknown }
+            let target = if self.tray_menu.as_ref().is_some_and(|m| m.window_id() == id) {
+                Target::TrayMenu
+            } else if self.color_pick.as_ref().is_some_and(|c| c.window_id() == id) {
                 Target::ColorPick
             } else if self.overlay.as_ref().map(|ov| ov.window_id() == id).unwrap_or(false) {
                 Target::Overlay
@@ -1427,7 +1484,7 @@ pub fn run() -> Result<()> {
                                     // dialog offers on a package-managed
                                     // install, so a failed copy must still
                                     // show it somewhere the user can read.
-                                    Err(e) => notify("Frame Fang — copy failed",
+                                    Err(e) => notify("Frame Fang: copy failed",
                                         &format!("Couldn't copy the update command to the clipboard: {e}\n\nRun this yourself:\n{cmd}"),
                                         true),
                                 }
@@ -1466,6 +1523,10 @@ pub fn run() -> Result<()> {
                     if matches!(ev, WindowEvent::RedrawRequested) {
                         if let Some(t) = self.toast.as_mut() { t.redraw(); }
                     }
+                }
+                Target::TrayMenu => {
+                    if let Some(m) = self.tray_menu.as_mut() { m.handle_event(ev); }
+                    self.finish_tray_menu(_loop_target);
                 }
                 Target::Unknown => {}
             }
@@ -1549,7 +1610,7 @@ pub fn run() -> Result<()> {
                     Ok(ov) => self.overlay = Some(ov),
                     Err(e) => {
                         eprintln!("Editor open failed: {e}");
-                        notify("Frame Fang — capture failed",
+                        notify("Frame Fang: capture failed",
                             &format!("The editor window wouldn't open: {e}"), true);
                     }
                 }
@@ -1582,7 +1643,7 @@ pub fn run() -> Result<()> {
                     Ok(pv)  => self.pinned.push(pv),
                     Err(e)  => {
                         eprintln!("Pin failed: {e}");
-                        notify("Frame Fang — pin failed",
+                        notify("Frame Fang: pin failed",
                             &framefang_core::failure::pin_failure(&e.to_string()), true);
                     }
                 }
@@ -1633,6 +1694,9 @@ pub fn run() -> Result<()> {
         overlay: None,
         pinned:  Vec::new(),
         toast:   None,
+        tray_menu: None,
+        tray_menu_closed: None,
+        tray_sound: framefang_platform::recorder::RecordingOptions::NONE,
         color_pick: None,
         settings_view:  None,
         recording_view: None,
@@ -1811,6 +1875,13 @@ static FRAME_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 /// re-launch a moment after the tray icon appeared still works.
 const STARTUP_CAPTURE_GRACE: Duration = Duration::from_secs(10);
 
+/// Windows: how long a capture started from the tray menu waits before it
+/// freezes the screen. The menu is the app's own window, gone the moment it
+/// is clicked and kept out of captures anyway, so this only covers the
+/// hidden-icons flyout closing. The native menu's fade needed 700 ms.
+#[cfg(target_os = "windows")]
+const TRAY_MENU_SETTLE: Duration = Duration::from_millis(200);
+
 /// Extract the frame at `secs` (clip seconds) at native resolution via
 /// ffmpeg. The PNG round-trips through the OS temp dir; the editor gets
 /// it as an RGBA buffer, exactly like a screenshot.
@@ -1886,7 +1957,7 @@ fn run_annotation_burn(
     out:      &std::path::Path,
 ) -> Result<()> {
     if overlays.is_empty() {
-        return Err(anyhow!("nothing to burn — no overlay groups."));
+        return Err(anyhow!("nothing to burn: no overlay groups."));
     }
     // One temp PNG per group. pid + group index alone is NOT unique:
     // burns run on detached worker threads, so committing a second
@@ -1992,8 +2063,10 @@ fn stderr_tail(stderr: &str) -> String {
     lines[n.saturating_sub(4)..].join(" | ")
 }
 
+/// The tray icon's hover text: the name, then the capture key as set in
+/// Settings (rebuilt whenever Settings saves), on two lines.
 fn tray_tooltip(s: &AppSettings) -> String {
-    format!("Frame Fang — press {} to capture", s.hotkey().describe())
+    format!("Frame Fang\nPress {} to capture", s.hotkey().describe())
 }
 
 /// Register every configured binding, reporting the ones the OS refused.
@@ -2190,19 +2263,32 @@ fn dismiss_tray_flyouts() {
     }
 }
 
+/// Open a folder, file or web link the way a double-click would: the folder
+/// in Explorer (Finder, the file manager), the link in the browser.
+///
+/// On Windows this is ShellExecute, never `cmd /c start`: a tray app that
+/// starts cmd flashes a console window on every click of Open shots.
 fn open_url(url: &str) {
-    use std::process::Command;
-    let opener = if cfg!(target_os = "windows") {
-        ("cmd",  vec!["/C", "start", "", url])
-    } else if cfg!(target_os = "macos") {
-        ("open", vec![url])
-    } else {
-        ("xdg-open", vec![url])
-    };
-    let mut cmd = Command::new(opener.0);
-    cmd.args(opener.1);
-    if let Err(e) = cmd.spawn() {
-        eprintln!("Couldn't open {url}: {e}");
+    #[cfg(target_os = "windows")]
+    {
+        use windows::core::{w, HSTRING, PCWSTR};
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        let target = HSTRING::from(url);
+        let h = unsafe {
+            ShellExecuteW(None, w!("open"), PCWSTR(target.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL)
+        };
+        // ShellExecute reports success as a value above 32.
+        if h.0 as isize <= 32 {
+            eprintln!("Couldn't open {url}: ShellExecute returned {}", h.0 as isize);
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        if let Err(e) = std::process::Command::new(opener).arg(url).spawn() {
+            eprintln!("Couldn't open {url}: {e}");
+        }
     }
 }
 

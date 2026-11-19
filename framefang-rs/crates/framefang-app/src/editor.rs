@@ -1020,7 +1020,7 @@ impl Overlay {
         let desktop_origin = desktop.origin();
         let desktop_size   = desktop.size();
         let attrs = WindowAttributes::default()
-            .with_title(if video_mode { "Frame Fang — annotate recording" } else { "Frame Fang" })
+            .with_title(if video_mode { "Frame Fang: annotate recording" } else { "Frame Fang" })
             .with_decorations(false)
             .with_resizable(false)
             .with_window_level(WindowLevel::AlwaysOnTop)

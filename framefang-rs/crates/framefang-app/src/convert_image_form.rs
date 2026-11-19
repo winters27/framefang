@@ -127,7 +127,7 @@ impl ConvertImageView {
         let win_h = WIN_H + crate::chrome::TITLE_H as u32;
         let (cx, cy) = centered_origin(loop_target, WIN_W, win_h);
         let attrs = crate::chrome::frameless(WindowAttributes::default())
-            .with_title("Frame Fang — Convert image")
+            .with_title("Frame Fang: Convert image")
             .with_resizable(false)
             .with_inner_size(PhysicalSize::new(WIN_W, win_h))
             .with_position(PhysicalPosition::new(cx, cy))

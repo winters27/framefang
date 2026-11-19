@@ -90,7 +90,7 @@ impl RecordingIndicator {
         let (x, y) = origin;
 
         let attrs = WindowAttributes::default()
-            .with_title("Frame Fang — recording")
+            .with_title("Frame Fang: recording")
             .with_decorations(false)
             .with_resizable(false)
             .with_inner_size(PhysicalSize::new(WIN_W, WIN_H))

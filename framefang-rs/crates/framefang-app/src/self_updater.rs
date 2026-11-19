@@ -89,7 +89,7 @@ fn run(
     let channel = crate::install_source::channel();
     if channel.is_package_managed() {
         return Err(format!(
-            "this Frame Fang was installed as a {} — update it through that package manager",
+            "this Frame Fang was installed as a {}. Update it through that package manager.",
             channel.label()
         ));
     }
@@ -131,7 +131,7 @@ fn run(
     // mount, which vanishes with this process — then relaunch that file.
     if is_appimage_asset(&asset_url) {
         let target = crate::install_source::appimage_path().ok_or_else(|| {
-            "AppImage asset picked but $APPIMAGE is unset — not an AppImage run".to_owned()
+            "AppImage asset picked but $APPIMAGE is unset: this isn't an AppImage run".to_owned()
         })?;
         make_executable(&download_path)?;
         swap_running_binary(&download_path, &target)?;
@@ -343,7 +343,7 @@ fn extract_tar_gz(archive: &Path) -> Result<PathBuf, String> {
         .arg("-C")
         .arg(&dir)
         .status()
-        .map_err(|e| format!("tar spawn: {e} — is `tar` on PATH?"))?;
+        .map_err(|e| format!("tar spawn: {e}. Is `tar` on PATH?"))?;
     if !status.success() {
         return Err(format!("tar exited with {status} extracting {}", archive.display()));
     }
@@ -373,7 +373,7 @@ fn extract_zip(archive: &Path) -> Result<PathBuf, String> {
             .arg("-d")
             .arg(&dir)
             .status()
-            .map_err(|e| format!("unzip spawn: {e} — is `unzip` on PATH?"))?;
+            .map_err(|e| format!("unzip spawn: {e}. Is `unzip` on PATH?"))?;
         if !status.success() {
             return Err(format!("unzip exited with {status} extracting {}", archive.display()));
         }

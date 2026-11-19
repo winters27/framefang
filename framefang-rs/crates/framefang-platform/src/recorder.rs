@@ -636,7 +636,7 @@ fn spawn_recorder(output: &Path, options: RecordingOptions, region: Option<Captu
             Ok((Backend::Process { child, stderr, cast: None }, opt))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::Recording(
-            "ffmpeg not found in PATH — install with: sudo apt install ffmpeg".into()
+            "ffmpeg isn't on PATH. Install it with: sudo apt install ffmpeg".into()
         )),
         Err(e) => Err(Error::Recording(format!("failed to spawn ffmpeg: {e}"))),
     }
@@ -714,7 +714,7 @@ fn spawn_recorder_wayland(output: &Path, options: RecordingOptions, region: Opti
     let mut child = match res {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Error::Recording(
-            "ffmpeg not found in PATH — install with: sudo apt install ffmpeg".into()
+            "ffmpeg isn't on PATH. Install it with: sudo apt install ffmpeg".into()
         )),
         Err(e) => return Err(Error::Recording(format!("failed to spawn ffmpeg: {e}"))),
     };
@@ -967,7 +967,7 @@ fn spawn_recorder(output: &Path, options: RecordingOptions, region: Option<Captu
         Err(e) => {
             if let Some(s) = sck { s.stop(); }
             if e.kind() == std::io::ErrorKind::NotFound {
-                Err(Error::Recording("ffmpeg not found — install it with: brew install ffmpeg".into()))
+                Err(Error::Recording("ffmpeg isn't installed. Install it with: brew install ffmpeg".into()))
             } else {
                 Err(Error::Recording(format!("failed to spawn ffmpeg: {e}")))
             }
@@ -1415,7 +1415,7 @@ fn watch_recorder_startup(mut child: Child) -> Result<(Child, StderrTail)> {
                 let mut buf = String::new();
                 if let Some(mut e) = stderr.take() { let _ = e.read_to_string(&mut buf); }
                 return Err(Error::Recording(format!(
-                    "recording failed to start — the encoder exited immediately ({status}).\n\n{}",
+                    "recording failed to start: the encoder exited immediately ({status}).\n\n{}",
                     ffmpeg_error_tail(&buf)
                 )));
             }

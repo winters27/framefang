@@ -59,6 +59,16 @@ pub struct MenuLabels {
     pub record:       String,
 }
 
+/// A click on the tray icon, in physical screen pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrayClick {
+    /// Where the pointer was.
+    pub x: i32,
+    pub y: i32,
+    /// The icon's own box: x, y, width, height.
+    pub icon: (i32, i32, u32, u32),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayEvent {
     None,
@@ -193,6 +203,10 @@ impl Tray {
         menu.append(&delay_3s).map_err(|e| Error::Tray(e.to_string()))?;
         menu.append(&delay_5s).map_err(|e| Error::Tray(e.to_string()))?;
         menu.append(&delay_10s).map_err(|e| Error::Tray(e.to_string()))?;
+        // Only Linux can reach it: the countdown keeps GTK pumping there.
+        // On Windows and macOS the countdown blocks the thread the menu
+        // runs on, so it could never open while there was anything to cancel.
+        #[cfg(target_os = "linux")]
         menu.append(&cancel).map_err(|e| Error::Tray(e.to_string()))?;
         menu.append(&PredefinedMenuItem::separator()).map_err(|e| Error::Tray(e.to_string()))?;
         menu.append(&rec_none).map_err(|e| Error::Tray(e.to_string()))?;
@@ -216,12 +230,16 @@ impl Tray {
         menu.append(&exit).map_err(|e| Error::Tray(e.to_string()))?;
 
         let img = build_icon();
-        let tray_icon = TrayIconBuilder::new()
+        let builder = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_icon(img)
-            .with_tooltip(tooltip.into())
-            .build()
-            .map_err(|e| Error::Tray(e.to_string()))?;
+            .with_tooltip(tooltip.into());
+        // Windows: the app draws its own menu in the color scheme (see
+        // `take_click`). The native one stays attached, unopened, for
+        // `show_native_menu` if that window can't be made.
+        #[cfg(windows)]
+        let builder = builder.with_menu_on_left_click(false).with_menu_on_right_click(false);
+        let tray_icon = builder.build().map_err(|e| Error::Tray(e.to_string()))?;
 
         Ok(Tray {
             icon: tray_icon,
@@ -285,6 +303,36 @@ impl Tray {
             Ok(ev) if ev.id == self.exit_id      => TrayEvent::Exit,
             _ => TrayEvent::None,
         }
+    }
+
+    /// The last left or right click on the icon since the previous call, as
+    /// the button came up. Windows only, where the app opens its own menu
+    /// there; elsewhere the native menu opens by itself and this is `None`.
+    /// Drains the icon's whole event queue either way, so hover events never
+    /// pile up.
+    pub fn take_click(&self) -> Option<TrayClick> {
+        use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
+        let mut click = None;
+        while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
+            if let TrayIconEvent::Click {
+                position, rect, button: MouseButton::Left | MouseButton::Right,
+                button_state: MouseButtonState::Up, ..
+            } = ev {
+                click = Some(TrayClick {
+                    x: position.x.round() as i32,
+                    y: position.y.round() as i32,
+                    icon: (rect.position.x.round() as i32, rect.position.y.round() as i32,
+                           rect.size.width, rect.size.height),
+                });
+            }
+        }
+        if cfg!(windows) { click } else { None }
+    }
+
+    /// Open the native menu at the pointer: the fallback when the app's own
+    /// menu window can't be made. Windows and macOS only.
+    pub fn show_native_menu(&self) {
+        self.icon.show_menu();
     }
 
     /// Replace the hover tooltip. Called after the user rebinds the capture
@@ -361,13 +409,13 @@ fn stop_label(record_label: &str) -> String {
 /// in `icons/` are all the *same* artwork — no procedural fallback that
 /// drifts visually from the brand.
 ///
-/// 64×64 is the source size: large enough that panel resampling (Linux tray
-/// panels typically render at 16–22 px) stays clean, small enough that
-/// embedding doesn't bloat the binary. The decoded RGBA is handed to
-/// `tray-icon`, which resamples per-platform.
+/// 32×32, rendered from the small-icon artwork (no glow, a dark edge round
+/// the F, thicker brackets): trays draw at 16 to 32 px, and shrinking the
+/// 64 px icon (glow and all) down to that turned it to mush. The decoded
+/// RGBA is handed to `tray-icon`, which resamples per-platform.
 fn build_icon() -> TrayIconImage {
     const ICON_PNG: &[u8] = include_bytes!(
-        "../../../../icons/linux_hicolor/64x64/apps/framefang.png"
+        "../../../../icons/linux_hicolor/32x32/apps/framefang.png"
     );
     let img = image::load_from_memory(ICON_PNG)
         .expect("embedded brand PNG must decode")

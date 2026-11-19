@@ -235,7 +235,7 @@ impl SettingsView {
         let win_h = content_height(&rows) + crate::chrome::TITLE_H as u32;
         let (cx, cy) = centered_origin(loop_target, WIN_W, win_h);
         let attrs = crate::chrome::frameless(WindowAttributes::default())
-            .with_title("Frame Fang — Settings")
+            .with_title("Frame Fang: Settings")
             .with_resizable(false)
             .with_inner_size(PhysicalSize::new(WIN_W, win_h))
             .with_position(PhysicalPosition::new(cx, cy))
@@ -526,7 +526,7 @@ impl SettingsView {
                     PathBuf::from(&self.draft.save_directory)
                 };
                 if let Some(p) = rfd::FileDialog::new()
-                    .set_title("Frame Fang — Screenshots folder")
+                    .set_title("Frame Fang: Screenshots folder")
                     .set_directory(&starting)
                     .pick_folder()
                 {
@@ -542,7 +542,7 @@ impl SettingsView {
                     PathBuf::from(&self.draft.recordings_directory)
                 };
                 if let Some(p) = rfd::FileDialog::new()
-                    .set_title("Frame Fang — Recordings folder")
+                    .set_title("Frame Fang: Recordings folder")
                     .set_directory(&starting)
                     .pick_folder()
                 {

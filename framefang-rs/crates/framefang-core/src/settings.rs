@@ -54,7 +54,7 @@ impl Default for Hotkey {
 }
 
 impl Hotkey {
-    /// Human-readable rendering, e.g. `"Ctrl + Shift + P"` or `"PrintScreen"`.
+    /// Human-readable rendering, e.g. `"Ctrl + Shift + P"` or `"Print Screen"`.
     /// Unknown VKs render as `"(0xNN)"` so the user can at least see they have
     /// an unsupported key bound.
     pub fn describe(&self) -> String {
@@ -116,11 +116,11 @@ const fn k(vk: u32, label: &'static str, alone: bool) -> KeyInfo { KeyInfo { vk,
 /// Labels are ASCII (the 5x7 bitmap font has nothing else).
 pub const KEYS: &[KeyInfo] = &[
     k(0x08, "Backspace", false), k(0x09, "Tab", false), k(0x0D, "Enter", false),
-    k(0x13, "Pause", true), k(0x14, "CapsLock", false), k(0x1B, "Esc", false),
+    k(0x13, "Pause", true), k(0x14, "Caps Lock", false), k(0x1B, "Esc", false),
     k(0x20, "Space", false),
-    k(0x21, "PageUp", false), k(0x22, "PageDown", false), k(0x23, "End", false), k(0x24, "Home", false),
+    k(0x21, "Page Up", false), k(0x22, "Page Down", false), k(0x23, "End", false), k(0x24, "Home", false),
     k(0x25, "Left", false), k(0x26, "Up", false), k(0x27, "Right", false), k(0x28, "Down", false),
-    k(0x2C, "PrintScreen", true), k(0x2D, "Insert", true), k(0x2E, "Delete", false),
+    k(0x2C, "Print Screen", true), k(0x2D, "Insert", true), k(0x2E, "Delete", false),
     k(0x30, "0", false), k(0x31, "1", false), k(0x32, "2", false), k(0x33, "3", false), k(0x34, "4", false),
     k(0x35, "5", false), k(0x36, "6", false), k(0x37, "7", false), k(0x38, "8", false), k(0x39, "9", false),
     k(0x41, "A", false), k(0x42, "B", false), k(0x43, "C", false), k(0x44, "D", false), k(0x45, "E", false),
@@ -141,7 +141,7 @@ pub const KEYS: &[KeyInfo] = &[
     k(0x7C, "F13", true), k(0x7D, "F14", true), k(0x7E, "F15", true), k(0x7F, "F16", true),
     k(0x80, "F17", true), k(0x81, "F18", true), k(0x82, "F19", true), k(0x83, "F20", true),
     k(0x84, "F21", true), k(0x85, "F22", true), k(0x86, "F23", true), k(0x87, "F24", true),
-    k(0x90, "NumLock", false), k(0x91, "ScrollLock", true),
+    k(0x90, "Num Lock", false), k(0x91, "Scroll Lock", true),
     k(0xA6, "Browser Back", true), k(0xA7, "Browser Forward", true), k(0xA8, "Browser Refresh", true),
     k(0xA9, "Browser Stop", true), k(0xAA, "Browser Search", true), k(0xAB, "Favorites", true),
     k(0xAC, "Browser Home", true),
@@ -597,7 +597,7 @@ mod tests {
         let hk = s.hotkey();
         assert_eq!(hk.modifiers, Modifiers::empty());
         assert_eq!(hk.virtual_key, 0x2C);
-        assert_eq!(hk.describe(), "PrintScreen");
+        assert_eq!(hk.describe(), "Print Screen");
         assert_eq!(Hotkey::default(), hk);
     }
 
@@ -634,7 +634,7 @@ mod tests {
 
     #[test]
     fn vk_label_covers_common_keys() {
-        assert_eq!(vk_label(0x2C), Some("PrintScreen"));
+        assert_eq!(vk_label(0x2C), Some("Print Screen"));
         assert_eq!(vk_label(0x50), Some("P"));
         assert_eq!(vk_label(0x70), Some("F1"));
         assert_eq!(vk_label(0x7B), Some("F12"));
