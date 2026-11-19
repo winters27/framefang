@@ -144,6 +144,9 @@ pub fn run() -> Result<()> {
         /// The "Copied to clipboard" pill after a copy that closed the
         /// capture window. Dropped by `about_to_wait` once it has faded.
         toast:      Option<crate::toast::Toast>,
+        /// The editor eyedropper's color-pick session over the frozen
+        /// screen, while it is open. Its answer goes back to `overlay`.
+        color_pick: Option<Overlay>,
         /// Settings dialog window, present while the user is editing
         /// preferences. Routed by `WindowId` like the overlay + pinned
         /// windows. `None` when no settings dialog is open.
@@ -1250,8 +1253,10 @@ pub fn run() -> Result<()> {
             // Decide the routing target *before* consuming the event so we
             // only dispatch once. Overlay wins if it owns the id; otherwise
             // search the pinned-window list.
-            enum Target { Overlay, Pinned(usize), Settings, Recording, About, FirstRun, Updates, ConvertImage, ConvertVideo, Toast, Unknown }
-            let target = if self.overlay.as_ref().map(|ov| ov.window_id() == id).unwrap_or(false) {
+            enum Target { Overlay, ColorPick, Pinned(usize), Settings, Recording, About, FirstRun, Updates, ConvertImage, ConvertVideo, Toast, Unknown }
+            let target = if self.color_pick.as_ref().is_some_and(|c| c.window_id() == id) {
+                Target::ColorPick
+            } else if self.overlay.as_ref().map(|ov| ov.window_id() == id).unwrap_or(false) {
                 Target::Overlay
             } else if self.toast.as_ref().is_some_and(|t| t.window_id() == id) {
                 Target::Toast
@@ -1283,6 +1288,7 @@ pub fn run() -> Result<()> {
             // Where the "Copied" pill goes, read off the overlay before it is
             // dropped. Only a copy that closes the window gets one.
             let mut toast_spot:   Option<(i32, i32)> = None;
+            let mut wants_color_pick = false;
             let mut pinned_payload: Option<(image::ImageBuffer<image::Rgba<u8>, Vec<u8>>, (i32, i32))> = None;
             let mut record_region: Option<(i32, i32, i32, i32)> = None;
             let mut chosen: Option<Box<ChosenRegion>> = None;
@@ -1303,7 +1309,24 @@ pub fn run() -> Result<()> {
                             OverlayOutcome::Pinned(img, p)  => { drop_overlay = true; pinned_payload = Some((img, p)); }
                             OverlayOutcome::RecordRegion(r) => { drop_overlay = true; record_region = Some(r); }
                             OverlayOutcome::Chosen(c)       => { drop_overlay = true; chosen = Some(c); }
+                            OverlayOutcome::PickScreenColor => { wants_color_pick = true; }
+                            // Only a color-pick session answers with a color.
+                            OverlayOutcome::ColorPicked(_)  => {}
                         }
+                    }
+                }
+                Target::ColorPick => {
+                    let answer = self.color_pick.as_mut().map(|c| c.handle_event(ev));
+                    match answer {
+                        Some(OverlayOutcome::ColorPicked(c)) => {
+                            self.color_pick = None;
+                            if let Some(ov) = self.overlay.as_mut() { ov.take_screen_color(c); }
+                        }
+                        Some(OverlayOutcome::Cancelled) => {
+                            self.color_pick = None;
+                            if let Some(ov) = self.overlay.as_mut() { ov.screen_color_cancelled(); }
+                        }
+                        _ => {}
                     }
                 }
                 Target::Settings => {
@@ -1450,6 +1473,29 @@ pub fn run() -> Result<()> {
                 Target::Unknown => {}
             }
 
+            // The editor's eyedropper: freeze the whole screen, editor and
+            // all, and let the user pick a color from anywhere on it.
+            if wants_color_pick {
+                match capture_all_screens() {
+                    Ok(shot) => match Overlay::new_for_color_pick(
+                        _loop_target, shot.geometry(), shot.bitmap, self.settings.clone())
+                    {
+                        Ok(mut c) => {
+                            c.set_display_map(shot.map);
+                            self.color_pick = Some(c);
+                        }
+                        Err(e) => {
+                            eprintln!("framefang: color pick open failed: {e}");
+                            if let Some(ov) = self.overlay.as_mut() { ov.screen_color_cancelled(); }
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("framefang: color pick capture failed: {e}");
+                        if let Some(ov) = self.overlay.as_mut() { ov.screen_color_cancelled(); }
+                    }
+                }
+            }
+
             // Save As asks with the overlay out of the way, and brings it back
             // if the user cancels.
             if let Some(img) = save_as {
@@ -1482,6 +1528,8 @@ pub fn run() -> Result<()> {
                     self.settings.capture_mode   = ov.settings().capture_mode.clone();
                 }
                 self.overlay = None;
+                // A color-pick session has no editor left to answer.
+                self.color_pick = None;
                 // A cancelled region-selection session must not leave its audio
                 // choice armed for whatever overlay commits next.
                 if record_region.is_none() { self.pending_region_audio = None; }
@@ -1588,6 +1636,7 @@ pub fn run() -> Result<()> {
         overlay: None,
         pinned:  Vec::new(),
         toast:   None,
+        color_pick: None,
         settings_view:  None,
         recording_view: None,
         about_view:     None,

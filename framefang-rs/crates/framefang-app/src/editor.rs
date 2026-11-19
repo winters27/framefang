@@ -92,6 +92,13 @@ pub enum OverlayOutcome {
     /// Carries `(x, y, w, h)` in window pixels — the caller clamps it to the
     /// desktop and hands it to the recorder. No bitmap: nothing is saved.
     RecordRegion((i32, i32, i32, i32)),
+    /// The editor's eyedropper wants a color from anywhere on screen, not
+    /// just its own picture: the caller freezes the whole screen and opens
+    /// `new_for_color_pick` over it, then hands the answer back with
+    /// `take_screen_color`.
+    PickScreenColor,
+    /// A color-pick session's answer: the color clicked.
+    ColorPicked(framefang_core::color::Rgba),
     /// The region picker let go of the frozen desktop: the user released a
     /// drag, and the picture now goes to its own editor window
     /// (`Overlay::new_for_editor`) while the rest of the screen comes back.
@@ -151,9 +158,11 @@ pub fn editor_placement(pic: (i32, i32, i32, i32), monitor: vdesk::MonitorRect) 
     let (_, ap_h) = action_panel_dims(&VIDEO_ACTION_BUTTONS);
     // The tool column and the flyout that slides out beside it.
     let tools = 5 + tp_w + FLYOUT_GAP + FLYOUT_W + EDITOR_EDGE;
-    let (top, bottom) = (EDITOR_EDGE, 5 + ap_h + EDITOR_EDGE);
-    // Tall enough for the tool column, however short the picture is.
-    let h = (top + pic.3 + bottom).max(EDITOR_EDGE * 2 + tp_h);
+    // The column stands on the picture's bottom edge (`tool_panel_origin`),
+    // so a picture shorter than it needs room above for the rest of it.
+    let top = EDITOR_EDGE + (tp_h - pic.3).max(0);
+    let bottom = 5 + ap_h + EDITOR_EDGE;
+    let h = top + pic.3 + bottom;
     let (mw, mh) = (monitor.width as i32, monitor.height as i32);
     if pic.2 <= 0 || pic.3 <= 0 || h > mh { return None; }
     let y = (pic.1 - top).clamp(monitor.y, monitor.y + mh - h);
@@ -757,6 +766,13 @@ pub struct Overlay {
     glide_at: std::time::Instant,
     /// A press in Screen or All screens mode, waiting for its release.
     pick_pressed: bool,
+    /// This overlay is a color-pick session over the frozen screen
+    /// (`new_for_color_pick`): no dim, no tools, just the color loupe, and
+    /// a click answers with the color under it.
+    color_pick: bool,
+    /// The editor's eyedropper was just armed and wants the whole screen
+    /// to pick from; the press returns `PickScreenColor`.
+    wants_screen_color: bool,
 }
 
 impl Drop for Overlay {
@@ -812,6 +828,38 @@ impl Overlay {
         let mut me = Self::build(loop_target, screenshot, desktop, settings, false, None, None, None)?;
         me.pick_mode = crate::pick::PickMode::parse(&me.settings.capture_mode);
         Ok(me)
+    }
+
+    /// A color-pick session over the frozen screen, for the editor window's
+    /// eyedropper: the whole desktop as it was, undimmed, with the color
+    /// loupe at the cursor. A click answers `ColorPicked`; Esc or a right
+    /// click answers `Cancelled`.
+    pub fn new_for_color_pick(
+        loop_target: &ActiveEventLoop,
+        desktop: DesktopGeometry,
+        screenshot: ImageBuffer<Rgba<u8>, Vec<u8>>,
+        settings: AppSettings,
+    ) -> Result<Self> {
+        let mut me = Self::build(loop_target, screenshot, desktop, settings, false, None, None, None)?;
+        me.color_pick = true;
+        me.picking_color = true;
+        Ok(me)
+    }
+
+    /// The color a color-pick session answered with: the eyedropper's tool
+    /// takes it, as if picked from the picture.
+    pub fn take_screen_color(&mut self, c: framefang_core::color::Rgba) {
+        self.spectrum_pick = None;
+        self.set_color(c.with_alpha(0xFF));
+        self.show_palette_of_color();
+        self.save_knobs();
+        self.window.focus_window();
+    }
+
+    /// The color-pick session was cancelled: the eyedropper goes down.
+    pub fn screen_color_cancelled(&mut self) {
+        self.stop_picking();
+        self.window.focus_window();
     }
 
     /// The windows that were on screen when it froze (frontmost first, in
@@ -874,7 +922,7 @@ impl Overlay {
 
     /// The frozen full-desktop picker of a normal capture, the one session
     /// that hands its region off to an editor window.
-    fn is_picker(&self) -> bool { !self.video_mode && !self.record_mode && !self.editor_mode }
+    fn is_picker(&self) -> bool { !self.video_mode && !self.record_mode && !self.editor_mode && !self.color_pick }
 
     /// Hand the just-released region to an editor window, or `None` to keep
     /// editing in place (the picture plus its tools would not fit on the
@@ -1141,6 +1189,8 @@ impl Overlay {
             glide_from: (0, 0, 0, 0),
             glide_at: std::time::Instant::now(),
             pick_pressed: false,
+            color_pick: false,
+            wants_screen_color: false,
         })
     }
 
@@ -1300,6 +1350,9 @@ impl Overlay {
         let hit = |r: Rect4| rect_contains(offset(r, (fx, fy)), self.cursor);
         if hit(custom.eyedropper) {
             self.picking_color = !self.picking_color;
+            // The editor window holds only its picture; to pick from the
+            // whole screen it asks for a color-pick session over it.
+            self.wants_screen_color = self.picking_color && self.editor_mode;
             self.hover_tip = None;
             self.update_resize_cursor();
             self.window.request_redraw();
@@ -1362,14 +1415,16 @@ impl Overlay {
     /// around it is not part of the capture.
     fn pick_color_at_cursor(&mut self) {
         if self.editor_mode && !self.cursor_in_selection() { return; }
-        let (ox, oy) = self.bitmap_offset();
-        let (x, y) = (self.cursor.0 + ox, self.cursor.1 + oy);
-        if x < 0 || y < 0 || x >= self.screenshot.width() as i32 || y >= self.screenshot.height() as i32 { return; }
-        let p = self.screenshot.get_pixel(x as u32, y as u32).0;
+        let Some(c) = self.color_at_cursor() else { return; };
         self.spectrum_pick = None;
-        self.set_color(framefang_core::color::Rgba::new_opaque(p[0], p[1], p[2]));
+        self.set_color(c);
         self.show_palette_of_color();
         self.save_knobs();
+    }
+
+    /// The captured pixel under the cursor, opaque.
+    fn color_at_cursor(&self) -> Option<framefang_core::color::Rgba> {
+        pixel_at(&self.screenshot, self.cursor, self.bitmap_offset())
     }
 
     fn knob_value(&self, k: Knob) -> f32 {
@@ -1624,7 +1679,7 @@ impl Overlay {
                         // can place the first selection edge by pixel, and
                         // the highlight follows what a click would take.
                         self.update_target();
-                        let on_bar = rect_contains(self.mode_bar().0, self.cursor);
+                        let on_bar = self.has_hover() && rect_contains(self.mode_bar().0, self.cursor);
                         self.window.set_cursor(if on_bar { CursorIcon::Pointer } else { CursorIcon::Crosshair });
                         self.window.request_redraw();
                     }
@@ -1644,6 +1699,7 @@ impl Overlay {
             // Right-click commits the current selection (matches the
             // OverlayForm gesture for "save this region right now").
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Right, .. } => {
+                if self.color_pick { return OverlayOutcome::Cancelled; }
                 if self.state == State::Drawing {
                     // Cancel the in-progress annotation, mirroring C# OverlayForm.
                     self.current = None;
@@ -1749,6 +1805,10 @@ impl Overlay {
 
     fn handle_key(&mut self, key: Key) -> OverlayOutcome {
         eprintln!("framefang: key={:?} state={:?} mods={:?}", key, self.state, self.mods);
+        // A color-pick session knows one key: Esc backs out of it.
+        if self.color_pick {
+            return if key == Key::Named(NamedKey::Escape) { OverlayOutcome::Cancelled } else { OverlayOutcome::Continue };
+        }
         // Text-input state owns the keyboard while it's active — typed
         // characters extend the pending annotation; Enter commits, Esc
         // cancels, Backspace pops the last char.
@@ -2117,6 +2177,13 @@ impl Overlay {
     }
 
     fn handle_left_press(&mut self) -> OverlayOutcome {
+        // A color-pick session answers with the color under the click.
+        if self.color_pick {
+            return match self.color_at_cursor() {
+                Some(c) => OverlayOutcome::ColorPicked(c),
+                None => OverlayOutcome::Continue,
+            };
+        }
         // An armed Esc confirmation owns the click the same way it owns
         // the keyboard: clicking Close again goes through with it, a click
         // anywhere else calls it off and is swallowed so the answer can
@@ -2153,6 +2220,9 @@ impl Overlay {
         // A color recolors the text being typed too (`set_color`), like the
         // size slider resizes it.
         if self.press_flyout_colors() {
+            if std::mem::take(&mut self.wants_screen_color) {
+                return OverlayOutcome::PickScreenColor;
+            }
             return OverlayOutcome::Continue;
         }
         if self.flyout_rect().is_some_and(|(r, _, _)| rect_contains(r, self.cursor)) {
@@ -2487,7 +2557,7 @@ impl Overlay {
     // every screen. A drag still draws a region in the first mode.
 
     /// The capture screens that have a hover: the picker and record mode.
-    fn has_hover(&self) -> bool { !self.locked() }
+    fn has_hover(&self) -> bool { !self.locked() && !self.color_pick }
 
     /// How many screens the capture spans.
     fn screens(&self) -> usize { self.desktop.monitors().len().max(1) }
@@ -3009,7 +3079,9 @@ impl Overlay {
         // the capture) paint black.
         let t_start = std::time::Instant::now();
         let backdrop_shot = crate::backdrop::Shot { rgba: shot, width: shot_w, height: shot_h, offset: shot_off };
-        let lit = hover.as_ref().map(|((x, y, w, h), _, _)| (*x, *y, x + w, y + h)).or(sel_rect);
+        // A color-pick session shows the screen as it is: nothing dimmed.
+        let lit = if self.color_pick { Some((0, 0, win_w as i32, win_h as i32)) }
+                  else { hover.as_ref().map(|((x, y, w, h), _, _)| (*x, *y, x + w, y + h)).or(sel_rect) };
         buf.copy_from_slice(self.backdrop.frame(win_w, win_h, &backdrop_shot, lit));
         let t_backdrop = t_start.elapsed();
 
@@ -3195,7 +3267,7 @@ impl Overlay {
         // just a dimmed desktop with a lens on it, which says nothing about
         // dragging a region or about the way back out. One dim line spells
         // both out; it disappears the moment the drag starts.
-        if matches!(self.state, State::Idle) {
+        if matches!(self.state, State::Idle) && !self.color_pick {
             draw_idle_hint(&mut buf, win_w, win_h, cursor_bounds,
                            if self.record_mode { RECORD_HINT } else { pick_mode.hint() });
         }
@@ -3213,11 +3285,15 @@ impl Overlay {
         // Only where a drag can start: Screen and All screens take a click.
         let can_drag = locked || pick_mode == crate::pick::PickMode::Auto;
         let on_bar = mode_bar.as_ref().is_some_and(|(b, _)| rect_contains(*b, self.cursor));
-        if (matches!(self.state, State::Idle | State::Selecting) && can_drag && !on_bar) || picking_here {
-            // The eyedropper's lens opens up and to the left: the tool panel
-            // and its flyout are to the right and would be covered.
+        if picking_here {
+            // The eyedropper's own loupe: the lens and the color's card. Over
+            // the capture screen's panels it opens up and to the left, away
+            // from the tool panel and its flyout.
+            draw_color_loupe(&mut buf, win_w, win_h, cursor_bounds,
+                             &self.screenshot, self.cursor, shot_off, !self.color_pick, self.color_pick);
+        } else if matches!(self.state, State::Idle | State::Selecting) && can_drag && !on_bar {
             draw_magnifier(&mut buf, win_w, win_h, cursor_bounds,
-                           &self.screenshot, self.cursor, shot_off, picking_here);
+                           &self.screenshot, self.cursor, shot_off, false);
         }
 
         // Pass 6.5: video timeline — video mode only, and only when the
@@ -3361,10 +3437,13 @@ fn action_panel_dims(buttons: &[ActionButton]) -> (i32, i32) {
 /// instead of flipping to the other side of the selection.
 fn tool_panel_origin(bounds: (i32, i32, i32, i32), sel: (i32, i32, i32, i32)) -> (i32, i32) {
     let (bx, by, bw, bh) = bounds;
-    let (sx, sy, sw, _sh) = sel;
+    let (sx, sy, sw, sh) = sel;
     let (pw, ph) = tool_panel_dims();
     let mut tx = sx + sw + 5;
-    let mut ty = sy;
+    // Bottom-aligned with the selection, beside the action row: on a short
+    // capture the column grows upward past it rather than hanging far
+    // below it.
+    let mut ty = sy + sh - ph;
     if tx + pw > bx + bw { tx = sx - pw - 5; }
     if ty + ph > by + bh { ty = by + bh - ph; }
     (tx.max(bx), ty.max(by))
@@ -4435,6 +4514,113 @@ fn draw_magnifier(
     draw_filled_rect(buf, win_w, win_h, cx, inner_y, cx + 1, inner_y + MAG_SIZE, red);
 }
 
+/// The captured pixel at frame point `p`, opaque. `None` off the capture.
+fn pixel_at(shot: &ImageBuffer<Rgba<u8>, Vec<u8>>, p: (i32, i32), shot_off: (i32, i32))
+    -> Option<framefang_core::color::Rgba>
+{
+    let (x, y) = (p.0 + shot_off.0, p.1 + shot_off.1);
+    if x < 0 || y < 0 || x >= shot.width() as i32 || y >= shot.height() as i32 { return None; }
+    let px = shot.get_pixel(x as u32, y as u32).0;
+    Some(framefang_core::color::Rgba::new_opaque(px[0], px[1], px[2]))
+}
+
+/// `c` as hue in whole degrees and saturation and lightness in whole
+/// percent.
+fn to_hsl(c: framefang_core::color::Rgba) -> (u32, u32, u32) {
+    let (r, g, b) = (c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0);
+    let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+    let l = (max + min) / 2.0;
+    let d = max - min;
+    if d < 1e-6 { return (0, 0, (l * 100.0).round() as u32); }
+    let s = d / (1.0 - (2.0 * l - 1.0).abs());
+    let h = if max == r { ((g - b) / d).rem_euclid(6.0) } else if max == g { (b - r) / d + 2.0 } else { (r - g) / d + 4.0 };
+    (((h * 60.0).round() as u32) % 360, (s * 100.0).round().min(100.0) as u32, (l * 100.0).round() as u32)
+}
+
+/// The color loupe's lens: 17 pixels across at 9x.
+const LOUPE_PIXELS: i32 = 17;
+const LOUPE_ZOOM: i32 = 9;
+const LOUPE_LENS: i32 = LOUPE_PIXELS * LOUPE_ZOOM + 2;
+const LOUPE_CARD_W: i32 = 184;
+const LOUPE_GAP: i32 = 6;
+
+/// The eyedropper's loupe: a lens on the pixels around the cursor with the
+/// one a click takes outlined, and beside it a card with that color as a
+/// large swatch, its hex in big type, and its RGB and HSL. The pair sits
+/// below and right of the cursor (`up_left`: above and left), flipping to
+/// stay on the screen in `bounds`. `hint` adds how to pick and back out.
+#[allow(clippy::too_many_arguments)]
+fn draw_color_loupe(
+    buf: &mut [u32], win_w: usize, win_h: usize,
+    bounds: Rect4,
+    shot: &ImageBuffer<Rgba<u8>, Vec<u8>>,
+    cursor: (i32, i32), shot_off: (i32, i32),
+    up_left: bool, hint: bool,
+) {
+    use framefang_core::color::Rgba as C;
+    const SURFACE: u32 = 0x00_1A_1A_1D;
+    const EDGE: u32 = 0x00_3A_3A_40;
+    const OFFSET: i32 = 22;
+    let Some(color) = pixel_at(shot, cursor, shot_off) else { return; };
+    let (bx, by, bw, bh) = bounds;
+    let (unit_w, unit_h) = (LOUPE_LENS + LOUPE_GAP + LOUPE_CARD_W, LOUPE_LENS);
+    let (right, below) = (cursor.0 + OFFSET, cursor.1 + OFFSET);
+    let (left, above) = (cursor.0 - OFFSET - unit_w, cursor.1 - OFFSET - unit_h);
+    let fits_x = |x: i32| x >= bx && x + unit_w <= bx + bw;
+    let fits_y = |y: i32| y >= by && y + unit_h <= by + bh;
+    let x0 = if up_left { if fits_x(left) { left } else { right } } else if fits_x(right) { right } else { left };
+    let y0 = if up_left { if fits_y(above) { above } else { below } } else if fits_y(below) { below } else { above };
+    if !fits_x(x0) || !fits_y(y0) { return; }
+
+    // The lens. Each captured pixel a 9 px square; the center one framed
+    // dark then light, so it reads on any color.
+    draw_filled_rect(buf, win_w, win_h, x0, y0, x0 + LOUPE_LENS, y0 + LOUPE_LENS, SURFACE);
+    draw_rect_border(buf, win_w, win_h, x0, y0, x0 + LOUPE_LENS, y0 + LOUPE_LENS, EDGE);
+    let r = LOUPE_PIXELS / 2;
+    for sy in 0..LOUPE_PIXELS {
+        for sx in 0..LOUPE_PIXELS {
+            let p = pixel_at(shot, (cursor.0 + sx - r, cursor.1 + sy - r), shot_off)
+                .map_or(0, |c| ((c.r as u32) << 16) | ((c.g as u32) << 8) | c.b as u32);
+            let (dx, dy) = (x0 + 1 + sx * LOUPE_ZOOM, y0 + 1 + sy * LOUPE_ZOOM);
+            draw_filled_rect(buf, win_w, win_h, dx, dy, dx + LOUPE_ZOOM, dy + LOUPE_ZOOM, p);
+        }
+    }
+    let (cx, cy) = (x0 + 1 + r * LOUPE_ZOOM, y0 + 1 + r * LOUPE_ZOOM);
+    draw_rect_border(buf, win_w, win_h, cx - 1, cy - 1, cx + LOUPE_ZOOM + 1, cy + LOUPE_ZOOM + 1, 0x00_00_00_00);
+    draw_rect_border(buf, win_w, win_h, cx - 2, cy - 2, cx + LOUPE_ZOOM + 2, cy + LOUPE_ZOOM + 2, 0x00_FF_FF_FF);
+
+    // The card.
+    let (kx, ky) = (x0 + LOUPE_LENS + LOUPE_GAP, y0);
+    draw_filled_rect(buf, win_w, win_h, kx, ky, kx + LOUPE_CARD_W, ky + unit_h, SURFACE);
+    draw_rect_border(buf, win_w, win_h, kx, ky, kx + LOUPE_CARD_W, ky + unit_h, EDGE);
+    const PAD: i32 = 14;
+    const SW: i32 = 44;
+    let ink = ((color.r as u32) << 16) | ((color.g as u32) << 8) | color.b as u32;
+    draw_filled_rect(buf, win_w, win_h, kx + PAD - 1, ky + PAD - 1, kx + PAD + SW + 1, ky + PAD + SW + 1, EDGE);
+    draw_filled_rect(buf, win_w, win_h, kx + PAD, ky + PAD, kx + PAD + SW, ky + PAD + SW, ink);
+    let hex = format!("#{:02X}{:02X}{:02X}", color.r, color.g, color.b);
+    let (h, s, l) = to_hsl(color);
+    let rows = [("RGB", format!("{}, {}, {}", color.r, color.g, color.b)), ("HSL", format!("{h}, {s}%, {l}%"))];
+    let mut surf = crate::painter::U32Surface { buf, stride: win_w as i32, height: win_h as i32 };
+    const HEX_PX: f32 = 20.0;
+    let hex_y = (ky + PAD) as f32 + (SW as f32 - framefang_core::text::line_height(HEX_PX)) / 2.0;
+    crate::painter::draw_unicode_text(&mut surf, (kx + PAD + SW + 12) as f32, hex_y, HEX_PX, &hex,
+                                      C::new_opaque(0xF4, 0xF4, 0xF7));
+    let row_px = FLYOUT_TEXT_PX;
+    let row_h = framefang_core::text::line_height(row_px) + 4.0;
+    let mut y = (ky + PAD + SW + 12) as f32;
+    for (label, value) in rows {
+        crate::painter::draw_unicode_text(&mut surf, (kx + PAD) as f32, y, row_px, label, C::new_opaque(0x7A, 0x7A, 0x84));
+        crate::painter::draw_unicode_text(&mut surf, (kx + PAD + 40) as f32, y, row_px, &value, C::new_opaque(0xDC, 0xDC, 0xE2));
+        y += row_h;
+    }
+    if hint {
+        let hint_y = (ky + unit_h - PAD) as f32 - framefang_core::text::line_height(11.5);
+        crate::painter::draw_unicode_text(&mut surf, (kx + PAD) as f32, hint_y, 11.5,
+                                          "Click to pick  -  Esc to cancel", C::new_opaque(0x6E, 0x6E, 0x78));
+    }
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────
 
 /// Paint surface for `compose_video_overlay`. Reads (and writes) a live
@@ -4743,6 +4929,26 @@ mod tests {
     }
 
     #[test]
+    fn the_tools_stand_on_the_pictures_bottom_right_corner() {
+        let (_, tp_h) = tool_panel_dims();
+        // A short picture: the column ends level with its bottom and the
+        // window makes room above for the rest of it.
+        let m = monitor(0, 0, 2560, 1440);
+        let p = editor_placement((600, 700, 300, 120), m).unwrap();
+        assert_eq!((p.pos.0 + p.picture_at.0, p.pos.1 + p.picture_at.1), (600, 700), "the picture stays put");
+        let sel = (p.picture_at.0, p.picture_at.1, 300, 120);
+        let (_, ty) = tool_panel_origin((0, 0, p.size.0 as i32, p.size.1 as i32), sel);
+        assert_eq!(ty + tp_h, sel.1 + sel.3, "bottom-aligned with the picture");
+        assert!(ty >= 0, "inside the window");
+        // A tall selection on the frozen desktop: the same, not its top.
+        let (_, ty) = tool_panel_origin((0, 0, 2560, 1440), (100, 100, 900, 1000));
+        assert_eq!(ty + tp_h, 1100);
+        // Near the top of the screen the column is held on it and runs down.
+        let (_, ty) = tool_panel_origin((0, 0, 2560, 1440), (100, 10, 400, 80));
+        assert_eq!(ty, 0);
+    }
+
+    #[test]
     fn a_picture_too_big_for_a_window_is_edited_in_place() {
         let m = monitor(0, 0, 2560, 1440);
         assert_eq!(editor_placement((0, 0, 2560, 1440), m), None);
@@ -4846,6 +5052,28 @@ mod tests {
         assert_eq!(spectrum_color(1.0, 1.0), C::new_opaque(0, 0, 0));
         // Out-of-range input is clamped, never a panic or a wrapped hue.
         assert_eq!(spectrum_color(-1.0, 5.0), spectrum_color(0.0, 1.0));
+    }
+
+    #[test]
+    fn the_loupe_reads_colors_out_in_hsl() {
+        use framefang_core::color::Rgba as C;
+        assert_eq!(to_hsl(C::new_opaque(255, 0, 0)), (0, 100, 50));
+        assert_eq!(to_hsl(C::new_opaque(0, 255, 0)), (120, 100, 50));
+        assert_eq!(to_hsl(C::new_opaque(0, 0, 255)), (240, 100, 50));
+        assert_eq!(to_hsl(C::new_opaque(128, 128, 128)), (0, 0, 50));
+        assert_eq!(to_hsl(C::new_opaque(255, 255, 255)), (0, 0, 100));
+        // A blue between: #3A7BD5.
+        let (h, s, l) = to_hsl(C::new_opaque(0x3A, 0x7B, 0xD5));
+        assert!((214..=215).contains(&h) && (64..=66).contains(&s) && (52..=54).contains(&l), "{h} {s} {l}");
+    }
+
+    #[test]
+    fn the_eyedropper_reads_the_capture_through_its_offset() {
+        let mut shot = frame(4, 4, [0, 0, 0, 255]);
+        shot.put_pixel(3, 2, Rgba([10, 20, 30, 7]));
+        // Frame (1, 1) is capture (3, 2) when the frame starts at (2, 1).
+        assert_eq!(pixel_at(&shot, (1, 1), (2, 1)), Some(framefang_core::color::Rgba::new_opaque(10, 20, 30)));
+        assert_eq!(pixel_at(&shot, (5, 0), (0, 0)), None);
     }
 
     #[test]
