@@ -99,7 +99,7 @@ const SECTION_TOP: i32 = 22;
 /// A heading's whole band: what one costs in height.
 const SECTION_BAND: i32 = bitmap_font::GLYPH_H * SECTION_SCALE + SECTION_BELOW;
 /// Under the heading while nothing else needs saying.
-const SUBTITLE: &str = "Changes save as you make them. Esc closes.";
+const SUBTITLE: &str = "Changes save as you make them.  [Esc] closes";
 const HEADER_BTN_GAP: i32 = 8;
 /// Between the Theme row's color chips.
 const THEME_CHIP_GAP: i32 = 8;
@@ -944,7 +944,12 @@ impl SettingsView {
         };
         let line_w = self.rows.iter().find(|r| r.kind == WidgetKind::OpenJson)
             .map_or(300, |r| r.rect.0 - PAD - 12);
-        draw_text(&mut surf, PAD, 44, 1, &truncate_for(line, line_w), argb_to_framefang(color));
+        if self.status.is_none() {
+            // Names a key, drawn as a key (`keycap`).
+            crate::keycap::draw_line(surf.buf, win_w, win_h, PAD, 44, line, 1, color);
+        } else {
+            draw_text(&mut surf, PAD, 44, 1, &truncate_for(line, line_w), argb_to_framefang(color));
+        }
 
         // Section labels, numbered like a terminal's, anchored to their
         // first row.
@@ -1318,8 +1323,8 @@ fn render_row<S: painter::Surface>(
         let gap = rh - 2 * bitmap_font::GLYPH_H;
         let top = ry + gap / 3;
         draw_text(surf, rx + 6, top, 1, row.label, argb_to_framefang(TEXT_BRIGHT));
-        draw_text(surf, rx + 6, top + bitmap_font::GLYPH_H + gap / 3, 1, &switch_caption(draft),
-                  argb_to_framefang(TEXT_MUTED()));
+        crate::keycap::draw_line_on(surf, rx + 6, top + bitmap_font::GLYPH_H + gap / 3, &switch_caption(draft),
+                                    1, TEXT_MUTED());
         return;
     }
 
@@ -1418,9 +1423,16 @@ fn render_row<S: painter::Surface>(
                     None     => ("(not set)".to_owned(), TEXT_DIM()),
                 }
             };
-            let truncated = truncate_for(&text, box_w - 16);
             let ty = val_y + (val_h - bitmap_font::GLYPH_H) / 2;
-            draw_text(surf, val_x + 8, ty, 1, &truncated, argb_to_framefang(color));
+            let bound = !listening && draft.hotkey_for(action).is_some();
+            let keys = crate::keycap::chord(&text);
+            if bound && crate::keycap::line_width(&keys, 1) <= box_w - 16 {
+                // The binding as the keys themselves (`keycap`).
+                crate::keycap::draw_line_on(surf, val_x + 8, ty, &keys, 1, color);
+            } else {
+                let truncated = truncate_for(&text, box_w - 16);
+                draw_text(surf, val_x + 8, ty, 1, &truncated, argb_to_framefang(color));
+            }
         }
         WidgetKind::StartWithOs | WidgetKind::AutoCopy | WidgetKind::CloseAfterCopy | WidgetKind::CaptureCursor => {
             let on = match row.kind {
@@ -1450,11 +1462,12 @@ fn draw_mark<S: painter::Surface>(surf: &mut S, row: &Row, hovered: bool) {
 
 /// What holding the switch key does, under the After-a-capture label.
 fn switch_caption(draft: &AppSettings) -> String {
+    // `[Key]` is drawn as a key (`keycap`).
     let key = draft.switch_key().label();
     if draft.open_editor {
-        format!("Hold {key} to copy only")
+        format!("Hold [{key}] to copy only")
     } else {
-        format!("Hold {key} to open the editor")
+        format!("Hold [{key}] to open the editor")
     }
 }
 
@@ -1956,7 +1969,7 @@ mod tests {
                 s.open_editor = open_editor;
                 s.switch_key = key.name().into();
                 let caption = switch_caption(&s);
-                assert!(6 + bitmap_font::measure(&caption, 1) + MIN_GAP <= LABEL_W, "\"{caption}\"");
+                assert!(6 + crate::keycap::line_width(&caption, 1) + MIN_GAP <= LABEL_W, "\"{caption}\"");
             }
         }
     }

@@ -472,10 +472,16 @@ fn draw(buf: &mut [u32], w: usize, h: usize, l: &Layout, hover: Option<usize>, s
                 let c = if !it.enabled { TEXT_DIM() } else { TEXT_BRIGHT };
                 text(buf, w, h, TEXT_X as f32, y, ih, ROW_PX, it.label, c);
                 if let Some(hint) = &it.hint {
-                    let tw = framefang_core::text::line_width(hint, SMALL_PX);
-                    let hx = (W - PAD) as f32 - tw;
-                    let c = if hint == "not set" { TEXT_DIM() } else { TEXT_MUTED() };
-                    text(buf, w, h, hx, y, ih, SMALL_PX, hint, c);
+                    if hint == "not set" {
+                        let tw = framefang_core::text::line_width(hint, SMALL_PX);
+                        text(buf, w, h, (W - PAD) as f32 - tw, y, ih, SMALL_PX, hint, TEXT_DIM());
+                    } else {
+                        // The keys themselves, drawn as keys, right-aligned.
+                        let keys = crate::keycap::chord(hint);
+                        let kw = crate::keycap::line_width(&keys, 1);
+                        let text_y = y + (ih - crate::bitmap_font::GLYPH_H) / 2;
+                        crate::keycap::draw_line(buf, w, h, W - PAD - kw, text_y, &keys, 1, TEXT_MUTED());
+                    }
                 }
             }
             Kind::Chip => {

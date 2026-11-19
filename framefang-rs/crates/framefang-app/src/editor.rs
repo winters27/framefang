@@ -723,6 +723,18 @@ pub struct Overlay {
     shown: bool,
     /// Esc was down at the last `guard_focus`, so one press counts once.
     esc_down: bool,
+    /// The capture dock's animations: when Tab was last pressed (its key
+    /// shows pressed for `pick::KEY_PRESS`), when the mode last changed (its
+    /// chip decodes for `pick::DECODE`), and the animation frame last drawn,
+    /// so `tick` redraws only when the dock would look different.
+    tab_pressed_at: Option<std::time::Instant>,
+    decode_at: Option<std::time::Instant>,
+    dock_drawn: DockFrame,
+    /// When the dock first reached the screen: the sweep and the cursor's
+    /// blink run from here. Not from `opened_at`: freezing the screen and
+    /// the first frame take a good part of a second (Brandon 2026-11-19:
+    /// "its practically done by the time its there").
+    dock_since: Option<std::time::Instant>,
     /// An answer `guard_focus` reached without a window event (Esc pressed
     /// while another window had the keyboard), handed back by the next
     /// `handle_event` so the tray closes it through its usual path.
@@ -1232,6 +1244,10 @@ impl Overlay {
             shape: Vec::new(),
             shown: !cloak && (windowed.is_none() || !crate::window_shape::supported()),
             esc_down: false,
+            tab_pressed_at: None,
+            decode_at: None,
+            dock_drawn: DockFrame::default(),
+            dock_since: None,
             pending_outcome: None,
             hold_at_press: false,
             video_mode,
@@ -1749,7 +1765,7 @@ impl Overlay {
                         // can place the first selection edge by pixel, and
                         // the highlight follows what a click would take.
                         self.update_target();
-                        let on_bar = self.has_hover() && rect_contains(self.mode_bar().0, self.cursor);
+                        let on_bar = self.has_hover() && rect_contains(self.mode_bar().rect, self.cursor);
                         self.window.set_cursor(if on_bar { CursorIcon::Pointer } else { CursorIcon::Crosshair });
                         self.window.request_redraw();
                     }
@@ -1918,6 +1934,7 @@ impl Overlay {
             Key::Named(NamedKey::Enter) => self.commit(),
             // Tab: the next capture mode, before any region exists.
             Key::Named(NamedKey::Tab) if self.state == State::Idle && self.has_hover() => {
+                self.tab_pressed_at = Some(std::time::Instant::now());
                 let next = self.pick_mode.next(self.screens());
                 self.set_pick_mode(next);
                 OverlayOutcome::Continue
@@ -2378,10 +2395,10 @@ impl Overlay {
         match self.state {
             State::Idle => {
                 use crate::pick::PickMode;
-                // The mode bar: a chip switches what a click takes.
-                let (bar, chips) = self.mode_bar();
-                if rect_contains(bar, self.cursor) {
-                    if let Some((m, _)) = chips.iter().find(|(_, r)| rect_contains(*r, self.cursor)) {
+                // The dock: a chip switches what a click takes.
+                let dock = self.mode_bar();
+                if rect_contains(dock.rect, self.cursor) {
+                    if let Some((m, _)) = dock.chips.iter().find(|(_, r)| rect_contains(*r, self.cursor)) {
                         self.set_pick_mode(*m);
                     }
                     return OverlayOutcome::Continue;
@@ -2695,6 +2712,7 @@ impl Overlay {
     fn set_pick_mode(&mut self, mode: crate::pick::PickMode) {
         if mode == self.pick_mode { return; }
         self.pick_mode = mode;
+        self.decode_at = Some(std::time::Instant::now());
         self.settings.capture_mode = mode.name().to_owned();
         if let Err(e) = self.settings.save_editor_fields() {
             eprintln!("framefang: capture mode save failed: {e}");
@@ -2703,11 +2721,56 @@ impl Overlay {
         self.window.request_redraw();
     }
 
-    /// The mode bar and its chips, on the screen under the cursor.
-    fn mode_bar(&self) -> (Rect4, Vec<(crate::pick::PickMode, Rect4)>) {
+    /// The capture dock, on the screen under the cursor, above its taskbar.
+    fn mode_bar(&self) -> crate::pick::Dock {
         let modes = crate::pick::PickMode::offered(self.screens());
-        crate::pick::bar_layout(self.chrome_bounds(self.cursor), modes,
-            |s| framefang_core::text::layout(s, FLYOUT_TEXT_PX).width().ceil() as i32)
+        crate::pick::dock_layout(self.usable(self.chrome_bounds(self.cursor)), modes, self.record_mode)
+    }
+
+    /// `b`, a screen in frame pixels, less what the taskbar (or another bar
+    /// docked to its edge) takes, on Windows. The frozen picture covers the
+    /// whole screen, taskbar included, so without this the dock sat partly
+    /// behind the real taskbar (Brandon 2026-11-19).
+    fn usable(&self, b: Rect4) -> Rect4 {
+        #[cfg(windows)]
+        {
+            use windows::Win32::Foundation::POINT;
+            use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+            let (vx, vy) = vdesk::frame_to_virtual(self.frame_origin, (b.0 + b.2 / 2, b.1 + b.3 / 2));
+            let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+            let ok = unsafe {
+                let mon = MonitorFromPoint(POINT { x: vx, y: vy }, MONITOR_DEFAULTTONEAREST);
+                GetMonitorInfoW(mon, &mut mi).as_bool()
+            };
+            if ok {
+                let (m, wk) = (mi.rcMonitor, mi.rcWork);
+                let (l, t) = (wk.left - m.left, wk.top - m.top);
+                let (r, btm) = (m.right - wk.right, m.bottom - wk.bottom);
+                return (b.0 + l, b.1 + t, b.2 - l - r, b.3 - t - btm);
+            }
+        }
+        b
+    }
+
+    /// The dock's animation frame now: what changes how it looks.
+    fn dock_frame(&self) -> DockFrame {
+        use crate::pick::{BLINK, DECODE, DECODE_STEP, KEY_PRESS, SWEEP};
+        let since_open = self.dock_since.map_or(std::time::Duration::ZERO, |t| t.elapsed());
+        DockFrame {
+            sweep: (since_open < SWEEP).then(|| (since_open.as_millis() / 16) as u32),
+            decode: self.decode_at.map(|t| t.elapsed()).filter(|t| *t < DECODE)
+                .map(|t| (t.as_millis() / DECODE_STEP.as_millis()) as u32),
+            pressed: self.tab_pressed_at.is_some_and(|t| t.elapsed() < KEY_PRESS),
+            cursor_on: (since_open.as_millis() / BLINK.as_millis()) % 2 == 0,
+        }
+    }
+
+    /// Called every tray tick: the dock's sweep, decode, key press and
+    /// cursor run on time, not on events, so redraw when its frame changed.
+    pub fn tick(&mut self) {
+        if self.state == State::Idle && self.has_hover() && self.dock_frame() != self.dock_drawn {
+            self.window.request_redraw();
+        }
     }
 
     /// A click (not a drag): take what the highlight shows.
@@ -2757,17 +2820,18 @@ impl Overlay {
         if let Some((idx, btn)) = tool_panel_hit(tp, self.cursor).filter(|_| !self.record_mode) {
             let (_, _, x1, y1) = tool_panel_button_rect(tp, idx as i32);
             let label = match btn {
-                ToolPanelButton::Tool(Tool::Pen)        => "Pen (P)",
-                ToolPanelButton::Tool(Tool::Line)       => "Line (L)",
-                ToolPanelButton::Tool(Tool::Arrow)      => "Arrow (A)",
-                ToolPanelButton::Tool(Tool::Rectangle)  => "Rectangle (R)",
-                ToolPanelButton::Tool(Tool::Ellipse)    => "Ellipse (E)",
-                ToolPanelButton::Tool(Tool::Marker)     => "Marker (M)",
-                ToolPanelButton::Tool(Tool::Text)       => "Text (T)",
-                ToolPanelButton::Tool(Tool::Step)       => "Step (N)",
-                ToolPanelButton::Tool(Tool::Pixelate)   => "Pixelate (B)",
-                ToolPanelButton::Undo                   => "Undo (Ctrl+Z)",
-                ToolPanelButton::Redo                   => "Redo (Ctrl+Y)",
+                // `[Key]` is drawn as a key (`keycap`).
+                ToolPanelButton::Tool(Tool::Pen)        => "Pen [P]",
+                ToolPanelButton::Tool(Tool::Line)       => "Line [L]",
+                ToolPanelButton::Tool(Tool::Arrow)      => "Arrow [A]",
+                ToolPanelButton::Tool(Tool::Rectangle)  => "Rectangle [R]",
+                ToolPanelButton::Tool(Tool::Ellipse)    => "Ellipse [E]",
+                ToolPanelButton::Tool(Tool::Marker)     => "Marker [M]",
+                ToolPanelButton::Tool(Tool::Text)       => "Text [T]",
+                ToolPanelButton::Tool(Tool::Step)       => "Step [N]",
+                ToolPanelButton::Tool(Tool::Pixelate)   => "Pixelate [B]",
+                ToolPanelButton::Undo                   => "Undo [Ctrl]+[Z]",
+                ToolPanelButton::Redo                   => "Redo [Ctrl]+[Y]",
             };
             // The tool whose settings are slid out beside it needs no tip:
             // it would land on top of them.
@@ -2781,11 +2845,11 @@ impl Overlay {
         if let Some(btn) = action_panel_hit(ap, self.cursor, self.action_buttons()) {
             let label = match btn {
                 ActionButton::Pin    => "Pin to screen",
-                ActionButton::Copy   => "Copy (Ctrl+C)",
-                ActionButton::Save if self.video_mode => "Save (Ctrl+S)",
-                ActionButton::Save   => "Save (Ctrl+S)  -  Shift: Save as",
-                ActionButton::Record => if self.record_mode { "Record (Enter)" } else { "Record this region" },
-                ActionButton::Close  => "Close (Esc)",
+                ActionButton::Copy   => "Copy [Ctrl]+[C]",
+                ActionButton::Save if self.video_mode => "Save [Ctrl]+[S]",
+                ActionButton::Save   => "Save [Ctrl]+[S]  // hold [Shift] to Save as",
+                ActionButton::Record => if self.record_mode { "Record [Enter]" } else { "Record this region" },
+                ActionButton::Close  => "Close [Esc]",
             };
             return Some((label, self.cursor.0 + 14, self.cursor.1 + 14));
         }
@@ -3122,6 +3186,21 @@ impl Overlay {
         let gliding = hover.is_some() && self.glide_at.elapsed() < crate::pick::GLIDE;
         let pick_mode = self.pick_mode.available(self.screens());
         let mode_bar = (self.state == State::Idle && self.has_hover()).then(|| self.mode_bar());
+        // The dock's animations, read now so `tick` knows this frame is drawn.
+        let dock_anim = mode_bar.as_ref().map(|_| {
+            // Not on screen yet (the first frame is drawn cloaked): the
+            // sweep waits at its start.
+            if self.shown && self.dock_since.is_none() { self.dock_since = Some(std::time::Instant::now()); }
+            let since = self.dock_since.map_or(std::time::Duration::ZERO, |t| t.elapsed());
+            self.dock_drawn = self.dock_frame();
+            DockAnim {
+                sweep: (since < crate::pick::SWEEP)
+                    .then(|| since.as_secs_f32() / crate::pick::SWEEP.as_secs_f32()),
+                decode: self.decode_at.map(|t| t.elapsed()).filter(|t| *t < crate::pick::DECODE),
+                pressed: self.dock_drawn.pressed,
+                cursor_on: self.dock_drawn.cursor_on,
+            }
+        });
         // Offset of framebuffer (0, 0) inside the capture: zero whenever the
         // overlay covers the virtual desktop as asked.
         let shot_off      = self.bitmap_offset();
@@ -3333,17 +3412,12 @@ impl Overlay {
             }
         }
 
-        // Pass 5.5: idle hint — before any selection exists the overlay is
-        // just a dimmed desktop with a lens on it, which says nothing about
-        // dragging a region or about the way back out. One dim line spells
-        // both out; it disappears the moment the drag starts.
-        if matches!(self.state, State::Idle) && !self.color_pick {
-            draw_idle_hint(&mut buf, win_w, win_h, cursor_bounds,
-                           if self.record_mode { RECORD_HINT } else { pick_mode.hint() });
-        }
-        if let Some((bar, chips)) = &mode_bar {
-            let hovered = chips.iter().find(|(_, r)| rect_contains(*r, self.cursor)).map(|(m, _)| *m);
-            draw_mode_bar(&mut buf, win_w, win_h, *bar, chips, pick_mode, hovered);
+        // Pass 5.5: the capture dock. Before any selection exists the
+        // overlay is a dimmed desktop that says nothing about the modes or
+        // the way back out; the dock does, and goes the moment a drag starts.
+        if let (Some(dock), Some(anim)) = (&mode_bar, &dock_anim) {
+            let hovered = dock.chips.iter().find(|(_, r)| rect_contains(*r, self.cursor)).map(|(m, _)| *m);
+            draw_dock(&mut buf, win_w, win_h, dock, pick_mode, hovered, anim);
         }
 
         // Pass 6: magnifier — only useful when the user is positioning the
@@ -3354,7 +3428,7 @@ impl Overlay {
         // a click would take.
         // Only where a drag can start: Screen and All screens take a click.
         let can_drag = locked || pick_mode == crate::pick::PickMode::Auto;
-        let on_bar = mode_bar.as_ref().is_some_and(|(b, _)| rect_contains(*b, self.cursor));
+        let on_bar = mode_bar.as_ref().is_some_and(|d| rect_contains(d.rect, self.cursor));
         if picking_here {
             // The eyedropper's own loupe: the lens and the color's card. Over
             // the capture screen's panels it opens up and to the left, away
@@ -3399,7 +3473,7 @@ impl Overlay {
             };
             draw_notice_bar(
                 &mut buf, win_w, win_h, cursor_bounds,
-                &[&headline, "Esc again to discard  -  any other key to keep editing"],
+                &[&headline, "[Esc] again to discard  //  any other key keeps editing"],
                 0x00_FF_B0_20, 0x00_FF_D8_8A,
             );
         } else if self.select_mode {
@@ -3407,9 +3481,9 @@ impl Overlay {
             // the user is working under it and doesn't need the recipe any
             // more.
             let lines: &[&str] = if self.selected_idx.is_some() {
-                &["Select mode", "drag to move  -  Del removes"]
+                &["Select mode", "drag to move  //  [Del] removes"]
             } else {
-                &["Select mode", "click ink to move it  -  Del removes  -  S or a tool key exits"]
+                &["Select mode", "click ink to move it  //  [Del] removes  //  [S] or a tool key exits"]
             };
             draw_notice_bar(&mut buf, win_w, win_h, cursor_bounds, lines, NEON_GREEN, NEON_GREEN_TEXT);
         } else if self.copied_at.is_some_and(|t| t.elapsed() < COPIED_NOTICE) {
@@ -3438,6 +3512,8 @@ impl Overlay {
                 self.window.set_visible(true);
             }
             self.window.focus_window();
+            // On screen from now: the dock's sweep starts here.
+            self.dock_since = Some(std::time::Instant::now());
         }
         if let Some(log) = self.frame_log.as_mut() {
             let ms = |d: std::time::Duration| d.as_secs_f32() * 1000.0;
@@ -4280,9 +4356,10 @@ fn release_x11_focus() {
     let _ = conn.flush();
 }
 
-/// Small dark pill carrying a button label, drawn near where the user's
-/// cursor is hovering. Uses the in-tree 5×7 bitmap font at scale 2 so it
-/// stays consistent with the dimension chip and palette header.
+/// A button's tooltip, near the cursor, in the capture dock's HUD look:
+/// black, framed a step quieter than the accent with an accent bar down its
+/// left, the words in the pixel font at scale 2 and any `[Key]` in the label
+/// drawn as a key (`keycap`).
 fn draw_tooltip(
     buf:    &mut [u32],
     win_w:  usize,
@@ -4292,12 +4369,14 @@ fn draw_tooltip(
     x:      i32,
     y:      i32,
 ) {
+    use crate::palette::*;
     let scale = 2;
-    let text_w = crate::bitmap_font::measure(label, scale);
-    let text_h = crate::bitmap_font::GLYPH_H * scale;
-    let pad_x  = 6;
-    let pad_y  = 4;
-    let chip_w = text_w + pad_x * 2;
+    let text_w = crate::keycap::line_width(label, scale);
+    let text_h = crate::keycap::line_height(label, scale);
+    const BAR_W: i32 = 3;
+    let pad_x  = 10;
+    let pad_y  = 6;
+    let chip_w = BAR_W + text_w + pad_x * 2;
     let chip_h = text_h + pad_y * 2;
     // Auto-flip so the chip stays on the monitor it belongs to.
     let (bx, by, bw, bh) = bounds;
@@ -4309,56 +4388,125 @@ fn draw_tooltip(
     if y0 < by { y0 = by + 4; }
     let x1 = x0 + chip_w;
     let y1 = y0 + chip_h;
-    draw_filled_rect(buf, win_w, win_h, x0, y0, x1, y1, 0x00_10_10_14);
-    draw_rect_border(buf, win_w, win_h, x0, y0, x1, y1, 0x00_4A_4A_50);
-    let mut surf = crate::painter::U32Surface { buf, stride: win_w as i32, height: win_h as i32 };
-    crate::painter::draw_text(&mut surf, x0 + pad_x, y0 + pad_y, scale, label, framefang_core::color::Rgba::WHITE);
+    draw_filled_rect(buf, win_w, win_h, x0, y0, x1, y1, 0x00_00_00_00);
+    draw_rect_border(buf, win_w, win_h, x0, y0, x1, y1, LASER_DIM());
+    draw_filled_rect(buf, win_w, win_h, x0, y0, x0 + BAR_W, y1, LASER());
+    let text_y = y0 + (chip_h - crate::bitmap_font::GLYPH_H * scale) / 2;
+    crate::keycap::draw_line(buf, win_w, win_h, x0 + BAR_W + pad_x, text_y, label, scale, TEXT_BRIGHT);
 }
 
-/// The one-line hint shown while nothing is selected yet. Plain ASCII —
-/// the 5x7 bitmap font substitutes '?' for anything outside 0x20..=0x7E,
-/// so no dashes or arrows beyond the keyboard set.
-/// The capture screen's own line is its mode's (`PickMode::hint`).
-///
-/// Record-mode variant: names the confirm key, because there is no Save button
-/// to fall back on and the rectangle alone doesn't say how to start.
-const RECORD_HINT: &str = "pick the area to record  -  Tab for modes  -  Enter to start  -  Esc to close";
+/// The capture dock's animation frame, as far as how it looks goes: the
+/// sweep's and the decode's step, the Tab key down, the cursor on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DockFrame {
+    sweep: Option<u32>,
+    decode: Option<u32>,
+    pressed: bool,
+    cursor_on: bool,
+}
 
-/// Bottom-center hint chip, painted only in `State::Idle`. Same dark fill +
-/// hairline border as the tooltip chip so it reads as overlay chrome, but
-/// in a muted grey: it's a nudge for first-time users, not something that
-/// should pull attention away from the region they're about to pick.
-fn draw_idle_hint(
-    buf:    &mut [u32],
-    win_w:  usize,
-    win_h:  usize,
-    bounds: (i32, i32, i32, i32),
-    hint:   &str,
+/// What the dock draws this frame: how far the opening sweep is (0 to 1),
+/// how long the new mode has been decoding, the Tab key down, the cursor on.
+#[derive(Debug, Clone, Copy)]
+struct DockAnim {
+    sweep: Option<f32>,
+    decode: Option<std::time::Duration>,
+    pressed: bool,
+    cursor_on: bool,
+}
+
+/// `dst` moved toward `src` by `a` (0 to 1).
+fn mix_rgb(dst: u32, src: u32, a: f32) -> u32 {
+    let a = a.clamp(0.0, 1.0);
+    let ch = |s: u32| {
+        let (d, c) = (((dst >> s) & 0xFF) as f32, ((src >> s) & 0xFF) as f32);
+        (d + (c - d) * a).round() as u32
+    };
+    (ch(16) << 16) | (ch(8) << 8) | ch(0)
+}
+
+fn rgba(c: u32) -> framefang_core::color::Rgba {
+    framefang_core::color::Rgba::new_opaque((c >> 16) as u8, (c >> 8) as u8, c as u8)
+}
+
+/// A key in the dock: `keycap`'s, its face at the top of `r`.
+fn draw_hud_key(buf: &mut [u32], win_w: usize, win_h: usize, r: Rect4, name: &str, pressed: bool) {
+    crate::keycap::draw_key(buf, win_w, win_h, r.0, r.1, name, crate::pick::DOCK_SCALE, pressed);
+}
+
+/// The capture dock (`pick::dock_layout`), in the app's HUD look and the
+/// color scheme from Settings: black with an accent bar down its left, the
+/// Tab key, `//`, the mode chips (the current one filled with the accent,
+/// decoding into its name right after a switch), a divider, the finishing
+/// keys with their words, and a blinking cursor. As it opens, a band of the
+/// accent sweeps across it once.
+fn draw_dock(
+    buf: &mut [u32], win_w: usize, win_h: usize,
+    dock: &crate::pick::Dock, picked: crate::pick::PickMode,
+    hovered: Option<crate::pick::PickMode>, anim: &DockAnim,
 ) {
-    const SCALE:  i32 = 2;
-    const PAD_X:  i32 = 12;
-    const PAD_Y:  i32 = 8;
-    const MARGIN: i32 = 48;          // gap from the bottom screen edge
+    use crate::palette::*;
+    use crate::pick::DOCK_SCALE;
+    let (bx, by, bw, bh) = dock.rect;
+    let th = crate::bitmap_font::GLYPH_H * DOCK_SCALE;
+    let text_y = dock.text_y;
+    draw_filled_rect(buf, win_w, win_h, bx, by, bx + bw, by + bh, 0x00_00_00_00);
+    draw_rect_border(buf, win_w, win_h, bx, by, bx + bw, by + bh, FIELD_BORDER());
+    draw_filled_rect(buf, win_w, win_h, bx, by, bx + crate::pick::DOCK_BAR_W, by + bh, LASER());
 
-    let (bx, by, bw, bh) = bounds;
-    let chip_w = crate::bitmap_font::measure(hint, SCALE) + PAD_X * 2;
-    let chip_h = crate::bitmap_font::GLYPH_H * SCALE + PAD_Y * 2;
-    // Centered on the monitor the cursor is on, not across the seam of a
-    // multi-monitor overlay.
-    let x0 = bx + (bw - chip_w) / 2;
-    let y0 = by + bh - chip_h - MARGIN;
-    // Screens too small to hold the chip get no hint rather than a clipped
-    // one — it would land on top of the user's content either way.
-    if x0 < bx || y0 < by { return; }
-    let x1 = x0 + chip_w;
-    let y1 = y0 + chip_h;
-    draw_filled_rect(buf, win_w, win_h, x0, y0, x1, y1, 0x00_10_10_14);
-    draw_rect_border(buf, win_w, win_h, x0, y0, x1, y1, 0x00_3A_3A_40);
-    let mut surf = crate::painter::U32Surface { buf, stride: win_w as i32, height: win_h as i32 };
-    crate::painter::draw_text(
-        &mut surf, x0 + PAD_X, y0 + PAD_Y, SCALE, hint,
-        framefang_core::color::Rgba::new_opaque(0x9A, 0x9A, 0xA2),
-    );
+    draw_hud_key(buf, win_w, win_h, dock.tab, "TAB", anim.pressed);
+    {
+        let mut surf = crate::painter::U32Surface { buf: &mut *buf, stride: win_w as i32, height: win_h as i32 };
+        crate::painter::draw_text(&mut surf, dock.slashes_x, text_y, DOCK_SCALE, "//", rgba(TEXT_DIM()));
+    }
+    for (m, (x, y, w, h)) in &dock.chips {
+        let on = *m == picked;
+        let hot = hovered == Some(*m) && !on;
+        if on {
+            draw_filled_rect(buf, win_w, win_h, *x, *y, x + w, y + h, LASER());
+        } else {
+            if hot { draw_filled_rect(buf, win_w, win_h, *x, *y, x + w, y + h, HOVER_FILL()); }
+            draw_rect_border(buf, win_w, win_h, *x, *y, x + w, y + h, if hot { LASER_DIM() } else { FIELD_BORDER() });
+        }
+        let label = match anim.decode {
+            Some(t) if on => crate::pick::decoding(m.dock_label(), t),
+            _ => m.dock_label().to_owned(),
+        };
+        let ink = if on { 0x00_00_00_00 } else if hot { TEXT_BRIGHT } else { TEXT_MUTED() };
+        let tw = crate::bitmap_font::measure(&label, DOCK_SCALE);
+        let mut surf = crate::painter::U32Surface { buf: &mut *buf, stride: win_w as i32, height: win_h as i32 };
+        crate::painter::draw_text(&mut surf, x + (w - tw) / 2, y + (h - th) / 2, DOCK_SCALE, &label, rgba(ink));
+    }
+    draw_filled_rect(buf, win_w, win_h, dock.divider_x, text_y - 4, dock.divider_x + 1, text_y + th + 4, FIELD_BORDER());
+    for (name, word, r, word_x) in &dock.keys {
+        draw_hud_key(buf, win_w, win_h, *r, name, false);
+        let mut surf = crate::painter::U32Surface { buf: &mut *buf, stride: win_w as i32, height: win_h as i32 };
+        crate::painter::draw_text(&mut surf, *word_x, text_y, DOCK_SCALE, word, rgba(TEXT_MUTED()));
+    }
+    if anim.cursor_on {
+        let (cx, cy, cw, ch) = dock.cursor;
+        draw_filled_rect(buf, win_w, win_h, cx, cy, cx + cw, cy + ch, LASER());
+    }
+
+    // The opening sweep: a soft band of the accent crossing left to right,
+    // easing in and out so its travel across the dock can be followed,
+    // lightening whatever it passes over.
+    if let Some(k) = anim.sweep {
+        let k = k.clamp(0.0, 1.0);
+        let k = k * k * (3.0 - 2.0 * k);
+        let center = -0.3 + 1.4 * k;
+        let half = 0.15;
+        let accent = LASER();
+        for py in by.max(0)..(by + bh).min(win_h as i32) {
+            for px in bx.max(0)..(bx + bw).min(win_w as i32) {
+                let f = (px - bx) as f32 / bw.max(1) as f32;
+                let a = 0.55 * (1.0 - (f - center).abs() / half);
+                if a <= 0.0 { continue; }
+                let i = py as usize * win_w + px as usize;
+                buf[i] = mix_rgb(buf[i], accent, a);
+            }
+        }
+    }
 }
 
 /// The selection's blue, which the hover highlight shares so a click looks
@@ -4400,39 +4548,6 @@ fn draw_target(buf: &mut [u32], win_w: usize, win_h: usize, r: Rect4, label: &st
                                       framefang_core::color::Rgba::new_opaque(0xFF, 0xFF, 0xFF));
     crate::painter::draw_unicode_text(&mut surf, tx + (name_w + 12) as f32, ty, FLYOUT_TEXT_PX, &dims,
                                       framefang_core::color::Rgba::new_opaque(0xD8, 0xE3, 0xFA));
-}
-
-/// The capture screen's mode bar: one chip per mode, the current one in the
-/// selection's blue, and a quiet `Tab` after them for the key that cycles.
-fn draw_mode_bar(
-    buf: &mut [u32], win_w: usize, win_h: usize,
-    bar: Rect4, chips: &[(crate::pick::PickMode, Rect4)],
-    current: crate::pick::PickMode, hovered: Option<crate::pick::PickMode>,
-) {
-    let (bx, by, bw, bh) = bar;
-    draw_filled_rect(buf, win_w, win_h, bx, by, bx + bw, by + bh, 0x00_22_22_24);
-    draw_rect_border(buf, win_w, win_h, bx, by, bx + bw, by + bh, 0x00_3A_3A_40);
-    let line_h = framefang_core::text::line_height(FLYOUT_TEXT_PX);
-    for (m, (x, y, w, h)) in chips {
-        let (fill, ink) = if *m == current {
-            (SELECTION_BLUE, framefang_core::color::Rgba::new_opaque(0xFF, 0xFF, 0xFF))
-        } else if hovered == Some(*m) {
-            (0x00_38_38_3E, framefang_core::color::Rgba::new_opaque(0xE8, 0xE8, 0xEC))
-        } else {
-            (0x00_2E_2E_32, framefang_core::color::Rgba::new_opaque(0xC0, 0xC0, 0xC6))
-        };
-        draw_filled_rect(buf, win_w, win_h, *x, *y, x + w, y + h, fill);
-        let mut surf = crate::painter::U32Surface { buf: &mut *buf, stride: win_w as i32, height: win_h as i32 };
-        let tw = framefang_core::text::layout(m.label(), FLYOUT_TEXT_PX).width();
-        crate::painter::draw_unicode_text(&mut surf, *x as f32 + (*w as f32 - tw) / 2.0,
-                                          *y as f32 + (*h as f32 - line_h) / 2.0, FLYOUT_TEXT_PX, m.label(), ink);
-    }
-    let key_x = bx + bw - crate::pick::BAR_KEY_W;
-    let tw = framefang_core::text::layout("Tab", FLYOUT_TEXT_PX).width();
-    let mut surf = crate::painter::U32Surface { buf, stride: win_w as i32, height: win_h as i32 };
-    crate::painter::draw_unicode_text(&mut surf, key_x as f32 + (crate::pick::BAR_KEY_W as f32 - tw) / 2.0,
-                                      by as f32 + (bh as f32 - line_h) / 2.0, FLYOUT_TEXT_PX, "Tab",
-                                      framefang_core::color::Rgba::new_opaque(0x7A, 0x7A, 0x82));
 }
 
 /// Bare modifier presses — winit delivers these as ordinary key events, and
@@ -4483,13 +4598,14 @@ fn draw_notice_bar(
     const MARGIN: i32 = 36;          // gap from the top screen edge
 
     if lines.is_empty() { return; }
-    let line_h  = crate::bitmap_font::GLYPH_H * SCALE;
+    // A line that names a key (`[Esc]`) is a key's height (`keycap`).
+    let heights: Vec<i32> = lines.iter().map(|l| crate::keycap::line_height(l, SCALE)).collect();
     let text_w  = lines.iter()
-        .map(|l| crate::bitmap_font::measure(l, SCALE))
+        .map(|l| crate::keycap::line_width(l, SCALE))
         .max()
         .unwrap_or(0);
     let chip_w = text_w + PAD_X * 2;
-    let chip_h = line_h * lines.len() as i32
+    let chip_h = heights.iter().sum::<i32>()
         + LINE_GAP * (lines.len() as i32 - 1)
         + PAD_Y * 2;
     let (bx, by, bw, bh) = bounds;
@@ -4501,21 +4617,17 @@ fn draw_notice_bar(
         || x0 < 0 || y0 < 0 || x0 + chip_w > win_w as i32 || y0 + chip_h > win_h as i32 { return; }
     draw_filled_rect(buf, win_w, win_h, x0, y0, x0 + chip_w, y0 + chip_h, 0x00_10_10_14);
     draw_rect_border(buf, win_w, win_h, x0, y0, x0 + chip_w, y0 + chip_h, accent);
-    let text_rgb = framefang_core::color::Rgba::new_opaque(
-        ((text >> 16) & 0xFF) as u8, ((text >> 8) & 0xFF) as u8, (text & 0xFF) as u8,
-    );
-    let accent_rgb = framefang_core::color::Rgba::new_opaque(
-        ((accent >> 16) & 0xFF) as u8, ((accent >> 8) & 0xFF) as u8, (accent & 0xFF) as u8,
-    );
-    let mut surf = crate::painter::U32Surface { buf, stride: win_w as i32, height: win_h as i32 };
+    let mut top = y0 + PAD_Y;
     for (i, line) in lines.iter().enumerate() {
-        let lw = crate::bitmap_font::measure(line, SCALE);
+        let lw = crate::keycap::line_width(line, SCALE);
         let lx = x0 + (chip_w - lw) / 2;
-        let ly = y0 + PAD_Y + i as i32 * (line_h + LINE_GAP);
+        // The words sit in the middle of their line's height.
+        let ly = top + (heights[i] - crate::bitmap_font::GLYPH_H * SCALE) / 2;
         // First line is the headline and takes the accent color; the rest
         // is the quieter instruction text.
-        let color = if i == 0 { accent_rgb } else { text_rgb };
-        crate::painter::draw_text(&mut surf, lx, ly, SCALE, line, color);
+        let color = if i == 0 { accent } else { text };
+        crate::keycap::draw_line(buf, win_w, win_h, lx, ly, line, SCALE, color);
+        top += heights[i] + LINE_GAP;
     }
 }
 
@@ -4671,7 +4783,7 @@ fn draw_color_loupe(
     let hex = format!("#{:02X}{:02X}{:02X}", color.r, color.g, color.b);
     let (h, s, l) = to_hsl(color);
     let rows = [("RGB", format!("{}, {}, {}", color.r, color.g, color.b)), ("HSL", format!("{h}, {s}%, {l}%"))];
-    let mut surf = crate::painter::U32Surface { buf, stride: win_w as i32, height: win_h as i32 };
+    let mut surf = crate::painter::U32Surface { buf: &mut *buf, stride: win_w as i32, height: win_h as i32 };
     const HEX_PX: f32 = 20.0;
     let hex_y = (ky + PAD) as f32 + (SW as f32 - framefang_core::text::line_height(HEX_PX)) / 2.0;
     crate::painter::draw_unicode_text(&mut surf, (kx + PAD + SW + 12) as f32, hex_y, HEX_PX, &hex,
@@ -4685,9 +4797,11 @@ fn draw_color_loupe(
         y += row_h;
     }
     if hint {
-        let hint_y = (ky + unit_h - PAD) as f32 - framefang_core::text::line_height(11.5);
-        crate::painter::draw_unicode_text(&mut surf, (kx + PAD) as f32, hint_y, 11.5,
-                                          "Click to pick  -  Esc to cancel", C::new_opaque(0x6E, 0x6E, 0x78));
+        // The words' line, a key's height up from the card's bottom padding.
+        let bottom = ky + unit_h - PAD;
+        let text_y = bottom - crate::keycap::height(1) + (crate::keycap::face_h(1) - crate::bitmap_font::GLYPH_H) / 2;
+        drop(surf);
+        crate::keycap::draw_line(buf, win_w, win_h, kx + PAD, text_y, "Click to pick  [Esc] cancels", 1, 0x00_8A_8A_94);
     }
 }
 
@@ -4932,6 +5046,49 @@ fn draw_diagonal_stripe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Writes the capture dock at moments of its animations (still, mid
+    /// sweep, mid decode with Tab down, the record version) and a tooltip,
+    /// over a dimmed busy background, to `target/capture-ui-<scheme>.png`,
+    /// to look at by eye:
+    /// `cargo test --release -p framefang-app capture_ui -- --ignored`
+    #[test]
+    #[ignore]
+    fn render_capture_ui_to_png() {
+        use crate::pick::PickMode;
+        use std::time::Duration;
+        let (w, h) = (1100usize, 560usize);
+        let still = DockAnim { sweep: None, decode: None, pressed: false, cursor_on: true };
+        let frames = [
+            (false, PickMode::Auto, Some(PickMode::Screen), still),
+            (false, PickMode::Auto, None, DockAnim { sweep: Some(0.35), ..still }),
+            (false, PickMode::Screen, None, DockAnim { decode: Some(Duration::from_millis(200)), pressed: true, cursor_on: false, ..still }),
+            (true, PickMode::Auto, None, still),
+        ];
+        for scheme in [crate::palette::Scheme::Orange, crate::palette::Scheme::Pink] {
+            crate::palette::set(scheme);
+            // A dimmed desktop: blocks of what an overlay darkens.
+            let mut buf: Vec<u32> = (0..w * h).map(|i| {
+                let (x, y) = (i % w, i / w);
+                if (x / 90 + y / 70) % 2 == 0 { 0x00_2A_30_3A } else { 0x00_3C_3A_34 }
+            }).collect();
+            for (i, (record, current, hovered, anim)) in frames.iter().enumerate() {
+                let band = (0, 40 + i as i32 * 120, w as i32, 100 + crate::pick::DOCK_MARGIN);
+                let dock = crate::pick::dock_layout(band, PickMode::offered(2), *record);
+                draw_dock(&mut buf, w, h, &dock, *current, *hovered, anim);
+            }
+            draw_tooltip(&mut buf, w, h, (0, 0, w as i32, h as i32), "Undo [Ctrl]+[Z]", 40, 4);
+            draw_notice_bar(&mut buf, w, h, (560, -30, 540, 200),
+                &["Discard 2 annotations?", "[Esc] again to discard  //  any other key keeps editing"],
+                0x00_FF_B0_20, 0x00_FF_D8_8A);
+            let img = image::RgbImage::from_fn(w as u32, h as u32, |x, y| {
+                let p = buf[y as usize * w + x as usize];
+                image::Rgb([(p >> 16) as u8, (p >> 8) as u8, p as u8])
+            });
+            let name = format!("../../target/capture-ui-{}.png", scheme.name().to_lowercase());
+            img.save(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(name)).unwrap();
+        }
+    }
 
     #[test]
     fn the_pulse_breathes_three_times_slowly_and_ends_dark() {

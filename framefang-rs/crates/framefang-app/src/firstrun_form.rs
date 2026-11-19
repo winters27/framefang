@@ -195,7 +195,8 @@ impl FirstRunView {
         // Settings dialog.
         y += 30;
         draw_text(&mut surf, PAD, y, 1, "HOTKEY", argb_to_framefang(SECTION_TINT()));
-        draw_text(&mut surf, VALUE_X, y, 1, &self.hotkey, argb_to_framefang(TEXT_BRIGHT));
+        // The capture key as the keys themselves (`keycap`).
+        crate::keycap::draw_line_on(&mut surf, VALUE_X, y, &crate::keycap::chord(&self.hotkey), 1, TEXT_BRIGHT);
         y += 18;
         let dir_w = WIN_W as i32 - PAD - VALUE_X;
         draw_text(&mut surf, PAD, y, 1, "SAVE TO", argb_to_framefang(SECTION_TINT()));

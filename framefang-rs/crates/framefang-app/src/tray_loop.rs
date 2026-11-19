@@ -286,6 +286,8 @@ pub fn run() -> Result<()> {
             if let Some(c) = click { self.tray_clicked(c, loop_target); }
             if let Some(m) = self.tray_menu.as_mut() { m.tick(); }
             self.finish_tray_menu(loop_target);
+            // The capture dock's animations run on time, not on events.
+            if let Some(ov) = self.overlay.as_mut() { ov.tick(); }
             // A full-screen capture window keeps the keyboard, and hears Esc
             // even when Windows gave the keyboard to something else.
             #[cfg(windows)]
@@ -513,6 +515,11 @@ pub fn run() -> Result<()> {
                     // The windows as the frozen picture shows them, read
                     // before the capture screen opens on top of them all.
                     let windows = framefang_platform::windows_list::on_screen_windows();
+                    // The Start menu and the other shell popups are in the
+                    // picture now; close the real ones, which would sit
+                    // above the capture screen.
+                    #[cfg(target_os = "windows")]
+                    dismiss_shell_popups();
                     if self.settings.capture_cursor { framefang_platform::cursor::draw_into(&mut shot); }
                     // Remember what desktop this selection is being dragged
                     // over: if the user turns the capture into a recording via
@@ -581,6 +588,8 @@ pub fn run() -> Result<()> {
             match capture_all_screens() {
                 Ok(shot) => {
                     let windows = framefang_platform::windows_list::on_screen_windows();
+                    #[cfg(target_os = "windows")]
+                    dismiss_shell_popups();
                     self.overlay_desktop = Some(shot.desktop_bounds());
                     self.pending_region_audio = Some(opts);
                     match Overlay::new_for_region_record(
@@ -2363,6 +2372,53 @@ fn dismiss_tray_flyouts() {
             }
         }
     }
+}
+
+/// The processes behind Windows' shell popups: Start, search, the
+/// notification center and quick settings. Lowercase file names.
+#[cfg(target_os = "windows")]
+const SHELL_POPUP_HOSTS: [&str; 5] = [
+    "startmenuexperiencehost.exe", "searchhost.exe", "searchapp.exe",
+    "shellexperiencehost.exe", "shellhost.exe",
+];
+
+/// Close the Start menu (or search, the notification center, quick
+/// settings) if it has the keyboard. Windows draws these in a layer above
+/// every always-on-top window, so the capture screen opened underneath them
+/// (Brandon 2026-11-19: "the screenshot only works underneath OS stuff like
+/// the start menu"). Called after the screen is frozen, so they are already
+/// in the picture; each closes on Esc. Nothing is sent to any other window.
+#[cfg(target_os = "windows")]
+fn dismiss_shell_popups() {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_ESCAPE,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    let name = unsafe {
+        let fg = GetForegroundWindow();
+        if fg.is_invalid() { return; }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(fg, Some(&mut pid));
+        let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else { return };
+        let mut buf = [0u16; 260];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, windows::core::PWSTR(buf.as_mut_ptr()), &mut len).is_ok();
+        let _ = CloseHandle(h);
+        if !ok { return; }
+        String::from_utf16_lossy(&buf[..len as usize])
+    };
+    let file = name.rsplit('\\').next().unwrap_or("").to_ascii_lowercase();
+    if !SHELL_POPUP_HOSTS.contains(&file.as_str()) { return; }
+    let key = |flags| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VK_ESCAPE, wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
+    };
+    let inputs = [key(Default::default()), key(KEYEVENTF_KEYUP)];
+    unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32); }
 }
 
 /// Open a folder, file or web link the way a double-click would: the folder

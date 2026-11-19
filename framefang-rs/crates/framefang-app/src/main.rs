@@ -28,6 +28,7 @@ mod convert_video_form;
 mod ffmpeg_fetch;
 mod firstrun_form;
 mod hud;
+mod keycap;
 mod palette;
 mod pick;
 mod pin;
