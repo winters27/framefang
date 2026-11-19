@@ -32,15 +32,18 @@ Linux build deps (CI installs these — see `.github/workflows/build-rust.yml`):
 
 Windows + macOS need no extra system packages.
 
-CI: tagged push to `v*` triggers `build-rust.yml` which produces and auto-attaches to the GitHub Release:
-- `framefang-linux-x86_64.tar.gz`
-- `framefang-linux-arm64.tar.gz`
-- `framefang-x86_64.AppImage` (repackaged from the x86_64 tarball)
-- `framefang-windows-x86_64.zip`
-- `Framefang.msi`
-- `Framefang-macos-arm64.dmg` / `Framefang-macos-x64.dmg` — the macOS artifacts users download
-- `framefang-macos-arm64-update.tar.gz` / `framefang-macos-x64-update.tar.gz` — bare `framefang` binary, payload for the in-app updater only
-- `SHA256SUMS`
+CI: a tagged push to `v*` runs `.github/workflows/release.yml`, which builds on
+Windows and attaches these to the GitHub Release, each as its own file (nothing
+zipped):
+
+- `Framefang.msi`: the installer
+- `Framefang-portable.exe`: the app itself, to run without installing
+- `SHA256SUMS`: the checksums the in-app updater verifies
+
+There are no macOS or Linux release builds yet. The updater already knows the
+names it would look for there (`updates_form.rs`, `pick_asset_url`): a Linux
+`framefang-linux-<arch>.tar.gz` or AppImage, and a macOS
+`framefang-macos-<arch>-update.tar.gz`.
 
 macOS deliberately ships no bare Mach-O asset: a binary downloaded through a
 browser is quarantined and can't be launched from Finder, so the `.dmg` is the

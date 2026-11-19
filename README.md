@@ -46,7 +46,7 @@ Framefang updates itself from the tray menu.
 
 | Platform | Get it |
 | --- | --- |
-| **Windows** | **`Framefang.msi`** installer, or the portable `framefang-windows-x86_64.zip` |
+| **Windows** | **`Framefang.msi`** installer, or **`Framefang-portable.exe`** to run without installing |
 | **macOS, Linux** | [Build from source](#building-from-source) for now |
 
 > [!TIP]

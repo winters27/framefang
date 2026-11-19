@@ -80,7 +80,8 @@ pub enum InstallChannel {
     Scoop,
     /// Installed by `Framefang.msi` (directly, via winget, or via Chocolatey).
     WindowsMsi,
-    /// Unpacked from `framefang-windows-x86_64.zip`.
+    /// `Framefang-portable.exe` run where it was saved (or, up to 1.3.0,
+    /// unpacked from `framefang-windows-x86_64.zip`).
     WindowsPortable,
     /// A `Framefang.app` bundle that no package manager claims (the `.dmg`).
     MacAppBundle,
@@ -158,12 +159,14 @@ pub fn update_action(channel: InstallChannel, probe: &InstallProbe) -> UpdateAct
         // honest; the plain Linux tarball layout is a straight binary swap.
         InstallChannel::WindowsMsi => UpdateAction::SelfInstall,
         InstallChannel::Portable if probe.os == HostOs::Linux => UpdateAction::SelfInstall,
+        // The Windows portable zip holds just `framefang.exe`: the running
+        // one is renamed aside and the new one moved in, then relaunched.
+        InstallChannel::WindowsPortable => UpdateAction::SelfInstall,
 
-        // Windows portable zips and macOS app bundles are unpacked by hand,
-        // so we hand the download back to the user rather than guessing at
-        // their layout (and, on macOS, at their code-signing state).
+        // macOS app bundles are unpacked by hand, so we hand the download
+        // back to the user rather than guessing at their layout and their
+        // code-signing state.
         InstallChannel::Portable
-        | InstallChannel::WindowsPortable
         | InstallChannel::MacAppBundle => UpdateAction::BrowserDownload,
 
         InstallChannel::Snap => UpdateAction::Managed {
@@ -564,14 +567,15 @@ mod tests {
     }
 
     #[test]
-    fn linux_tarball_self_installs_but_windows_and_macos_use_the_browser() {
+    fn portable_linux_and_windows_self_install_but_macos_uses_the_browser() {
         assert_eq!(
             detect_action(&linux("/tmp/u/.local/bin/framefang")).1,
             UpdateAction::SelfInstall
         );
+        // The Windows portable zip updates in place (2026-11-19).
         assert_eq!(
             detect_action(&windows("D:\\tools\\framefang\\framefang.exe")).1,
-            UpdateAction::BrowserDownload
+            UpdateAction::SelfInstall
         );
         assert_eq!(
             detect_action(&macos("/Applications/Framefang.app/Contents/MacOS/framefang")).1,

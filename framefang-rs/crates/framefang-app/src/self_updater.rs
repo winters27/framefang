@@ -164,50 +164,57 @@ fn is_appimage_asset(url: &str) -> bool {
 
 #[cfg(target_os = "windows")]
 fn launch_msi_and_exit(msi_path: &Path) -> Result<(), String> {
-    // Final user confirmation: the file is downloaded + SHA-verified, but
-    // the user hasn't been asked yet. Without this dialog the app just
-    // vanishes when they click "Download" — feels broken. The dialog
-    // also gives them a chance to save any pending work first.
+    use std::os::windows::process::CommandExt;
+    // A normal update: no wizard and no "ready to install?" box, since the
+    // user already chose Update now. `/passive` shows only Windows
+    // Installer's progress bar; Windows asks for permission once, because
+    // Framefang lives in Program Files. MajorUpgrade in main.wxs replaces
+    // the old version and keeps Add/Remove Programs right.
     //
-    // Buttons: "Install Now" (proceed) / "Cancel" (keep file, do nothing).
-    //
-    // rfd::MessageDialog supports OK-only / Yes-No / OK-Cancel — we use
-    // OK-Cancel so the default action is install but Esc cancels.
-    use rfd::{MessageButtons, MessageDialog, MessageLevel};
-    let go = MessageDialog::new()
-        .set_level(MessageLevel::Info)
-        .set_title("Framefang — ready to install update")
-        .set_description(
-            "The new version has been downloaded and verified.\n\n\
-             Framefang will close now so the Windows installer can replace it. \
-             The installer wizard opens immediately after — Windows may ask \
-             for permission; accept it to complete the upgrade.\n\n\
-             Save any in-progress screenshots first."
-        )
-        .set_buttons(MessageButtons::OkCancel)
-        .show();
-    if go != rfd::MessageDialogResult::Ok {
-        return Err("Install cancelled by user — downloaded MSI is still in your temp folder.".into());
-    }
-
-    // Full MSI wizard (no /q* flag) so the user sees license + install dir
-    // confirmation. /i covers MajorUpgrade. UAC is auto-prompted via the
-    // embedded manifest. We exit immediately so the running .exe releases
-    // its file lock before MSI's CopyFile step tries to overwrite it.
-    let res = Command::new("msiexec")
-        .arg("/i")
-        .arg(msi_path)
+    // A hidden cmd waits for the installer and then starts Framefang again,
+    // whether the install went through or was declined, so it always comes
+    // back. We exit straight away so the installer can replace our .exe.
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let line = msi_update_command(msi_path, &exe);
+    let res = Command::new("cmd")
+        .raw_arg(line)
+        .env(RELAUNCH_ENV, "1")
+        .creation_flags(CREATE_NO_WINDOW)
         .spawn();
     match res {
         Ok(_) => {
-            // 1.5s grace: give msiexec time to bind to its UI thread + show
-            // the wizard before our event loop tears down — otherwise the
-            // momentary "no framefang, no wizard either" gap looks like a crash.
-            std::thread::sleep(std::time::Duration::from_millis(1500));
+            std::thread::sleep(std::time::Duration::from_millis(300));
             std::process::exit(0);
         }
-        Err(e) => Err(format!("msiexec spawn: {e}")),
+        Err(e) => Err(format!("couldn't start the installer: {e}")),
     }
+}
+
+/// The hidden cmd line that installs `msi` with only a progress bar, waits
+/// for it, and starts `exe` again: `/s /c "start "" /wait msiexec ... &
+/// start "" "exe""`. `/s` makes cmd drop just the outer quotes.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn msi_update_command(msi: &Path, exe: &Path) -> String {
+    format!(
+        "/s /c \"start \"\" /wait msiexec /i \"{}\" /passive /norestart & start \"\" \"{}\"\"",
+        msi.display(), exe.display()
+    )
+}
+
+/// CREATE_NO_WINDOW: a console program (curl, cmd, tar) started from this
+/// windowless tray app would otherwise flash a console window.
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Start `cmd` with no console window on Windows. Every helper program the
+/// updater runs goes through here.
+pub(crate) fn hide_console(cmd: &mut Command) -> &mut Command {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -220,8 +227,9 @@ fn launch_msi_and_exit(_msi_path: &Path) -> Result<(), String> {
 // ── download ────────────────────────────────────────────────────────────────
 
 /// A deterministic temp filename so a half-completed download from an
-/// earlier session is overwritten cleanly when the user retries.
-fn temp_path_for_url(url: &str) -> PathBuf {
+/// earlier session is overwritten cleanly when the user retries. The
+/// Updates dialog reads its size to show how far the download has got.
+pub(crate) fn temp_path_for_url(url: &str) -> PathBuf {
     let mut h = Sha256::new();
     h.update(url.as_bytes());
     let hex = hex_encode(&h.finalize());
@@ -242,6 +250,9 @@ fn guess_suffix_from_url(url: &str) -> &'static str {
     else if last.ends_with(".tgz") { ".tgz" }
     else if last.ends_with(".zip") { ".zip" }
     else if last.to_ascii_lowercase().ends_with(".msi") { ".msi" }
+    // The portable Windows build, published as the exe itself: installed
+    // as-is (`extract_binary` passes an unknown shape straight through).
+    else if last.to_ascii_lowercase().ends_with(".exe") { ".exe" }
     // Keep the extension: the swapped-in file *is* the AppImage, and some
     // desktop integrations key off the name.
     else if last.to_ascii_lowercase().ends_with(".appimage") { ".AppImage" }
@@ -263,16 +274,16 @@ fn download(url: &str, out_path: &Path, on_progress: &impl Fn(u64, Option<u64>))
     // failed attempt. Ignore errors — the file may not exist yet.
     let _ = std::fs::remove_file(out_path);
 
-    let status = Command::new("curl")
+    let status = hide_console(Command::new("curl")
         .args([
-            "-fL",
+            "-fsSL",
             "-A", "framefang-self-updater",
             "--retry", "2",
             "--retry-delay", "1",
             "-o",
         ])
         .arg(out_path)
-        .arg(url)
+        .arg(url))
         .status()
         .map_err(|e| format!("curl spawn: {e}"))?;
 
@@ -660,6 +671,20 @@ pub fn cleanup_stale_old_binary() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_msi_update_runs_quietly_waits_and_reopens_framefang() {
+        let line = msi_update_command(
+            Path::new(r"C:\Users\A B\AppData\Local\Temp\framefang-update-1.msi"),
+            Path::new(r"C:\Program Files\Framefang\framefang.exe"),
+        );
+        assert!(line.starts_with("/s /c \""), "cmd keeps the inner quotes: {line}");
+        assert!(line.ends_with("\"\""), "{line}");
+        assert!(line.contains(r#"start "" /wait msiexec /i "C:\Users\A B\AppData\Local\Temp\framefang-update-1.msi""#), "{line}");
+        assert!(line.contains("/passive /norestart"), "progress bar only, no wizard: {line}");
+        assert!(line.contains(r#"& start "" "C:\Program Files\Framefang\framefang.exe""#),
+                "reopens Framefang even when the install was declined: {line}");
+    }
 
     #[test]
     fn parse_sha256sums_gnu_format() {

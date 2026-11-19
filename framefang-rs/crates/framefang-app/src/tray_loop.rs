@@ -1171,18 +1171,8 @@ pub fn run() -> Result<()> {
                 eprintln!("self-updater: an update is already in progress");
                 return;
             }
-            // Drop the updates dialog so the user sees the app idle while
-            // we work; the relaunched binary will pick up where we left off.
-            self.updates_view = None;
-
-            // Desktop notification so the silent download (no progress modal
-            // yet) doesn't look like a no-op — the app relaunches a few
-            // seconds later when the swap completes.
-            notify(
-                "Framefang is updating",
-                "Downloading the new version. Framefang will restart automatically when it's ready.",
-                false,
-            );
+            // The Updates dialog stays open and shows the download, then the
+            // install; Framefang restarts on the new version by itself.
 
             eprintln!(
                 "self-updater: downloading {asset_url} (verify_sha256 = {})",
@@ -1226,11 +1216,18 @@ pub fn run() -> Result<()> {
                 }
                 Ok(Err(msg)) => {
                     eprintln!("self-updater: failed: {msg}");
-                    rfd::MessageDialog::new()
-                        .set_level(rfd::MessageLevel::Error)
-                        .set_title("Framefang — update failed")
-                        .set_description(msg)
-                        .show();
+                    // In the dialog that started it, with Try again; a box
+                    // of its own only if that dialog was closed meanwhile.
+                    match self.updates_view.as_mut() {
+                        Some(v) => v.update_failed(msg),
+                        None => {
+                            rfd::MessageDialog::new()
+                                .set_level(rfd::MessageLevel::Error)
+                                .set_title("Framefang update failed")
+                                .set_description(msg)
+                                .show();
+                        }
+                    }
                 }
                 Err(_) => {
                     eprintln!("self-updater: worker thread panicked");

@@ -7,8 +7,12 @@
 # Release assets, named the way the in-app updater looks for them
 # (crates/framefang-app/src/updates_form.rs, pick_asset_url):
 #   Framefang.msi                  installer (WiX 3, per-machine)
-#   framefang-windows-x86_64.zip   portable: framefang.exe only
+#   Framefang-portable.exe         portable: the app itself, nothing to unzip
 #   SHA256SUMS                     sha256 of each asset, checked before install
+#
+# Every asset is published loose, never zipped: the portable build is a single
+# exe, so a zip around it only added a step. (Up to 1.3.0 it shipped as
+# framefang-windows-x86_64.zip; the updater still accepts that name.)
 #
 # FFmpeg is not bundled: recording and conversion use the user's own ffmpeg.
 #
@@ -51,12 +55,11 @@ jobs:
           $ver = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
           if ($tag -ne $ver) { throw "Tag v$tag does not match Cargo.toml version $ver" }
 
-      - name: Stage the portable zip
+      - name: Stage the portable exe
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path dist\framefang | Out-Null
-          Copy-Item target\release\framefang.exe dist\framefang\
-          Compress-Archive -Path dist\framefang\* -DestinationPath dist\framefang-windows-x86_64.zip
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target\release\framefang.exe dist\Framefang-portable.exe
 
       # WiX 3.14.1 from the WiX project's own release, so the build does not
       # depend on what the runner image happens to have installed.
@@ -88,7 +91,7 @@ jobs:
           name: framefang-windows
           path: |
             framefang-rs/dist/Framefang.msi
-            framefang-rs/dist/framefang-windows-x86_64.zip
+            framefang-rs/dist/Framefang-portable.exe
           if-no-files-found: error
 
   release:
@@ -108,7 +111,7 @@ jobs:
 
       - name: Checksums
         working-directory: dist
-        run: sha256sum Framefang.msi framefang-windows-x86_64.zip > SHA256SUMS && cat SHA256SUMS
+        run: sha256sum Framefang.msi Framefang-portable.exe > SHA256SUMS && cat SHA256SUMS
 
       - name: Create the release
         env:
@@ -120,4 +123,4 @@ jobs:
           gh release create "$TAG" \
             --title "Framefang ${TAG}" \
             "$@" \
-            dist/Framefang.msi dist/framefang-windows-x86_64.zip dist/SHA256SUMS
+            dist/Framefang.msi dist/Framefang-portable.exe dist/SHA256SUMS

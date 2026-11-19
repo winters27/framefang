@@ -64,6 +64,15 @@ struct ReleaseInfo {
     /// warning and proceeds; the MSI's own signature check is the next
     /// line of defense.
     expected_sha256: Option<String>,
+    /// The picked asset's size in bytes, for the download's progress bar.
+    asset_size: Option<u64>,
+}
+
+/// Update now was pressed: the download's progress, then installing, or
+/// what went wrong.
+struct Updating {
+    url: String,
+    error: Option<String>,
 }
 
 enum FetchState {
@@ -112,6 +121,9 @@ pub struct UpdatesView {
     action:  UpdateAction,
     /// The title strip drawn above the dialog (minimize, close, drag).
     title_bar: crate::chrome::TitleBar,
+    /// Set once Update now is pressed. The dialog stays open and shows the
+    /// download, then the install; Framefang restarts on its own.
+    updating: Option<Updating>,
     pub outcome: Option<UpdatesOutcome>,
 }
 
@@ -175,6 +187,7 @@ impl UpdatesView {
             channel,
             action,
             title_bar: Default::default(),
+            updating: None,
             outcome: None,
         };
         me.btns = me.build_btns();
@@ -207,6 +220,9 @@ impl UpdatesView {
                             let fname = url.rsplit('/').next()?.split('?').next()?;
                             crate::self_updater::parse_sha256sums(&raw.sha256sums, fname)
                         });
+                        let asset_size = asset_url.as_deref().and_then(|url| {
+                            raw.assets.iter().find(|a| a.browser_download_url == url).map(|a| a.size)
+                        }).filter(|s| *s > 0);
                         FetchState::Found(ReleaseInfo {
                             tag: raw.tag_name,
                             date,
@@ -214,6 +230,7 @@ impl UpdatesView {
                             notes,
                             asset_url,
                             expected_sha256,
+                            asset_size,
                         })
                     }
                     Err(e) => FetchState::Error(e),
@@ -223,10 +240,28 @@ impl UpdatesView {
                 self.window.request_redraw();
             }
         }
-        // Keep the dot-dot-dot animation moving while we're waiting.
-        if matches!(self.state, FetchState::Pending) {
+        // Keep the dot-dot-dot animation moving while we're waiting, and the
+        // progress bar while an update downloads.
+        if matches!(self.state, FetchState::Pending)
+            || self.updating.as_ref().is_some_and(|u| u.error.is_none())
+        {
             self.window.request_redraw();
         }
+    }
+
+    /// The update stopped short (download, checksum or installer): say why
+    /// and offer Update now again.
+    pub fn update_failed(&mut self, msg: String) {
+        if let Some(u) = self.updating.as_mut() { u.error = Some(msg); }
+        self.btns = self.build_btns();
+        self.window.request_redraw();
+    }
+
+    /// Whether Update now installs in place here (rather than opening the
+    /// download in the browser): an install we own, and an asset whose
+    /// install path is wired up for it.
+    fn installs_in_place(&self, url: &str) -> bool {
+        matches!(self.action, UpdateAction::SelfInstall) && asset_supports_self_install(url, self.channel)
     }
 
     pub fn handle_event(&mut self, event: WindowEvent) {
@@ -297,10 +332,14 @@ impl UpdatesView {
                                     // (straight binary swap), and the
                                     // AppImage (file swap). Everything else
                                     // opens in the browser.
-                                    let in_app =
-                                        matches!(self.action, UpdateAction::SelfInstall)
-                                            && asset_supports_self_install(url, self.channel);
-                                    if in_app {
+                                    if self.installs_in_place(url) {
+                                        // The dialog stays open with the
+                                        // download's progress, then the
+                                        // install; Framefang restarts itself.
+                                        self.updating = Some(Updating { url: url.clone(), error: None });
+                                        let _ = std::fs::remove_file(crate::self_updater::temp_path_for_url(url));
+                                        self.btns = self.build_btns();
+                                        self.window.request_redraw();
                                         UpdatesOutcome::DownloadAndInstall {
                                             asset_url: url.clone(),
                                             expected_sha256: info.expected_sha256.clone(),
@@ -368,6 +407,19 @@ impl UpdatesView {
         let has_update = matches!(&self.state, FetchState::Found(info) if info.has_update);
         let has_asset  = matches!(&self.state, FetchState::Found(info) if info.asset_url.is_some());
 
+        // Updating: nothing to press but Close until it fails (then the
+        // same button again, as Try again).
+        let failed = match &self.updating {
+            Some(u) if u.error.is_none() => return btns,
+            Some(_) => true,
+            None => false,
+        };
+        // Update now when it installs in place, plain Download when the
+        // browser has to fetch it.
+        let in_place = matches!(&self.state, FetchState::Found(ReleaseInfo { asset_url: Some(url), .. })
+                                if self.installs_in_place(url));
+        let update_label = if failed { "Try again" } else if in_place { "Update now" } else { "Download" };
+
         // A package-managed install (Snap, Flatpak, Homebrew, deb/rpm/AUR,
         // Scoop) never gets a Download button — replacing those files is
         // either impossible or actively breaks the package. It gets the
@@ -378,7 +430,7 @@ impl UpdatesView {
             }
             UpdateAction::Managed { .. } => None,
             _ if has_update && has_asset => {
-                Some(("Download for your system", BtnKind::Download))
+                Some((update_label, BtnKind::Download))
             }
             _ => None,
         };
@@ -446,13 +498,47 @@ impl UpdatesView {
                     draw_text(&mut surf, PAD + 120, y, 1, &info.date, argb_to_framefang(TEXT_BRIGHT));
                     y += 22;
                 }
-                let label = if info.has_update {
-                    "A newer build is available."
+                if let Some(u) = &self.updating {
+                    // Update now: the download's progress, then installing,
+                    // or what stopped it.
+                    let bar = (PAD, y + 18, WIN_W as i32 - PAD * 2, 8);
+                    match &u.error {
+                        Some(e) => {
+                            draw_text(&mut surf, PAD, y, 1, "The update didn't finish.", argb_to_framefang(DANGER));
+                            let msg = truncate_text(e, WIN_W as i32 - PAD * 2);
+                            draw_text(&mut surf, PAD, y + 18, 1, &msg, argb_to_framefang(TEXT_MUTED()));
+                        }
+                        None => {
+                            let got = std::fs::metadata(crate::self_updater::temp_path_for_url(&u.url))
+                                .map(|m| m.len()).unwrap_or(0);
+                            let (line, frac) = update_progress(got, info.asset_size, &info.tag);
+                            draw_text(&mut surf, PAD, y, 1, &line, argb_to_framefang(LASER()));
+                            fill_rect(&mut surf, bar.0, bar.1, bar.2, bar.3, argb_to_framefang(PANEL_FILL()));
+                            stroke_rect_argb(&mut surf, bar.0, bar.1, bar.2, bar.3, argb_to_framefang(PANEL_BORDER()));
+                            let fill_w = match frac {
+                                Some(f) => ((bar.2 - 2) as f32 * f) as i32,
+                                // Size unknown: a block sweeping across.
+                                None => (bar.2 - 2) / 4,
+                            };
+                            let fill_x = match frac {
+                                Some(_) => bar.0 + 1,
+                                None => {
+                                    let t = (self.started.elapsed().as_millis() % 1400) as f32 / 1400.0;
+                                    bar.0 + 1 + ((bar.2 - 2 - fill_w) as f32 * t) as i32
+                                }
+                            };
+                            fill_rect(&mut surf, fill_x, bar.1 + 1, fill_w.max(0), bar.3 - 2, argb_to_framefang(LASER()));
+                        }
+                    }
                 } else {
-                    "You're on the latest build."
-                };
-                let tint = if info.has_update { LASER() } else { TEXT_MUTED() };
-                draw_text(&mut surf, PAD, y, 1, label, argb_to_framefang(tint));
+                    let label = if info.has_update {
+                        "A newer build is available."
+                    } else {
+                        "You're on the latest build."
+                    };
+                    let tint = if info.has_update { LASER() } else { TEXT_MUTED() };
+                    draw_text(&mut surf, PAD, y, 1, label, argb_to_framefang(tint));
+                }
 
                 // Package-managed install: say who owns it and print the
                 // exact upgrade one-liner where the Download button's
@@ -564,13 +650,13 @@ struct RawRelease {
 /// body, date, and asset list without re-doing string scanning per field.
 fn fetch_latest_release() -> Result<RawRelease, String> {
     let url = "https://api.github.com/repos/winters27/framefang/releases/latest";
-    let out = std::process::Command::new("curl")
+    let out = crate::self_updater::hide_console(std::process::Command::new("curl")
         .args([
             "-sS", "-A", "framefang-updater",
             "--max-time", "8",
             "-H", "Accept: application/vnd.github+json",
             url,
-        ])
+        ]))
         .output()
         .map_err(|e| format!("curl: {e}"))?;
     if !out.status.success() {
@@ -607,9 +693,9 @@ fn fetch_latest_release() -> Result<RawRelease, String> {
     // dialog still shows release notes even when the hash file is absent.
     let sha256sums = sha256sums_url
         .and_then(|url| {
-            std::process::Command::new("curl")
+            crate::self_updater::hide_console(std::process::Command::new("curl")
                 .args(["-fsSL", "-A", "framefang-updater", "--max-time", "8"])
-                .arg(&url)
+                .arg(&url))
                 .output()
                 .ok()
                 .filter(|o| o.status.success())
@@ -618,6 +704,26 @@ fn fetch_latest_release() -> Result<RawRelease, String> {
         .unwrap_or_default();
 
     Ok(RawRelease { tag_name, body: body_md, published_at, html_url, assets, sha256sums })
+}
+
+/// The progress line while Update now runs, and how full the bar is (`None`
+/// when the size is unknown): downloading with megabytes so far, then, once
+/// all of it is in, installing.
+fn update_progress(got: u64, total: Option<u64>, tag: &str) -> (String, Option<f32>) {
+    let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
+    match total {
+        Some(t) if got >= t => (format!("Installing {tag}... Framefang restarts by itself."), Some(1.0)),
+        Some(t) => (format!("Downloading {tag}  {:.1} / {:.1} MB", mb(got), mb(t)), Some(got as f32 / t as f32)),
+        None => (format!("Downloading {tag}..."), None),
+    }
+}
+
+/// `s` cut with `...` to fit `max_w` pixels of the 1x bitmap font.
+fn truncate_text(s: &str, max_w: i32) -> String {
+    if bitmap_font::measure(s, 1) <= max_w { return s.to_owned(); }
+    let mut out: String = s.chars().collect();
+    while !out.is_empty() && bitmap_font::measure(&format!("{out}..."), 1) > max_w { out.pop(); }
+    format!("{out}...")
 }
 
 /// First 10 chars of an ISO-8601 timestamp, e.g. "2026-05-17T18:22:11Z" -> "2026-05-17".
@@ -688,6 +794,11 @@ fn pick_asset_url(assets: &[RawAsset], channel: InstallChannel) -> Option<String
     } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
         "framefang-macos-x64-update.tar.gz"
     } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        // The portable exe, published loose since 1.3.1; releases up to
+        // 1.3.0 zipped it.
+        if let Some(a) = assets.iter().find(|a| a.name.eq_ignore_ascii_case(PORTABLE_EXE)) {
+            return Some(a.browser_download_url.clone());
+        }
         "framefang-windows-x86_64.zip"
     } else {
         return None;
@@ -709,6 +820,9 @@ fn arch_tokens() -> &'static [&'static str] {
     }
 }
 
+/// The portable Windows build's release asset: the app itself, unzipped.
+const PORTABLE_EXE: &str = "Framefang-portable.exe";
+
 /// Does the picked asset have a shape whose in-place install path is wired
 /// up for `channel`? The channel decides whether we may replace this install
 /// at all; this decides whether we know *how* to. A mismatch (e.g. an
@@ -725,6 +839,9 @@ fn asset_supports_self_install(url: &str, channel: InstallChannel) -> bool {
         InstallChannel::Portable => {
             cfg!(target_os = "linux") && (name.ends_with(".tar.gz") || name.ends_with(".tgz"))
         }
+        // The Windows portable exe (or the zip older releases wrapped it
+        // in): the swap renames the running .exe aside.
+        InstallChannel::WindowsPortable => name.ends_with(".exe") || name.ends_with(".zip"),
         _ => false,
     }
 }
@@ -939,6 +1056,30 @@ fn _quiet() { let _ = Duration::from_secs(0); }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_progress_line_counts_megabytes_then_says_installing() {
+        let mb = 1024 * 1024;
+        let (line, f) = update_progress(mb, Some(4 * mb), "v1.3.1");
+        assert_eq!(line, "Downloading v1.3.1  1.0 / 4.0 MB");
+        assert_eq!(f, Some(0.25));
+        let (line, f) = update_progress(4 * mb, Some(4 * mb), "v1.3.1");
+        assert!(line.starts_with("Installing v1.3.1"), "{line}");
+        assert_eq!(f, Some(1.0));
+        assert_eq!(update_progress(10, None, "v1.3.1").1, None);
+        // Every line is plain ASCII for the bitmap font.
+        assert!(line.is_ascii());
+    }
+
+    #[test]
+    fn the_portable_windows_zip_updates_in_place() {
+        let zip = "https://x/framefang-windows-x86_64.zip";
+        assert!(asset_supports_self_install(zip, InstallChannel::WindowsPortable));
+        assert!(asset_supports_self_install("https://x/Framefang-portable.exe", InstallChannel::WindowsPortable));
+        assert!(asset_supports_self_install("https://x/Framefang.msi", InstallChannel::WindowsMsi));
+        assert!(!asset_supports_self_install(zip, InstallChannel::WindowsMsi));
+        assert!(!asset_supports_self_install(zip, InstallChannel::MacAppBundle));
+    }
 
     /// The bitmap font (bitmap_font.rs) only has glyphs for ASCII
     /// 0x20..=0x7E; everything else renders as `?`. After strip_markdown
