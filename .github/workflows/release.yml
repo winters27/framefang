@@ -288,16 +288,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Into `assets`, not `dist`: the checkout has its own dist/ (the macOS
+      # and Linux packaging scripts), and hashing that broke 1.4.0's publish.
       - uses: actions/download-artifact@v4
         with:
-          path: dist
+          path: assets
           merge-multiple: true
 
       - name: Checksums
-        working-directory: dist
+        working-directory: assets
         run: |
           ls -l
-          sha256sum $(ls | sort) > SHA256SUMS && cat SHA256SUMS
+          sha256sum $(find . -maxdepth 1 -type f -printf '%f\n' | sort) > SHA256SUMS && cat SHA256SUMS
 
       - name: Create the release
         env:
@@ -309,4 +311,4 @@ jobs:
           gh release create "$TAG" \
             --title "Framefang ${TAG}" \
             "$@" \
-            dist/*
+            assets/*
