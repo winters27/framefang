@@ -1,11 +1,8 @@
 //! The dialogs' design language: a retro-futuristic terminal, the feel of a
 //! cyberpunk HUD, carried by a few restrained touches rather than props. One
-//! accent (the color scheme's) on near-black, the pixel font for every system
+//! accent (the color scheme's) on pure black, the pixel font for every system
 //! label, and:
 //!
-//! - **Scanlines:** a faint accent line every third row of the background, so
-//!   the surfaces read as a phosphor screen. Backgrounds only; text stays
-//!   crisp.
 //! - **Glowing headings:** each window's title with a soft blurred halo of
 //!   its own color behind it, like neon. The rule under the header glows too.
 //! - **Terminal section labels:** `01 // CAPTURES`.
@@ -42,19 +39,13 @@ fn blend_px(buf: &mut [u32], w: usize, h: usize, x: i32, y: i32, c: u32, a: f32)
 
 // ── backgrounds ─────────────────────────────────────────────────────────────
 
-/// A dialog's background: the header band and the body, both with faint
-/// scanlines, and the glowing rule under the header.
+/// A dialog's background: the header band, the body (pure black), and the
+/// glowing rule between them. Flat: the scanlines that used to run across
+/// both are gone (Brandon 2026-11-19: "make it pure black").
 pub fn backdrop(buf: &mut [u32], w: usize, h: usize, header_h: i32) {
-    let (top, body, accent) = (BG_TOP(), BG_BODY(), LASER());
-    let (top_line, body_line) = (mix(top, accent, 0.035), mix(body, accent, 0.03));
+    let (top, body) = (BG_TOP(), BG_BODY());
     for y in 0..h {
-        let line = y % 3 == 0;
-        let c = match ((y as i32) < header_h, line) {
-            (true, false) => top,
-            (true, true) => top_line,
-            (false, false) => body,
-            (false, true) => body_line,
-        };
+        let c = if (y as i32) < header_h { top } else { body };
         buf[y * w..(y + 1) * w].fill(c);
     }
     header_rule(buf, w, h, header_h);
@@ -145,17 +136,26 @@ fn box_blur(a: &mut [f32], w: usize, h: usize, r: i32) {
 /// A section label at `(x, y)`: `01 // NAME`, the number and slashes dim, the
 /// name in the section tint, then a quiet rule out to `right`.
 pub fn section(buf: &mut [u32], w: usize, h: usize, x: i32, right: i32, y: i32, n: usize, name: &str) {
+    section_scaled(buf, w, h, x, right, y, n, name, 1);
+}
+
+/// [`section`] in the pixel font at `scale` (2 is the size of a window's
+/// heading, without its glow): Settings uses 2 so its sections are easy to
+/// find (Brandon 2026-11-19).
+#[allow(clippy::too_many_arguments)]
+pub fn section_scaled(buf: &mut [u32], w: usize, h: usize, x: i32, right: i32, y: i32, n: usize, name: &str,
+                      scale: i32) {
     let rgba = |c: u32| framefang_core::color::Rgba::new((c >> 16) as u8, (c >> 8) as u8, c as u8, 255);
     let prefix = format!("{n:02} // ");
     // `measure` leaves off the gap after the last glyph; add it back.
-    let pw = crate::bitmap_font::measure(&prefix, 1) + 1;
+    let pw = crate::bitmap_font::measure(&prefix, scale) + scale;
     {
         let mut s = crate::painter::U32Surface { buf, stride: w as i32, height: h as i32 };
-        crate::painter::draw_text(&mut s, x, y, 1, &prefix, rgba(TEXT_DIM()));
-        crate::painter::draw_text(&mut s, x + pw, y, 1, name, rgba(SECTION_TINT()));
+        crate::painter::draw_text(&mut s, x, y, scale, &prefix, rgba(TEXT_DIM()));
+        crate::painter::draw_text(&mut s, x + pw, y, scale, name, rgba(SECTION_TINT()));
     }
-    let start = x + pw + crate::bitmap_font::measure(name, 1) + 10;
-    let rule_y = y + crate::bitmap_font::GLYPH_H / 2;
+    let start = x + pw + crate::bitmap_font::measure(name, scale) + 10 * scale;
+    let rule_y = y + crate::bitmap_font::GLYPH_H * scale / 2;
     if rule_y < 0 || rule_y as usize >= h { return; }
     let rule = HEADER_RULE();
     for xx in start.max(0)..right.min(w as i32) {
@@ -190,13 +190,14 @@ mod tests {
     }
 
     #[test]
-    fn scanlines_are_faint_and_only_every_third_row() {
+    fn the_body_is_flat_pure_black_in_every_scheme() {
         let (w, h) = (10usize, 12usize);
-        let mut b = vec![0u32; w * h];
-        backdrop(&mut b, w, h, 4);
-        assert_ne!(b[6 * w], b[7 * w], "a scanline row differs from its neighbor");
-        assert_eq!(b[7 * w], b[8 * w], "rows between scanlines match");
-        let lum = |p: u32| ((p >> 16) & 0xFF) + ((p >> 8) & 0xFF) + (p & 0xFF);
-        assert!(lum(b[6 * w]).abs_diff(lum(b[7 * w])) < 30, "faint");
+        for s in Scheme::ALL {
+            set(s);
+            let mut b = vec![0x00FF_FFFFu32; w * h];
+            backdrop(&mut b, w, h, 4);
+            assert!(b[7 * w..].iter().all(|&p| p == 0), "{s:?}: body rows are all #000000");
+            assert_ne!(b[0], 0, "{s:?}: the header band sits a step above it");
+        }
     }
 }

@@ -1340,7 +1340,7 @@ impl Overlay {
             self.show_palette_of_color();
             // The next capture opens on this tool.
             self.settings.last_tool = t.name().to_owned();
-            if let Err(e) = self.settings.save() {
+            if let Err(e) = self.settings.save_editor_fields() {
                 eprintln!("framefang: tool choice save failed: {e}");
             }
         }
@@ -1542,7 +1542,7 @@ impl Overlay {
         self.settings.set_tool_style(self.tool, style);
         self.settings.last_text_size = self.text_size;
         self.settings.pixelate_block = self.pixel_size;
-        if let Err(e) = self.settings.save() {
+        if let Err(e) = self.settings.save_editor_fields() {
             eprintln!("framefang: tool settings save failed: {e}");
         }
     }
@@ -2696,7 +2696,7 @@ impl Overlay {
         if mode == self.pick_mode { return; }
         self.pick_mode = mode;
         self.settings.capture_mode = mode.name().to_owned();
-        if let Err(e) = self.settings.save() {
+        if let Err(e) = self.settings.save_editor_fields() {
             eprintln!("framefang: capture mode save failed: {e}");
         }
         self.update_target();

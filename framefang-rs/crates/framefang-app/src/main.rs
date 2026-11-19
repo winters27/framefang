@@ -21,6 +21,7 @@ mod icons;
 mod install_source;
 mod painter;
 mod about_form;
+mod autostart;
 mod brand_icon;
 mod convert_image_form;
 mod convert_video_form;
@@ -71,17 +72,26 @@ fn main() -> Result<()> {
     } else {
         Duration::ZERO
     };
+    // `framefang --settings` opens Settings: in the running copy if there
+    // is one, else in this one once it is up.
+    let wants_settings = std::env::args().skip(1).any(|a| a == "--settings");
     // Held for the whole process: dropping it releases the lock.
     let _instance = match instance::acquire_waiting(grace) {
         Instance::Primary(guard) => Some(guard),
         Instance::AlreadyRunning => {
             // Make the extra launch do the useful thing rather than nothing:
-            // the running instance polls for this and opens the overlay.
-            instance::request_capture();
-            eprintln!(
-                "Framefang is already running — asked it to capture. \
-                 Use its tray icon to reach the menu."
-            );
+            // the running instance polls for this and opens the overlay (or
+            // Settings, when asked for).
+            if wants_settings {
+                instance::request_settings();
+                eprintln!("Frame Fang is already running. Asked it to open Settings.");
+            } else {
+                instance::request_capture();
+                eprintln!(
+                    "Frame Fang is already running. Asked it to capture. \
+                     Use its tray icon to reach the menu."
+                );
+            }
             return Ok(());
         }
         // No usable per-app directory to lock in. Start anyway: refusing to
@@ -97,6 +107,9 @@ fn main() -> Result<()> {
     if let Some(pid) = framefang_platform::reap_orphaned_recorder() {
         eprintln!("Stopped a screen recording left over from a previous run (pid {pid}).");
     }
+
+    // After the lock (which clears stale requests): this copy answers it.
+    if wants_settings { instance::request_settings(); }
 
     tray_loop::run()
 }

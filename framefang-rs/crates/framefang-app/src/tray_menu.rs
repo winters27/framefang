@@ -3,7 +3,7 @@
 //! keep their native menus.
 //!
 //! A borderless, always-on-top window opened over the taskbar where the icon
-//! was clicked, in the dialogs' look (scanlines, glowing heading, `01 //`
+//! was clicked, in the dialogs' look (pure black, glowing heading, `01 //`
 //! section labels). It closes when it loses focus, on Esc, or when a row is
 //! picked; the tray loop then runs the picked action through the same code as
 //! the native menu's events. The Sound chips only choose and leave it open.

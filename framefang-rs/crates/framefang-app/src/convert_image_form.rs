@@ -485,7 +485,7 @@ impl ConvertImageView {
                 draw_text(&mut surf, PAD, footer_y, 1, &msg, argb_to_framefang(OK_TINT));
             }
             Status::Err(e) => {
-                draw_text(&mut surf, PAD, footer_y, 1, e, argb_to_framefang(DANGER));
+                draw_text(&mut surf, PAD, footer_y, 1, e, argb_to_framefang(DANGER()));
             }
         }
 

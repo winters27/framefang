@@ -45,8 +45,17 @@ pub fn run() -> Result<()> {
     // than to show it on every launch.
     let first_run = AppSettings::settings_path().map(|p| !p.exists()).unwrap_or(false);
 
-    let settings = AppSettings::load();
+    let (settings, settings_error) = AppSettings::load_reporting();
     crate::palette::set(crate::palette::Scheme::parse(&settings.theme));
+    if let Some(e) = &settings_error {
+        eprintln!("{e}");
+        notify("Frame Fang: settings file had a mistake", e, true);
+    }
+    // "Start with system" on, but the sign-in entry is gone (removed from the
+    // system's startup list, or the setting was edited by hand): put it back.
+    if let Err(e) = crate::autostart::ensure(settings.start_with_windows) {
+        eprintln!("start with system: {e}");
+    }
 
     // Asked once, at startup, and threaded through the app: the answer can't
     // change without a new login session, and both the startup notice and the
@@ -149,8 +158,13 @@ pub fn run() -> Result<()> {
         /// When `tray_menu` last closed. A click on the icon right after it
         /// closed is the click that closed it, so it must not reopen it.
         tray_menu_closed: Option<Instant>,
-        /// The Sound chosen in the tray menu, for the next time it opens.
-        tray_sound: framefang_platform::recorder::RecordingOptions,
+        /// `settings.json`'s modified time when last read or written here,
+        /// and when it was last looked at: a hand edit is picked up within
+        /// a second (`watch_settings_file`).
+        settings_mtime: Option<std::time::SystemTime>,
+        settings_checked: Instant,
+        /// The last hand edit that didn't parse was already reported.
+        settings_bad_reported: Option<std::time::SystemTime>,
         /// The editor eyedropper's color-pick session over the frozen
         /// screen, while it is open. Its answer goes back to `overlay`.
         color_pick: Option<Overlay>,
@@ -279,6 +293,12 @@ pub fn run() -> Result<()> {
                 if let Some(ov) = self.overlay.as_mut() { ov.guard_focus(); }
                 if let Some(c) = self.color_pick.as_mut() { c.guard_focus(); }
             }
+            // A hand edit of settings.json takes effect without a restart.
+            self.watch_settings_file();
+            // `framefang --settings`, from a second launch or this one.
+            if framefang_platform::instance::take_settings_request() {
+                self.show_settings(loop_target);
+            }
             // An open Settings window follows the FFmpeg download's progress.
             if let Some(v) = self.settings_view.as_mut() { v.tick(); }
             // Collected before dispatch so the manager borrow is done with
@@ -382,7 +402,7 @@ pub fn run() -> Result<()> {
                 full_key: key(HotkeyAction::CaptureFullScreen),
                 record_key: key(HotkeyAction::ToggleRecording),
                 recording: self.recorder.is_recording(),
-                sound: self.tray_sound,
+                sound: sound_from_name(&self.settings.record_sound),
             };
             match crate::tray_menu::TrayMenu::new(loop_target, (click.x, click.y), state) {
                 Ok(m) => self.tray_menu = Some(m),
@@ -397,7 +417,14 @@ pub fn run() -> Result<()> {
         /// it is off the screen before whatever was picked starts.
         fn finish_tray_menu(&mut self, loop_target: &ActiveEventLoop) {
             let Some(out) = self.tray_menu.as_mut().and_then(|m| m.outcome.take()) else { return };
-            if let Some(m) = self.tray_menu.take() { self.tray_sound = m.sound(); }
+            if let Some(m) = self.tray_menu.take() {
+                // The Sound chips' choice is kept in settings.json.
+                let name = sound_name(m.sound());
+                if self.settings.record_sound != name {
+                    self.settings.record_sound = name.to_owned();
+                    self.save_settings();
+                }
+            }
             self.tray_menu_closed = Some(Instant::now());
             if let crate::tray_menu::MenuOutcome::Run(ev) = out {
                 self.run_tray_event(ev, loop_target);
@@ -1092,51 +1119,20 @@ pub fn run() -> Result<()> {
         }
 
         /// Called from the window event router after the settings dialog
-        /// produces an outcome. `Saved` persists + re-registers the hotkey +
-        /// refreshes the tooltip; `Cancelled` drops the draft; `OpenJson`
-        /// opens settings.json and leaves the dialog open.
+        /// produces an outcome. `Changed` applies and saves at once (there is
+        /// no Save button); `Closed` turns the shortcuts back on; `OpenJson`
+        /// opens settings.json and leaves the dialog open. `true` closes it.
         fn apply_settings_outcome(&mut self, outcome: SettingsOutcome) -> bool {
             match outcome {
-                SettingsOutcome::Saved(new) => {
-                    self.settings = new;
-                    crate::palette::set(crate::palette::Scheme::parse(&self.settings.theme));
-                    if let Err(e) = self.settings.save() {
-                        eprintln!("Failed to persist settings: {e}");
-                        notify("Frame Fang: settings not saved",
-                            &framefang_core::failure::settings_write_failure(&e.to_string()), true);
-                    }
-                    if let Some(hk) = self.hotkeys.as_mut() {
-                        // A rebind the user just performed by hand is the
-                        // one failure they will definitely notice and least
-                        // expect an explanation for — on the portal backend
-                        // it can be refused outright. Say so where they are
-                        // looking, not on stderr.
-                        for (action, e) in apply_hotkeys(hk, &self.settings) {
-                            notify("Frame Fang: couldn't set that shortcut",
-                                   &format!("{}: {e}", action.label()), true);
-                        }
-                    }
-                    // Every surface that quotes a hotkey — the hover tooltip
-                    // and the menu rows — is rebuilt in place, so a rebind is
-                    // visible without restarting the app.
-                    if let Some(t) = &self.tray {
-                        if let Err(e) = t.set_tooltip(&tray_tooltip(&self.settings)) {
-                            eprintln!("Tray tooltip update failed: {e}");
-                        }
-                        t.set_hotkey_labels(&menu_labels(&self.settings, self.portal_hotkey));
-                    }
-                    true
+                SettingsOutcome::Changed(new) => {
+                    self.apply_settings(new);
+                    self.save_settings();
+                    false
                 }
-                SettingsOutcome::Cancelled => {
-                    // The Theme chips preview live; cancelling puts the saved
-                    // scheme back.
-                    crate::palette::set(crate::palette::Scheme::parse(&self.settings.theme));
-                    // No persistence, but `show_settings` unregistered the
-                    // global hotkeys on open — re-register the previous
-                    // bindings so the user can capture again.
-                    if let Some(hk) = self.hotkeys.as_mut() {
-                        apply_hotkeys(hk, &self.settings);
-                    }
+                SettingsOutcome::Closed => {
+                    // `open_settings` turned every shortcut off so keys could
+                    // be rebound; turn on the ones the user ended with.
+                    self.register_hotkeys();
                     true
                 }
                 SettingsOutcome::OpenJson => {
@@ -1149,6 +1145,82 @@ pub fn run() -> Result<()> {
                         open_url(&p.to_string_lossy());
                     }
                     false
+                }
+            }
+        }
+
+        /// Make `new` the settings in use: the color scheme, the sign-in
+        /// entry, the tray's tooltip and menu words, and the shortcuts. The
+        /// shortcuts wait while Settings is open (it holds them off so keys
+        /// can be rebound) and come on when it closes.
+        fn apply_settings(&mut self, new: AppSettings) {
+            let old = std::mem::replace(&mut self.settings, new);
+            crate::palette::set(crate::palette::Scheme::parse(&self.settings.theme));
+            if old.start_with_windows != self.settings.start_with_windows {
+                if let Err(e) = crate::autostart::set(self.settings.start_with_windows) {
+                    eprintln!("start with system: {e}");
+                    notify("Frame Fang: start with system", &e, true);
+                }
+            }
+            // Every surface that quotes a hotkey (the hover tooltip and the
+            // menu rows) is rebuilt in place, so a rebind shows at once.
+            if let Some(t) = &self.tray {
+                if let Err(e) = t.set_tooltip(&tray_tooltip(&self.settings)) {
+                    eprintln!("Tray tooltip update failed: {e}");
+                }
+                t.set_hotkey_labels(&menu_labels(&self.settings, self.portal_hotkey));
+            }
+            let keys = |s: &AppSettings| (s.hotkey_bindings(), s.switch_key.clone());
+            if self.settings_view.is_none() && keys(&old) != keys(&self.settings) {
+                self.register_hotkeys();
+            }
+        }
+
+        /// Register the configured shortcuts. A rebind the user just made is
+        /// the one failure they will notice and least expect (on the portal
+        /// backend it can be refused outright), so say so where they look.
+        fn register_hotkeys(&mut self) {
+            if let Some(hk) = self.hotkeys.as_mut() {
+                for (action, e) in apply_hotkeys(hk, &self.settings) {
+                    notify("Frame Fang: couldn't set that shortcut",
+                           &format!("{}: {e}", action.label()), true);
+                }
+            }
+        }
+
+        /// Write `settings.json`, telling the user if it failed.
+        fn save_settings(&mut self) {
+            if let Err(e) = self.settings.save() {
+                eprintln!("Failed to persist settings: {e}");
+                notify("Frame Fang: settings not saved",
+                    &framefang_core::failure::settings_write_failure(&e.to_string()), true);
+            }
+            self.settings_mtime = settings_file_mtime();
+        }
+
+        /// Pick up a hand edit of `settings.json` (Edit as JSON, or any
+        /// editor) within a second: apply it, and show it in an open
+        /// Settings window. A file that doesn't parse changes nothing, and
+        /// says what is wrong once per save of it.
+        fn watch_settings_file(&mut self) {
+            if self.settings_checked.elapsed() < Duration::from_secs(1) { return; }
+            self.settings_checked = Instant::now();
+            let mtime = settings_file_mtime();
+            if mtime.is_none() || mtime == self.settings_mtime { return; }
+            self.settings_mtime = mtime;
+            let Some(text) = AppSettings::settings_path().and_then(|p| std::fs::read_to_string(p).ok()) else { return };
+            match AppSettings::parse(&text) {
+                Ok(s) => {
+                    self.settings_bad_reported = None;
+                    if s == self.settings { return; }
+                    if let Some(v) = self.settings_view.as_mut() { v.replace_draft(s.clone()); }
+                    self.apply_settings(s);
+                }
+                Err(e) => {
+                    if self.settings_bad_reported == mtime { return; }
+                    self.settings_bad_reported = mtime;
+                    notify("Frame Fang: settings.json has a mistake",
+                        &format!("{e}. Frame Fang keeps your current settings until it's fixed."), true);
                 }
             }
         }
@@ -1583,14 +1655,7 @@ pub fn run() -> Result<()> {
                 // persisted it to settings.json on mouseup; this keeps the
                 // tray's in-memory copy aligned.
                 if let Some(ov) = self.overlay.as_ref() {
-                    self.settings.marker_opacity = ov.settings().marker_opacity;
-                    self.settings.last_thickness = ov.settings().last_thickness;
-                    self.settings.last_text_size = ov.settings().last_text_size;
-                    self.settings.pixelate_block = ov.settings().pixelate_block;
-                    self.settings.tool_styles    = ov.settings().tool_styles.clone();
-                    self.settings.last_tool      = ov.settings().last_tool.clone();
-                    self.settings.palette_index  = ov.settings().palette_index;
-                    self.settings.capture_mode   = ov.settings().capture_mode.clone();
+                    ov.settings().copy_editor_fields_to(&mut self.settings);
                 }
                 self.overlay = None;
                 // A color-pick session has no editor left to answer.
@@ -1703,7 +1768,9 @@ pub fn run() -> Result<()> {
         toast:   None,
         tray_menu: None,
         tray_menu_closed: None,
-        tray_sound: framefang_platform::recorder::RecordingOptions::NONE,
+        settings_mtime: settings_file_mtime(),
+        settings_checked: Instant::now(),
+        settings_bad_reported: None,
         color_pick: None,
         settings_view:  None,
         recording_view: None,
@@ -2070,6 +2137,34 @@ fn stderr_tail(stderr: &str) -> String {
     lines[n.saturating_sub(4)..].join(" | ")
 }
 
+/// When `settings.json` was last written, if it exists.
+fn settings_file_mtime() -> Option<std::time::SystemTime> {
+    AppSettings::settings_path()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok())
+}
+
+/// The tray menu's Sound choice as `settings.json` stores it (`RecordSound`).
+fn sound_name(o: framefang_platform::recorder::RecordingOptions) -> &'static str {
+    match (o.mic, o.system_audio) {
+        (false, false) => "None",
+        (true, false)  => "Mic",
+        (false, true)  => "PC",
+        (true, true)   => "Both",
+    }
+}
+
+/// `RecordSound` back to the recorder's options; anything unknown is None.
+fn sound_from_name(s: &str) -> framefang_platform::recorder::RecordingOptions {
+    use framefang_platform::recorder::RecordingOptions as O;
+    match s.trim().to_ascii_lowercase().as_str() {
+        "mic" => O::MIC_ONLY,
+        "pc" | "system" => O::SYSTEM_ONLY,
+        "both" => O::MIC_AND_SYS,
+        _ => O::NONE,
+    }
+}
+
 /// The tray icon's hover text: the name, then the capture key as set in
 /// Settings (rebuilt whenever Settings saves), on two lines.
 fn tray_tooltip(s: &AppSettings) -> String {
@@ -2302,6 +2397,16 @@ fn open_url(url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_sound_choice_round_trips_through_settings_json() {
+        use framefang_platform::recorder::RecordingOptions as O;
+        for o in [O::NONE, O::MIC_ONLY, O::SYSTEM_ONLY, O::MIC_AND_SYS] {
+            assert_eq!(sound_from_name(sound_name(o)), o);
+        }
+        assert_eq!(sound_from_name(" both "), O::MIC_AND_SYS, "hand edits are forgiven case and spaces");
+        assert_eq!(sound_from_name("loud"), O::NONE);
+    }
 
     #[test]
     fn annotated_path_lands_next_to_source() {

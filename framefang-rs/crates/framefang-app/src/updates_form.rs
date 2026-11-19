@@ -504,7 +504,7 @@ impl UpdatesView {
                     let bar = (PAD, y + 18, WIN_W as i32 - PAD * 2, 8);
                     match &u.error {
                         Some(e) => {
-                            draw_text(&mut surf, PAD, y, 1, "The update didn't finish.", argb_to_framefang(DANGER));
+                            draw_text(&mut surf, PAD, y, 1, "The update didn't finish.", argb_to_framefang(DANGER()));
                             let msg = truncate_text(e, WIN_W as i32 - PAD * 2);
                             draw_text(&mut surf, PAD, y + 18, 1, &msg, argb_to_framefang(TEXT_MUTED()));
                         }
@@ -559,7 +559,7 @@ impl UpdatesView {
                 draw_notes(&mut surf, self.notes_rect, self.scroll, max_scroll, &info.notes);
             }
             FetchState::Error(e) => {
-                draw_text(&mut surf, PAD + 120, y, 1, "unavailable", argb_to_framefang(DANGER));
+                draw_text(&mut surf, PAD + 120, y, 1, "unavailable", argb_to_framefang(DANGER()));
                 y += 28;
                 let msg = format!("Couldn't reach GitHub: {}", e);
                 draw_text(&mut surf, PAD, y, 1, &msg, argb_to_framefang(TEXT_MUTED()));

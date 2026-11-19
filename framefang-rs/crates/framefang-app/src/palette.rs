@@ -23,10 +23,11 @@ pub enum Scheme {
     Green,
     Cyan,
     Yellow,
+    Orange,
 }
 
 impl Scheme {
-    pub const ALL: [Scheme; 4] = [Scheme::Pink, Scheme::Green, Scheme::Cyan, Scheme::Yellow];
+    pub const ALL: [Scheme; 5] = [Scheme::Pink, Scheme::Green, Scheme::Cyan, Scheme::Yellow, Scheme::Orange];
 
     /// The word shown in Settings and stored in settings.json.
     pub fn name(self) -> &'static str {
@@ -35,6 +36,7 @@ impl Scheme {
             Scheme::Green => "Green",
             Scheme::Cyan => "Cyan",
             Scheme::Yellow => "Yellow",
+            Scheme::Orange => "Orange",
         }
     }
 
@@ -55,6 +57,7 @@ impl Scheme {
             Scheme::Green => &GREEN_SET,
             Scheme::Cyan => &CYAN_SET,
             Scheme::Yellow => &YELLOW_SET,
+            Scheme::Orange => &ORANGE_SET,
         }
     }
 }
@@ -86,7 +89,7 @@ const PINK_SET: Colors = Colors {
     accent_dim: 0x00_7A_0B_42,
     toggle_on: 0x00_5C_0A_33,
     bg_top: 0x00_0E_0C_10,
-    bg_body: 0x00_09_08_0B,
+    bg_body: 0x00_00_00_00,
     rule: 0x00_24_1E_28,
     field_bg: 0x00_06_05_08,
     field_border: 0x00_2E_27_33,
@@ -106,7 +109,7 @@ const GREEN_SET: Colors = Colors {
     accent_dim: 0x00_0A_6B_26,
     toggle_on: 0x00_0A_4A_1E,
     bg_top: 0x00_0A_0F_0C,
-    bg_body: 0x00_06_0A_08,
+    bg_body: 0x00_00_00_00,
     rule: 0x00_1A_2A_22,
     field_bg: 0x00_04_07_05,
     field_border: 0x00_23_36_2C,
@@ -125,7 +128,7 @@ const CYAN_SET: Colors = Colors {
     accent_dim: 0x00_14_6A_86,
     toggle_on: 0x00_0B_4A_60,
     bg_top: 0x00_0A_0E_1A,
-    bg_body: 0x00_07_0A_13,
+    bg_body: 0x00_00_00_00,
     rule: 0x00_16_22_3A,
     field_bg: 0x00_05_07_0F,
     field_border: 0x00_1C_2A_48,
@@ -144,7 +147,7 @@ const YELLOW_SET: Colors = Colors {
     accent_dim: 0x00_6E_66_04,
     toggle_on: 0x00_4A_45_08,
     bg_top: 0x00_0F_0E_08,
-    bg_body: 0x00_0A_09_06,
+    bg_body: 0x00_00_00_00,
     rule: 0x00_2A_27_16,
     field_bg: 0x00_07_06_04,
     field_border: 0x00_36_32_1C,
@@ -154,6 +157,25 @@ const YELLOW_SET: Colors = Colors {
     toggle_off: 0x00_19_17_0D,
     toggle_off_knob: 0x00_5E_59_43,
     scrollbar_bg: 0x00_14_12_0A,
+};
+
+/// Sunset orange on warm black.
+const ORANGE_SET: Colors = Colors {
+    accent: 0x00_FF_7A_00,
+    accent_soft: 0x00_FF_B0_66,
+    accent_dim: 0x00_7A_3A_04,
+    toggle_on: 0x00_4F_27_06,
+    bg_top: 0x00_10_0B_07,
+    bg_body: 0x00_00_00_00,
+    rule: 0x00_2C_1F_15,
+    field_bg: 0x00_08_05_04,
+    field_border: 0x00_3A_2A_1C,
+    hover: 0x00_1F_15_0D,
+    text_muted: 0x00_B8_A8_98,
+    text_dim: 0x00_72_66_5A,
+    toggle_off: 0x00_1A_13_0D,
+    toggle_off_knob: 0x00_60_54_4A,
+    scrollbar_bg: 0x00_15_10_0B,
 };
 
 static CURRENT: AtomicU8 = AtomicU8::new(0);
@@ -208,9 +230,20 @@ pub fn PRIMARY_FILL() -> u32 {
 // ── colors that never change ────────────────────────────────────────────────
 
 pub const TEXT_BRIGHT: u32 = 0x00_F2_F2_F4;
-/// Errors: orange-red, apart from every scheme's accent.
-pub const DANGER: u32 = 0x00_FF_5C_3A;
-pub const WARN: u32 = 0x00_FF_B0_20;
+
+// ── status colors, kept apart from the accent ───────────────────────────────
+
+/// Errors: orange-red, or a red-pink under Orange, so an error never reads
+/// as the accent.
+pub fn DANGER() -> u32 { danger_for(current()) }
+/// Warnings: amber, or yellow under Orange.
+pub fn WARN() -> u32 {
+    if current() == Scheme::Orange { 0x00_FF_E2_3D } else { 0x00_FF_B0_20 }
+}
+
+fn danger_for(s: Scheme) -> u32 {
+    if s == Scheme::Orange { 0x00_FF_3B_5C } else { 0x00_FF_5C_3A }
+}
 pub const OK_TINT: u32 = 0x00_3D_F5_C8;
 
 #[cfg(test)]
@@ -230,7 +263,7 @@ mod tests {
 
     #[test]
     fn errors_read_apart_from_every_accent() {
-        // Hue distance, roughly: no accent may sit near DANGER's orange-red.
+        // Hue distance, roughly: no accent may sit near its scheme's error color.
         let hue = |c: u32| {
             let (r, g, b) = (((c >> 16) & 0xFF) as f32, ((c >> 8) & 0xFF) as f32, (c & 0xFF) as f32);
             let (mx, mn) = (r.max(g).max(b), r.min(g).min(b));
@@ -239,7 +272,7 @@ mod tests {
             h * 60.0
         };
         for s in Scheme::ALL {
-            let diff = (hue(s.accent()) - hue(DANGER)).abs();
+            let diff = (hue(s.accent()) - hue(danger_for(s))).abs();
             let diff = diff.min(360.0 - diff);
             assert!(diff > 25.0, "{:?} accent is too close to the error color", s);
         }

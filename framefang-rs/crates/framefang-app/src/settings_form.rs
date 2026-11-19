@@ -16,14 +16,17 @@
 //!                 Capture full screen (same, plus CLEAR — optional)
 //!                 Record screen       (same, plus CLEAR — optional)
 //!                 The system's own screenshot key (button to its page)
-//!   APPEARANCE    Theme   (cycles Light / Dark)
+//!   APPEARANCE    Theme   (one chip per color scheme)
 //!                 Start with system (toggle pill)
 //!
-//! The "Edit as JSON" button in the action bar still opens settings.json in
-//! the user's default editor — useful as an escape hatch when the rebind
-//! widget doesn't know a particular key (the supported set covers letters,
-//! digits, F1–F12, arrows, navigation cluster, PrintScreen, ScrollLock,
-//! Pause).
+//! There is no Save button: every change is handed to the tray as it is
+//! made (`SettingsOutcome::Changed`), which applies and saves it. A setting
+//! that differs from its default carries a diamond in the accent left of its
+//! label; clicking it puts the default back.
+//!
+//! The header holds the settings file: Edit as JSON opens settings.json in
+//! the user's default editor (a saved edit shows here within a second),
+//! Export... saves a copy where the user picks, Import... loads one.
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -80,10 +83,23 @@ const ROW_H: i32 = 34;
 const LABEL_W: i32 = 224;
 /// The window's heading, drawn at scale 2 left of the header buttons.
 const TITLE: &str = "FRAME FANG // SETTINGS";
-// Header buttons, right-anchored: Edit as JSON, Cancel, Save.
-const SAVE_W:   i32 = 92;
-const CANCEL_W: i32 = 92;
+// Header buttons, right-anchored: Export..., Import..., Edit as JSON. There
+// is no Save: every change is saved as it is made.
+const EXPORT_W: i32 = 92;
+const IMPORT_W: i32 = 92;
 const EDIT_W:   i32 = 112;
+/// Section headings: the pixel font at twice its size, with room around them
+/// so the page reads as three clear groups (Brandon 2026-11-19). `ABOVE` is
+/// from the last row of one section to the next heading, `BELOW` from a
+/// heading to its first row, `TOP` from the header band to the first heading.
+const SECTION_SCALE: i32 = 2;
+const SECTION_ABOVE: i32 = 34;
+const SECTION_BELOW: i32 = 16;
+const SECTION_TOP: i32 = 22;
+/// A heading's whole band: what one costs in height.
+const SECTION_BAND: i32 = bitmap_font::GLYPH_H * SECTION_SCALE + SECTION_BELOW;
+/// Under the heading while nothing else needs saying.
+const SUBTITLE: &str = "Changes save as you make them. Esc closes.";
 const HEADER_BTN_GAP: i32 = 8;
 /// Between the Theme row's color chips.
 const THEME_CHIP_GAP: i32 = 8;
@@ -142,12 +158,71 @@ enum WidgetKind {
     /// can draw it (`framefang_platform::cursor::SUPPORTED`).
     CaptureCursor,
     OpenJson,
-    SaveBtn,
-    CancelBtn,
+    /// Save a copy of the settings to a file the user picks.
+    ExportBtn,
+    /// Replace the settings with ones from a file the user picks.
+    ImportBtn,
+    /// The changed mark left of a setting: shown, and clickable, only while
+    /// that setting differs from its default; clicking puts the default back.
+    Reset(Setting),
     /// Opens the system's own screenshot-shortcut page. Laid out only where
     /// `system_shortcuts::page()` has one.
     SystemShortcut,
 }
+
+/// One setting as the user sees it, for its changed mark. A row of chips
+/// that sets two fields (After a capture: what happens, and the key that
+/// flips it) is one setting.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Setting {
+    ShotsFolder,
+    RecordingsFolder,
+    AfterCapture,
+    CaptureCursor,
+    AutoCopy,
+    CloseAfterCopy,
+    Hotkey(HotkeyAction),
+    Theme,
+    StartWithOs,
+}
+
+impl Setting {
+    /// Whether `s` holds this setting's default.
+    fn is_default(self, s: &AppSettings) -> bool {
+        let d = AppSettings::default();
+        match self {
+            Setting::ShotsFolder      => s.save_directory == d.save_directory,
+            Setting::RecordingsFolder => s.recordings_directory == d.recordings_directory,
+            Setting::AfterCapture     => s.open_editor == d.open_editor && s.switch_key() == d.switch_key(),
+            Setting::CaptureCursor    => s.capture_cursor == d.capture_cursor,
+            Setting::AutoCopy         => s.auto_copy == d.auto_copy,
+            Setting::CloseAfterCopy   => s.close_after_copy == d.close_after_copy,
+            Setting::Hotkey(a)        => s.hotkey_for(a) == d.hotkey_for(a),
+            Setting::Theme            => crate::palette::Scheme::parse(&s.theme) == crate::palette::Scheme::parse(&d.theme),
+            Setting::StartWithOs      => s.start_with_windows == d.start_with_windows,
+        }
+    }
+
+    /// Put this setting's default back into `s`.
+    fn reset(self, s: &mut AppSettings) {
+        let d = AppSettings::default();
+        match self {
+            Setting::ShotsFolder      => s.save_directory = d.save_directory,
+            Setting::RecordingsFolder => s.recordings_directory = d.recordings_directory,
+            Setting::AfterCapture     => { s.open_editor = d.open_editor; s.switch_key = d.switch_key; }
+            Setting::CaptureCursor    => s.capture_cursor = d.capture_cursor,
+            Setting::AutoCopy         => s.auto_copy = d.auto_copy,
+            Setting::CloseAfterCopy   => s.close_after_copy = d.close_after_copy,
+            Setting::Hotkey(a)        => s.set_hotkey_for(a, d.hotkey_for(a)),
+            Setting::Theme            => s.theme = d.theme,
+            Setting::StartWithOs      => s.start_with_windows = d.start_with_windows,
+        }
+    }
+}
+
+/// The changed mark: a diamond in the gutter left of the setting's label.
+const MARK_X: i32 = PAD - 11;
+const MARK_R: i32 = 3;
 
 /// The line under HOTKEYS: the system page's button, and whether the system
 /// is taking the capture binding right now.
@@ -160,13 +235,14 @@ struct Row {
 }
 
 pub enum SettingsOutcome {
-    /// User clicked [Save]; tray loop applies + persists.
-    Saved(AppSettings),
-    /// User clicked [Cancel] or hit Esc.
-    Cancelled,
+    /// A setting changed: the tray applies and saves it now. There is no
+    /// Save button; the window stays open.
+    Changed(AppSettings),
+    /// The window was closed (Esc or its close button). Everything is
+    /// already saved; the tray turns the shortcuts back on.
+    Closed,
     /// User clicked [Edit as JSON]; tray loop should shell-open the config
-    /// path. The view stays open so subsequent edits land in the draft when
-    /// the user re-opens it.
+    /// path. The window stays open, and an edit saved there shows in it.
     OpenJson,
 }
 
@@ -219,6 +295,9 @@ pub struct SettingsView {
     fetch_seen: crate::ffmpeg_fetch::Fetch,
     /// The title strip drawn above the dialog (minimize, close, drag).
     title_bar: crate::chrome::TitleBar,
+    /// What the last Export or Import did, shown in the subtitle's place;
+    /// `true` for a failure.
+    status: Option<(String, bool)>,
     pub outcome: Option<SettingsOutcome>,
 }
 
@@ -277,6 +356,7 @@ impl SettingsView {
             ffmpeg_attention,
             fetch_seen: crate::ffmpeg_fetch::state(),
             title_bar: Default::default(),
+            status: None,
             outcome: None,
         };
         me.refresh_system_takes();
@@ -285,6 +365,22 @@ impl SettingsView {
     }
 
     pub fn window_id(&self) -> WindowId { self.window.id() }
+
+    /// The settings changed outside this window (`settings.json` edited by
+    /// hand): show them. A rebind in progress is left listening.
+    pub fn replace_draft(&mut self, s: AppSettings) {
+        if s == self.draft { return; }
+        self.draft = s;
+        self.relayout();
+        self.window.request_redraw();
+    }
+
+    /// Hand the draft to the tray if `before` differs from it.
+    fn report_change(&mut self, before: &AppSettings) {
+        if self.draft != *before {
+            self.outcome = Some(SettingsOutcome::Changed(self.draft.clone()));
+        }
+    }
 
     /// Called from the tray loop's poll: redraw when the FFmpeg download
     /// moved on, and look for FFmpeg again once it has finished.
@@ -338,7 +434,7 @@ impl SettingsView {
     pub fn handle_event(&mut self, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
-                self.outcome = Some(SettingsOutcome::Cancelled);
+                self.outcome = Some(SettingsOutcome::Closed);
             }
             // Back from the system page: the setting may have changed.
             WindowEvent::Focused(true) => {
@@ -407,11 +503,9 @@ impl SettingsView {
 
     fn on_key(&mut self, ev: winit::event::KeyEvent) {
         if ev.state != ElementState::Pressed { return; }
-        // Esc cancels, Enter saves.
-        match ev.logical_key {
-            Key::Named(NamedKey::Escape) => self.outcome = Some(SettingsOutcome::Cancelled),
-            Key::Named(NamedKey::Enter)  => self.try_save(),
-            _ => {}
+        // Esc closes; everything is already saved.
+        if ev.logical_key == Key::Named(NamedKey::Escape) {
+            self.outcome = Some(SettingsOutcome::Closed);
         }
     }
 
@@ -436,6 +530,7 @@ impl SettingsView {
             self.draft.set_hotkey_for(action, self.hotkey_before_capture);
             self.capturing_hotkey = None;
             self.capture_hint = None;
+            self.error = None;
             self.relayout();
             self.window.request_redraw();
             return;
@@ -463,34 +558,25 @@ impl SettingsView {
             return;
         }
         self.capture_hint = None;
+        let before = self.draft.clone();
         self.draft.set_hotkey_for(action, Some(hk));
-        self.capturing_hotkey = None;
-        // The binding just changed, so whatever the last Save complained
-        // about may well be resolved — let the next Save re-check instead of
-        // leaving a stale message on screen.
-        self.error = None;
-        // Print Screen in or out: the Windows card comes or goes with it.
-        self.relayout();
-        self.window.request_redraw();
-    }
-
-    /// Commit the draft, unless two actions are bound to the same chord.
-    ///
-    /// A duplicate is not something the OS can arbitrate for us: on Windows
-    /// the second `RegisterHotKey` just fails, and under X11 both grabs land
-    /// on one key so whichever binding we happen to match first silently
-    /// wins. Refusing the save and naming both rows is the only outcome the
-    /// user can act on, so the dialog stays open with the message in the
-    /// footer.
-    fn try_save(&mut self) {
+        // A chord another action already has is refused as it is pressed,
+        // and the box keeps listening for another key. The OS can't share
+        // one: on Windows the second `RegisterHotKey` just fails, and under
+        // X11 whichever grab matches first silently wins.
         if let Some((a, b)) = self.draft.hotkey_conflict() {
             let chord = self.draft.hotkey_for(a).unwrap_or_default();
             self.error = Some(conflict_message(a, b, chord));
+            self.draft = before;
             self.window.request_redraw();
             return;
         }
+        self.capturing_hotkey = None;
         self.error = None;
-        self.outcome = Some(SettingsOutcome::Saved(self.draft.clone()));
+        // Print Screen in or out: the Windows card comes or goes with it.
+        self.relayout();
+        self.report_change(&before);
+        self.window.request_redraw();
     }
 
     fn hit_test(&self, x: i32, y: i32) -> Option<usize> {
@@ -504,6 +590,8 @@ impl SettingsView {
             // something to download.
             if r.kind == WidgetKind::Ffmpeg { return None; }
             if r.kind == WidgetKind::FfmpegDownload && !self.ffmpeg_actionable() { return None; }
+            // A changed mark is there only while its setting isn't default.
+            if let WidgetKind::Reset(s) = r.kind { if s.is_default(&self.draft) { return None; } }
             let (rx, ry, rw, rh) = r.rect;
             if x >= rx && x < rx + rw && y >= ry && y < ry + rh { Some(i) } else { None }
         })
@@ -511,7 +599,22 @@ impl SettingsView {
 
     fn activate(&mut self, idx: usize) {
         let kind = self.rows[idx].kind;
+        // Every control that changes a setting reports it as it happens.
+        let before = self.draft.clone();
         match kind {
+            WidgetKind::Reset(setting) => {
+                setting.reset(&mut self.draft);
+                if setting == Setting::Theme {
+                    crate::palette::set(crate::palette::Scheme::parse(&self.draft.theme));
+                }
+                if matches!(setting, Setting::Hotkey(_)) {
+                    self.capturing_hotkey = None;
+                    self.error = None;
+                    self.relayout();
+                }
+            }
+            WidgetKind::ExportBtn => self.export(),
+            WidgetKind::ImportBtn => self.import(),
             WidgetKind::Ffmpeg => {}
             WidgetKind::FfmpegDownload => {
                 crate::ffmpeg_fetch::start();
@@ -588,6 +691,7 @@ impl SettingsView {
                 self.hotkey_before_capture = self.draft.hotkey_for(action);
                 self.capturing_hotkey = Some(action);
                 self.capture_hint = None;
+                self.error = None;
             }
             WidgetKind::HotkeyClear(action) => {
                 // Only laid out for the optional actions, so this can never
@@ -600,14 +704,6 @@ impl SettingsView {
                 self.outcome = Some(SettingsOutcome::OpenJson);
                 return;
             }
-            WidgetKind::SaveBtn => {
-                self.try_save();
-                return;
-            }
-            WidgetKind::CancelBtn => {
-                self.outcome = Some(SettingsOutcome::Cancelled);
-                return;
-            }
             WidgetKind::SystemShortcut => {
                 if let Some(page) = self.system_page {
                     if let Err(e) = page.open() {
@@ -616,7 +712,52 @@ impl SettingsView {
                 }
             }
         }
+        self.report_change(&before);
         self.window.request_redraw();
+    }
+
+    /// Save a copy of the settings where the user picks, as JSON.
+    fn export(&mut self) {
+        let dir = directories::UserDirs::new()
+            .and_then(|u| u.document_dir().map(|p| p.to_path_buf()))
+            .unwrap_or_else(std::env::temp_dir);
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Frame Fang: Export settings")
+            .set_directory(&dir)
+            .set_file_name("Frame Fang settings.json")
+            .add_filter("Settings (JSON)", &["json"])
+            .save_file()
+        else { return };
+        self.status = Some(match self.draft.write_to(&path) {
+            Ok(()) => (format!("Exported to {}", path.display()), false),
+            Err(e) => (format!("Couldn't export: {e}"), true),
+        });
+    }
+
+    /// Replace every setting with the ones in a file the user picks. A file
+    /// that isn't Frame Fang settings changes nothing and says why.
+    fn import(&mut self) {
+        let dir = directories::UserDirs::new()
+            .and_then(|u| u.document_dir().map(|p| p.to_path_buf()))
+            .unwrap_or_else(std::env::temp_dir);
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Frame Fang: Import settings")
+            .set_directory(&dir)
+            .add_filter("Settings (JSON)", &["json"])
+            .pick_file()
+        else { return };
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        match AppSettings::read_from(&path) {
+            Ok(s) => {
+                self.draft = s;
+                crate::palette::set(crate::palette::Scheme::parse(&self.draft.theme));
+                self.capturing_hotkey = None;
+                self.error = None;
+                self.relayout();
+                self.status = Some((format!("Imported {name}"), false));
+            }
+            Err(e) => self.status = Some((format!("Couldn't import {name}: {e}"), true)),
+        }
     }
 
     /// Lay out section headers + every row. Sections are spaced apart with
@@ -632,22 +773,30 @@ impl SettingsView {
         let x = PAD;
         let row_w = WIN_W as i32 - PAD * 2;
 
-        // Header action bar — Edit-as-JSON sits leftmost on the right
-        // side, then Cancel, then the primary Save button. Sized to their
-        // words rather than generously, so the heading on the left has room.
+        // Header action bar: the settings file's three buttons, right-
+        // anchored. Sized to their words rather than generously, so the
+        // heading on the left has room.
         let header_btn_y = (HEADER_H - BTN_H) / 2 + 4;
-        let save_x   = WIN_W as i32 - PAD - SAVE_W;
-        let cancel_x = save_x   - HEADER_BTN_GAP - CANCEL_W;
-        let edit_x   = cancel_x - HEADER_BTN_GAP - EDIT_W;
+        let export_x = WIN_W as i32 - PAD - EXPORT_W;
+        let import_x = export_x - HEADER_BTN_GAP - IMPORT_W;
+        let edit_x   = import_x - HEADER_BTN_GAP - EDIT_W;
         rows.push(Row { kind: WidgetKind::OpenJson,  label: "Edit as JSON", rect: (edit_x,   header_btn_y, EDIT_W,   BTN_H) });
-        rows.push(Row { kind: WidgetKind::CancelBtn, label: "Cancel",       rect: (cancel_x, header_btn_y, CANCEL_W, BTN_H) });
-        rows.push(Row { kind: WidgetKind::SaveBtn,   label: "Save",         rect: (save_x,   header_btn_y, SAVE_W,   BTN_H) });
+        rows.push(Row { kind: WidgetKind::ImportBtn, label: "Import...",    rect: (import_x, header_btn_y, IMPORT_W, BTN_H) });
+        rows.push(Row { kind: WidgetKind::ExportBtn, label: "Export...",    rect: (export_x, header_btn_y, EXPORT_W, BTN_H) });
+
+        // A setting's changed mark, in the gutter left of its row.
+        let mark = |rows: &mut Vec<Row>, setting: Setting, y: i32| {
+            rows.push(Row { kind: WidgetKind::Reset(setting), label: "Reset to default",
+                            rect: (MARK_X - 7, y, 15, ROW_H) });
+        };
 
         // Content rows start below the header band + first section title.
-        let mut y = HEADER_H + 14 + 18;
+        let mut y = HEADER_H + SECTION_TOP + SECTION_BAND;
 
         // CAPTURES: where they go, and whether they also go to the clipboard.
+        mark(&mut rows, Setting::ShotsFolder, y);
         rows.push(Row { kind: WidgetKind::SaveFolder,       label: "Screenshots folder", rect: (x, y, row_w, ROW_H) }); y += ROW_H + ROW_GAP;
+        mark(&mut rows, Setting::RecordingsFolder, y);
         rows.push(Row { kind: WidgetKind::RecordingsFolder, label: "Recordings folder",  rect: (x, y, row_w, ROW_H) }); y += ROW_H + ROW_GAP;
         // FFmpeg, which recording and video conversion run: where it is, or
         // a Download button (`render_ffmpeg_row`).
@@ -657,6 +806,7 @@ impl SettingsView {
         y += ROW_H + ROW_GAP;
         // After a capture: two choices, then the key that flips one capture
         // to the other, each a group of chips across the value column.
+        mark(&mut rows, Setting::AfterCapture, y);
         rows.push(Row { kind: WidgetKind::AfterCapture, label: "After a capture", rect: (x, y, row_w, ROW_H) });
         let (chip_y, chip_h) = (y + 4, ROW_H - 8);
         let mut cx = x + LABEL_W;
@@ -674,18 +824,22 @@ impl SettingsView {
         y += ROW_H + ROW_GAP;
         // What goes into the picture, before where it goes.
         if framefang_platform::cursor::SUPPORTED {
+            mark(&mut rows, Setting::CaptureCursor, y);
             rows.push(Row { kind: WidgetKind::CaptureCursor, label: "Include the mouse pointer", rect: (x, y, row_w, ROW_H) }); y += ROW_H + ROW_GAP;
         }
+        mark(&mut rows, Setting::AutoCopy, y);
         rows.push(Row { kind: WidgetKind::AutoCopy,        label: "Copy screenshots automatically", rect: (x, y, row_w, ROW_H) }); y += ROW_H + ROW_GAP;
-        rows.push(Row { kind: WidgetKind::CloseAfterCopy,   label: "Close the editor after copying", rect: (x, y, row_w, ROW_H) }); y += ROW_H + 22;
+        mark(&mut rows, Setting::CloseAfterCopy, y);
+        rows.push(Row { kind: WidgetKind::CloseAfterCopy,   label: "Close the editor after copying", rect: (x, y, row_w, ROW_H) }); y += ROW_H;
 
         // HOTKEYS — one row per action: a display box filling the left part
         // of the value column, REBIND anchored to the right edge, and CLEAR
         // just inside it on the two optional actions. The buttons are their
         // own rows laid out over the display row's rect; `hit_test` scans in
         // reverse, so they win the click.
-        y += 18;
+        y += SECTION_ABOVE + SECTION_BAND;
         for action in HotkeyAction::ALL {
+            mark(&mut rows, Setting::Hotkey(action), y);
             rows.push(Row { kind:  WidgetKind::HotkeyDisplay(action),
                             label: action.label(),
                             rect:  (x, y, row_w, ROW_H) });
@@ -707,7 +861,7 @@ impl SettingsView {
             // Windows, capture key isn't Print Screen: Windows' switch
             // doesn't touch it, so no card; the next heading sits as far
             // below the last row as the other headings do.
-            Some(page) if page.is_windows() && !windows_guide => y += 16,
+            Some(page) if page.is_windows() && !windows_guide => y += SECTION_ABOVE - ROW_GAP,
             Some(page) if page.is_windows() => {
                 // The guide card; its button sits in the card's top-right.
                 let w = bitmap_font::measure(page.button, 1) + 24;
@@ -719,7 +873,7 @@ impl SettingsView {
                                 rect:  (x + row_w - CARD_PAD - w, top + CARD_PAD, w, CARD_BTN_H) });
                 // The APPEARANCE heading then sits as far below the card as
                 // the other headings sit below their rows.
-                y = top + CARD_H + 22;
+                y = top + CARD_H + SECTION_ABOVE;
             }
             Some(page) => {
                 let w = bitmap_font::measure(page.button, 1) + 24;
@@ -728,13 +882,14 @@ impl SettingsView {
                                 rect:  (x + row_w - w, y, w, SYSTEM_BTN_H) });
                 // Enough that the APPEARANCE heading clears the system line's
                 // button by about what the other sections get.
-                y += 44;
+                y += SYSTEM_BTN_H + SECTION_ABOVE;
             }
-            None => y += 44,
+            None => y += SECTION_ABOVE - ROW_GAP,
         }
 
         // APPEARANCE
-        y += 18;
+        y += SECTION_BAND;
+        mark(&mut rows, Setting::Theme, y);
         rows.push(Row { kind: WidgetKind::Theme, label: "Theme", rect: (x, y, row_w, ROW_H) });
         // One chip per scheme across the value column, a swatch and a word.
         let chips = crate::palette::Scheme::ALL;
@@ -745,6 +900,7 @@ impl SettingsView {
                             rect: (cx, y + 4, chip_w, ROW_H - 8) });
         }
         y += ROW_H + ROW_GAP;
+        mark(&mut rows, Setting::StartWithOs, y);
         rows.push(Row { kind: WidgetKind::StartWithOs, label: "Start with system", rect: (x, y, row_w, ROW_H) }); y += ROW_H;
 
         let _ = y;
@@ -769,8 +925,8 @@ impl SettingsView {
         let win_h = (h.get() as usize).saturating_sub(crate::chrome::TITLE_H as usize);
         let mut buf = vec![0u32; win_w * win_h];
 
-        // Header band and body with faint scanlines, the glowing rule
-        // under the header (`hud`).
+        // Header band, pure black body, the glowing rule under the header
+        // (`hud`).
         crate::hud::backdrop(&mut buf, win_w, win_h, HEADER_H);
         let _ = FOOTER_H;
 
@@ -780,8 +936,15 @@ impl SettingsView {
         crate::hud::heading(surf.buf, win_w, win_h, PAD, 18, TITLE);
         // Heading and subtitle must both end before the right-anchored
         // action bar; `the_heading_and_labels_clear_their_controls` checks.
-        draw_text(&mut surf, PAD, 44, 1, "Captures, hotkeys, appearance.",
-                  argb_to_framefang(TEXT_MUTED()));
+        // What the last Export or Import did takes the subtitle's place.
+        let (line, color) = match &self.status {
+            Some((msg, true))  => (msg.as_str(), DANGER()),
+            Some((msg, false)) => (msg.as_str(), OK_TINT),
+            None               => (SUBTITLE, TEXT_MUTED()),
+        };
+        let line_w = self.rows.iter().find(|r| r.kind == WidgetKind::OpenJson)
+            .map_or(300, |r| r.rect.0 - PAD - 12);
+        draw_text(&mut surf, PAD, 44, 1, &truncate_for(line, line_w), argb_to_framefang(color));
 
         // Section labels, numbered like a terminal's, anchored to their
         // first row.
@@ -792,12 +955,17 @@ impl SettingsView {
             self.rows.iter().find(|r| r.kind == WidgetKind::Theme).map(|r| (r.rect.1, "APPEARANCE")),
         ];
         for (i, (y, name)) in firsts.into_iter().flatten().enumerate() {
-            crate::hud::section(surf.buf, win_w, win_h, PAD, right, y - 22, i + 1, name);
+            let label_y = y - SECTION_BELOW - bitmap_font::GLYPH_H * SECTION_SCALE;
+            crate::hud::section_scaled(surf.buf, win_w, win_h, PAD, right, label_y, i + 1, name, SECTION_SCALE);
         }
 
         let capturing = self.capturing_hotkey;
         for (i, row) in self.rows.iter().enumerate() {
             let hovered = self.hover == Some(i);
+            if let WidgetKind::Reset(setting) = row.kind {
+                if !setting.is_default(&self.draft) { draw_mark(&mut surf, row, hovered); }
+                continue;
+            }
             if row.kind == WidgetKind::SystemShortcut {
                 if self.error.is_none() {
                     if self.guide_shown {
@@ -836,6 +1004,18 @@ impl SettingsView {
             render_row(&mut surf, row, hovered, capturing, self.capture_hint.as_deref(), &self.draft);
         }
 
+        // Pointing at a changed mark says what clicking it does, in place of
+        // the setting's name (its row follows its mark in `rows`).
+        if let Some(i) = self.hover {
+            if let (WidgetKind::Reset(_), Some(target)) = (self.rows[i].kind, self.rows.get(i + 1)) {
+                let (rx, ry, _, rh) = target.rect;
+                let indent = if target.kind == WidgetKind::CloseAfterCopy { SUB_INDENT } else { 0 };
+                fill_rect(&mut surf, rx, ry, LABEL_W - 8, rh, argb_to_framefang(BG_BODY()));
+                draw_text(&mut surf, rx + 6 + indent, ry + (rh - bitmap_font::GLYPH_H) / 2, 1,
+                          self.rows[i].label, argb_to_framefang(LASER()));
+            }
+        }
+
         // Inline validation, in the same danger tint the convert dialogs
         // use — but parked directly under the HOTKEYS block instead of at
         // the window's bottom edge, because that's the section it is about
@@ -845,7 +1025,7 @@ impl SettingsView {
                 .find(|r| matches!(r.kind, WidgetKind::HotkeyDisplay(_)))
             {
                 draw_text(&mut surf, PAD, r.rect.1 + ROW_H + 6, 1, msg,
-                          argb_to_framefang(DANGER));
+                          argb_to_framefang(DANGER()));
             }
         }
 
@@ -868,19 +1048,19 @@ fn render_system_line<S: painter::Surface>(
     let (rx, ry, rw, rh) = row.rect;
     let text_y = ry + (rh - bitmap_font::GLYPH_H) / 2;
     let (line, line_color) = if takes {
-        ("Print Screen opens the Snipping Tool, not Frame Fang", WARN)
+        ("Print Screen opens the Snipping Tool, not Frame Fang", WARN())
     } else {
         (page.line, TEXT_MUTED())
     };
     draw_text(surf, PAD + 6, text_y, 1, line, argb_to_framefang(line_color));
 
-    let border = if takes { WARN } else if hovered { LASER_DIM() } else { FIELD_BORDER() };
+    let border = if takes { WARN() } else if hovered { LASER_DIM() } else { FIELD_BORDER() };
     if hovered {
         fill_rect(surf, rx, ry, rw, rh, argb_to_framefang(HOVER_FILL()));
     }
     stroke_rect_argb(surf, rx, ry, rw, rh, argb_to_framefang(border));
     let tw = bitmap_font::measure(row.label, 1);
-    let color = if takes { WARN } else { TEXT_BRIGHT };
+    let color = if takes { WARN() } else { TEXT_BRIGHT };
     draw_text(surf, rx + (rw - tw) / 2, text_y, 1, row.label, argb_to_framefang(color));
 }
 
@@ -922,7 +1102,7 @@ fn render_ffmpeg_row<S: painter::Surface>(surf: &mut S, row: &Row, ff: &FfmpegRo
         }
         (_, Fetch::Installing) => ("Checking and installing...".to_owned(), TEXT_BRIGHT),
         (Some(path), _) => (path.display().to_string(), TEXT_MUTED()),
-        (None, Fetch::Failed(e)) => (format!("Download failed: {e}"), DANGER),
+        (None, Fetch::Failed(e)) => (format!("Download failed: {e}"), DANGER()),
         (None, _) if crate::ffmpeg_fetch::offered() =>
             ("Not installed. Recording and video conversion need it.".to_owned(), TEXT_MUTED()),
         (None, _) => (crate::ffmpeg_fetch::missing_message().to_owned(), TEXT_MUTED()),
@@ -978,7 +1158,7 @@ fn guide_text(g: &WindowsGuide) -> (String, String, u32) {
         (
             "Windows is using Print Screen for its own capture".to_owned(),
             format!("To use Print Screen here, turn this off in {}:", g.page),
-            WARN,
+            WARN(),
         )
     } else {
         (
@@ -1077,10 +1257,11 @@ fn render_row<S: painter::Surface>(
     let (rx, ry, rw, rh) = row.rect;
 
     // ── Action-bar buttons ─────────────────────────────────────────────────
-    if matches!(row.kind, WidgetKind::SaveBtn | WidgetKind::CancelBtn | WidgetKind::OpenJson) {
-        let is_primary = row.kind == WidgetKind::SaveBtn;
-        let border = if is_primary { LASER() } else if hovered { LASER_DIM() } else { PANEL_BORDER() };
-        let fill   = if is_primary && hovered { PRIMARY_FILL() } else if hovered { HOVER_FILL() } else { 0x0000_0000 };
+    if matches!(row.kind, WidgetKind::ExportBtn | WidgetKind::ImportBtn | WidgetKind::OpenJson) {
+        // No primary button: nothing here commits anything.
+        let is_primary = false;
+        let border = if hovered { LASER_DIM() } else { PANEL_BORDER() };
+        let fill   = if hovered { HOVER_FILL() } else { 0x0000_0000 };
         if fill != 0 {
             fill_rect(surf, rx, ry, rw, rh, argb_to_framefang(fill));
         }
@@ -1226,7 +1407,7 @@ fn render_row<S: painter::Surface>(
             stroke_rect_argb(surf, val_x, val_y, box_w, val_h, argb_to_framefang(border));
             let (text, color) = if listening {
                 match capture_hint {
-                    Some(hint) => (hint.to_owned(), WARN),
+                    Some(hint) => (hint.to_owned(), WARN()),
                     None => ("[ PRESS A KEY ]".to_owned(), LASER()),
                 }
             } else {
@@ -1251,6 +1432,19 @@ fn render_row<S: painter::Surface>(
             draw_toggle(surf, val_x, val_y, val_h, on);
         }
         _ => {}
+    }
+}
+
+/// A changed mark: a small diamond in the accent, on its row's label line,
+/// a size up while pointed at.
+fn draw_mark<S: painter::Surface>(surf: &mut S, row: &Row, hovered: bool) {
+    let (_, ry, _, rh) = row.rect;
+    let (cx, cy) = (MARK_X, ry + rh / 2);
+    let r = if hovered { MARK_R + 1 } else { MARK_R };
+    let c = argb_to_framefang(LASER());
+    for dy in -r..=r {
+        let half = r - dy.abs();
+        fill_rect(surf, cx - half, cy + dy, 2 * half + 1, 1, c);
     }
 }
 
@@ -1607,7 +1801,7 @@ mod tests {
 
         // The heading ends before the first header button.
         let first_btn = rows.iter()
-            .filter(|r| matches!(r.kind, WidgetKind::OpenJson | WidgetKind::CancelBtn | WidgetKind::SaveBtn))
+            .filter(|r| matches!(r.kind, WidgetKind::OpenJson | WidgetKind::ImportBtn | WidgetKind::ExportBtn))
             .map(|r| r.rect.0)
             .min()
             .unwrap();
@@ -1655,20 +1849,25 @@ mod tests {
         let theme = rows.iter().find(|r| r.kind == WidgetKind::Theme).unwrap();
         let card_top = btn.rect.1 - CARD_PAD;
         assert!(card_top >= last_hotkey.rect.1 + ROW_H);
-        assert!(card_top + CARD_H + 12 <= theme.rect.1 - 22, "room for the APPEARANCE heading");
+        assert_eq!(theme.rect.1 - (card_top + CARD_H), SECTION_ABOVE + SECTION_BAND,
+                   "the APPEARANCE heading sits as far below the card as the others below their rows");
 
         // Another capture key: no card, and the window is shorter by it.
         let without = SettingsView::build_rows(Some(page), false);
         assert!(!without.iter().any(|r| r.kind == WidgetKind::SystemShortcut));
         let theme2 = without.iter().find(|r| r.kind == WidgetKind::Theme).unwrap();
-        assert_eq!(theme2.rect.1 - (last_hotkey.rect.1 + ROW_H), 40, "same spacing as the other sections");
+        assert_eq!(theme2.rect.1 - (last_hotkey.rect.1 + ROW_H), SECTION_ABOVE + SECTION_BAND,
+                   "same spacing as the other sections");
+        let close = without.iter().find(|r| r.kind == WidgetKind::CloseAfterCopy).unwrap();
+        let first_hotkey = without.iter().find(|r| matches!(r.kind, WidgetKind::HotkeyDisplay(_))).unwrap();
+        assert_eq!(first_hotkey.rect.1 - (close.rect.1 + ROW_H), SECTION_ABOVE + SECTION_BAND);
         assert!(content_height(&without) < content_height(&rows));
         // The After-a-capture row (2026-11-17) took the last 40 px a 768 px
-        // screen had: with the card it needed about 808 (title bar and a
-        // 48 px taskbar included), so 1366x768 cuts off the bottom row. The
-        // mouse-pointer row (2026-11-19, Brandon asked for it) adds 40 more.
+        // screen had. The mouse-pointer row and then the roomier section
+        // headings (2026-11-19, both Brandon's asks) took it past 848: it now
+        // needs a 1080 px screen (title bar and a 48 px taskbar included).
         // Pinned so the next row is a deliberate choice too.
-        assert!(content_height(&rows) + crate::chrome::TITLE_H as u32 + 48 <= 848, "fits an 848 px screen");
+        assert!(content_height(&rows) + crate::chrome::TITLE_H as u32 + 48 <= 1000, "fits a 1080 px screen");
     }
 
     #[test]
@@ -1684,9 +1883,42 @@ mod tests {
     }
 
     #[test]
+    fn every_changed_mark_sits_beside_its_row_and_resets_just_that_setting() {
+        let rows = SettingsView::build_rows(None, false);
+        let mut c = AppSettings::default();
+        c.save_directory = "D:/shots".into();
+        c.recordings_directory = "D:/videos".into();
+        c.open_editor = false;
+        c.switch_key = "Alt".into();
+        c.capture_cursor = true;
+        c.auto_copy = true;
+        c.close_after_copy = true;
+        c.theme = "Orange".into();
+        c.start_with_windows = true;
+        for (i, a) in HotkeyAction::ALL.into_iter().enumerate() {
+            c.set_hotkey_for(a, Some(Hotkey { modifiers: HkMods::CONTROL, virtual_key: 0x70 + i as u32 }));
+        }
+        let mut seen = 0;
+        for (i, r) in rows.iter().enumerate() {
+            let WidgetKind::Reset(s) = r.kind else { continue };
+            seen += 1;
+            let row = &rows[i + 1];
+            assert_eq!(r.rect.1, row.rect.1, "{s:?}: the mark is on its row's line");
+            assert!(r.rect.0 >= 0 && r.rect.0 + r.rect.2 <= PAD, "{s:?}: the mark stays in the gutter");
+            assert!(!s.is_default(&c), "{s:?} reads as changed");
+            s.reset(&mut c);
+            assert!(s.is_default(&c), "{s:?} is back to default");
+        }
+        assert!(seen >= 10, "a mark for every setting row");
+        if framefang_platform::cursor::SUPPORTED {
+            assert_eq!(c, AppSettings::default(), "resetting every mark gives the defaults back");
+        }
+    }
+
+    #[test]
     fn header_button_words_fit_their_buttons() {
         for r in SettingsView::build_rows(None, false) {
-            if matches!(r.kind, WidgetKind::OpenJson | WidgetKind::CancelBtn | WidgetKind::SaveBtn) {
+            if matches!(r.kind, WidgetKind::OpenJson | WidgetKind::ImportBtn | WidgetKind::ExportBtn) {
                 assert!(bitmap_font::measure(r.label, 1) + 2 * MIN_GAP <= r.rect.2, "{}", r.label);
             }
             // A theme chip holds an 8 px swatch, a 6 px gap and the name.

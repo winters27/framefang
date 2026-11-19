@@ -32,6 +32,9 @@ const LOCK_FILE: &str = "instance.lock";
 /// Name of the "the user launched me again — please capture" flag file.
 const CAPTURE_REQUEST_FILE: &str = "capture.request";
 
+/// Name of the "launched with --settings: open Settings" flag file.
+const SETTINGS_REQUEST_FILE: &str = "settings.request";
+
 /// Held for the lifetime of the primary instance. Dropping it releases the
 /// lock, so it must be kept alive in `main` for as long as the app runs.
 pub struct InstanceLock {
@@ -58,6 +61,10 @@ fn lock_path() -> Option<PathBuf> {
 
 fn capture_request_path() -> Option<PathBuf> {
     AppSettings::config_dir().map(|d| d.join(CAPTURE_REQUEST_FILE))
+}
+
+fn settings_request_path() -> Option<PathBuf> {
+    AppSettings::config_dir().map(|d| d.join(SETTINGS_REQUEST_FILE))
 }
 
 /// Try to become the primary instance, answering immediately.
@@ -108,6 +115,7 @@ fn acquire_once() -> Instance {
     match try_lock(&file) {
         LockOutcome::Held => {
             if let Some(req) = capture_request_path() { let _ = fs::remove_file(req); }
+            if let Some(req) = settings_request_path() { let _ = fs::remove_file(req); }
             Instance::Primary(InstanceLock { _file: file })
         }
         LockOutcome::Contended => Instance::AlreadyRunning,
@@ -133,6 +141,21 @@ pub fn request_capture() {
 /// file *is* the claim, so two ticks can never both act on one request.
 pub fn take_capture_request() -> bool {
     let Some(path) = capture_request_path() else { return false };
+    fs::remove_file(path).is_ok()
+}
+
+/// Ask the running instance (or this one, once its loop runs) to open
+/// Settings: `framefang --settings`. Best-effort, like `request_capture`.
+pub fn request_settings() {
+    let Some(path) = settings_request_path() else { return };
+    if let Some(dir) = path.parent() { let _ = fs::create_dir_all(dir); }
+    let _ = fs::write(&path, b"settings\n");
+}
+
+/// Consume a pending Settings request, if one is waiting. Removing the file
+/// is the claim, as with `take_capture_request`.
+pub fn take_settings_request() -> bool {
+    let Some(path) = settings_request_path() else { return false };
     fs::remove_file(path).is_ok()
 }
 

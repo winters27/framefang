@@ -189,7 +189,7 @@ pub fn blocks_typing(hk: &Hotkey) -> bool {
     !bindable_alone(hk.virtual_key) && !hk.modifiers.intersects(typing_safe_modifiers())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppSettings {
     #[serde(rename = "LastTool", default = "default_tool")]
     pub last_tool: String,
@@ -292,7 +292,15 @@ pub struct AppSettings {
     /// per-tool slider mutates this and persists it on mouseup.
     #[serde(rename = "MarkerOpacity", default = "default_marker_opacity")]
     pub marker_opacity: u8,
+
+    /// The sound a recording started from the tray menu takes: "None",
+    /// "Mic", "PC" (what the computer plays) or "Both". Chosen with the
+    /// menu's Sound chips.
+    #[serde(rename = "RecordSound", default = "default_record_sound")]
+    pub record_sound: String,
 }
+
+fn default_record_sound() -> String { "None".to_owned() }
 
 impl Default for AppSettings {
     fn default() -> Self {
@@ -321,6 +329,7 @@ impl Default for AppSettings {
             palette_index:       0,
             theme:               default_theme(),
             marker_opacity:      default_marker_opacity(),
+            record_sound:        default_record_sound(),
         }
     }
 }
@@ -396,7 +405,7 @@ fn default_hotkey_modifiers_flags() -> Modifiers {
     Modifiers::from_bits_truncate(default_hotkey_modifiers())
 }
 
-/// The dialogs' color scheme by name (Pink, Green, Cyan, Yellow). Older
+/// The dialogs' color scheme by name (Pink, Green, Cyan, Yellow, Orange). Older
 /// files hold "Light" or "Dark", which the app reads as Pink.
 fn default_theme()       -> String  { "Pink".to_owned() }
 fn default_marker_opacity() -> u8 { 0xC8 }
@@ -452,24 +461,93 @@ impl AppSettings {
         Self::config_dir().map(|d| d.join("settings.json"))
     }
 
-    /// Load settings; missing or malformed file silently returns `Default`.
+    /// Load settings; a missing file gives `Default`. See [`Self::load_reporting`]
+    /// for a file that doesn't parse.
+    pub fn load() -> AppSettings {
+        Self::load_reporting().0
+    }
+
+    /// Load settings, and say what went wrong when `settings.json` exists
+    /// but doesn't parse (a hand edit with a typo). Such a file is copied to
+    /// `settings.broken.json` first, so the next save can't overwrite the
+    /// only copy of the user's text, and the app runs on defaults.
     ///
     /// The first run after the rename finds no file here; it reads the one
     /// the app kept under its old name instead (`org/kashot/Kashot`) and
     /// saves a copy here, so hotkeys, folders and tool styles carry over.
     /// The old file is left in place.
-    pub fn load() -> AppSettings {
-        let Some(path) = Self::settings_path() else { return AppSettings::default(); };
+    pub fn load_reporting() -> (AppSettings, Option<String>) {
+        let Some(path) = Self::settings_path() else { return (AppSettings::default(), None); };
         match fs::read_to_string(&path) {
-            Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+            Ok(s) => match Self::parse(&s) {
+                Ok(settings) => (settings, None),
+                Err(e) => {
+                    let kept = path.with_file_name("settings.broken.json");
+                    let note = match fs::copy(&path, &kept) {
+                        Ok(_) => format!("settings.json couldn't be read ({e}). Frame Fang started with \
+                                          the defaults and kept your file as settings.broken.json."),
+                        Err(_) => format!("settings.json couldn't be read ({e}). Frame Fang started with \
+                                           the defaults."),
+                    };
+                    (AppSettings::default(), Some(note))
+                }
+            },
             Err(_) => match Self::pre_rename_settings() {
                 Some(s) => {
                     let _ = s.save();
-                    s
+                    (s, None)
                 }
-                None => AppSettings::default(),
+                None => (AppSettings::default(), None),
             },
         }
+    }
+
+    /// Settings from JSON text. Missing fields take their defaults; anything
+    /// that isn't JSON, or a field of the wrong kind, is an error naming the
+    /// line and column.
+    pub fn parse(text: &str) -> Result<AppSettings, String> {
+        serde_json::from_str(text).map_err(|e| e.to_string())
+    }
+
+    /// Settings read from a file the user picked (Import in Settings).
+    pub fn read_from(path: &std::path::Path) -> Result<AppSettings, String> {
+        let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
+        if text.trim().is_empty() { return Err("the file is empty".to_owned()); }
+        Self::parse(&text)
+    }
+
+    /// Save only what the capture editor remembers (tools, colors, sizes,
+    /// the capture mode) into `settings.json` as it is on disk now. The
+    /// editor holds a copy of the settings from when it opened; saving all
+    /// of it would undo anything changed in Settings, or in the file, since.
+    /// A file that doesn't parse is left alone for the user to fix.
+    pub fn save_editor_fields(&self) -> io::Result<()> {
+        let mut on_disk = match Self::settings_path().map(fs::read_to_string) {
+            Some(Ok(text)) => Self::parse(&text).map_err(io::Error::other)?,
+            _ => AppSettings::default(),
+        };
+        self.copy_editor_fields_to(&mut on_disk);
+        on_disk.save()
+    }
+
+    /// The fields the capture editor owns, copied onto `to`.
+    pub fn copy_editor_fields_to(&self, to: &mut AppSettings) {
+        to.last_tool       = self.last_tool.clone();
+        to.last_color_argb = self.last_color_argb;
+        to.last_thickness  = self.last_thickness;
+        to.last_text_size  = self.last_text_size;
+        to.pixelate_block  = self.pixelate_block;
+        to.tool_styles     = self.tool_styles.clone();
+        to.palette_index   = self.palette_index;
+        to.marker_opacity  = self.marker_opacity;
+        to.capture_mode    = self.capture_mode.clone();
+    }
+
+    /// These settings written to a file the user picked (Export in Settings),
+    /// in the same form as `settings.json`.
+    pub fn write_to(&self, path: &std::path::Path) -> io::Result<()> {
+        let json = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
+        crate::atomic_file::write_atomic(path, json.as_bytes())
     }
 
     /// The settings file from before the app was renamed, if one exists and
@@ -528,6 +606,38 @@ mod tests {
         assert_eq!(s.last_tool, s2.last_tool);
         assert_eq!(s.last_color_argb, s2.last_color_argb);
         assert_eq!(s.hotkey_virtual_key, s2.hotkey_virtual_key);
+        assert_eq!(s, s2, "every field survives the trip");
+    }
+
+    #[test]
+    fn a_hand_edit_with_a_typo_is_an_error_that_names_the_line() {
+        let e = AppSettings::parse("{\n  \"Theme\": \"Orange\",\n  \"AutoCopy\": nope,\n  \"OpenEditor\": true\n}").unwrap_err();
+        assert!(e.contains("line 3"), "{e}");
+        let e = AppSettings::parse("{ \"AutoCopy\": \"yes\" }").unwrap_err();
+        assert!(e.contains("line 1"), "a field of the wrong kind is refused: {e}");
+    }
+
+    #[test]
+    fn a_partial_file_fills_the_rest_with_defaults() {
+        let s = AppSettings::parse("{ \"Theme\": \"Orange\" }").unwrap();
+        assert_eq!(s.theme, "Orange");
+        assert_eq!(AppSettings { theme: "Pink".into(), ..s }, AppSettings::default());
+    }
+
+    #[test]
+    fn export_then_import_gives_the_same_settings() {
+        let dir = std::env::temp_dir().join(format!("ff-settings-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("exported.json");
+        let mut s = AppSettings::default();
+        s.theme = "Orange".into();
+        s.auto_copy = true;
+        s.record_sound = "Both".into();
+        s.write_to(&path).unwrap();
+        assert_eq!(AppSettings::read_from(&path).unwrap(), s);
+        std::fs::write(&path, "").unwrap();
+        assert!(AppSettings::read_from(&path).is_err(), "an empty file is refused");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
