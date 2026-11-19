@@ -39,6 +39,11 @@ on:
 permissions:
   contents: read
 
+# A runner that briefly can't reach crates.io (1.5.0's Intel Mac build
+# failed on a DNS blip) gets more tries before the build gives up.
+env:
+  CARGO_NET_RETRY: 10
+
 jobs:
   windows:
     name: Windows x86_64
@@ -301,14 +306,20 @@ jobs:
           ls -l
           sha256sum $(find . -maxdepth 1 -type f -printf '%f\n' | sort) > SHA256SUMS && cat SHA256SUMS
 
-      - name: Create the release
+      # A rerun (say, of a platform that failed) finds the release already
+      # there and adds or replaces its files, SHA256SUMS included.
+      - name: Create or update the release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" assets/* --clobber
+            exit 0
+          fi
           notes="release-notes/${TAG}.md"
-          if [ -f "$notes" ]; then set -- --notes-file "$notes"; else set -- --notes "Framefang ${TAG}"; fi
+          if [ -f "$notes" ]; then set -- --notes-file "$notes"; else set -- --notes "Frame Fang ${TAG}"; fi
           gh release create "$TAG" \
-            --title "Framefang ${TAG}" \
+            --title "Frame Fang ${TAG}" \
             "$@" \
             assets/*
