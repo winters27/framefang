@@ -49,6 +49,21 @@ const ROW_PX: f32 = 13.5;
 const SMALL_PX: f32 = 12.0;
 /// Space between the menu and the taskbar or the screen's edge.
 const GAP: i32 = 10;
+/// The footer row that ends the app, typed like a shell command in the pixel
+/// font (Brandon picked it, 2026-11-19). It names the app, so it can't be read
+/// as "close this menu" the way a bare "Exit" was.
+const QUIT: &str = "> KILL FRAME_FANG";
+/// The block cursor after it while hovered: its width, and how long it stays
+/// on and off.
+const CURSOR_W: i32 = 5;
+/// Space before the cursor: a letter gap and a bit, so it reads as a cursor
+/// and not as part of the last letter.
+const CURSOR_GAP: i32 = 3;
+const BLINK: Duration = Duration::from_millis(500);
+
+fn quit_w() -> i32 {
+    crate::bitmap_font::measure(QUIT, 1) + CURSOR_GAP + CURSOR_W
+}
 
 /// What the menu shows: the keys as set in Settings and what is going on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,8 +197,10 @@ fn layout(s: &MenuState) -> Layout {
     let about_w = text_w("About") + 2 * (TEXT_X - INSET);
     l.items.push(Item { kind: Kind::Footer, rect: (INSET, fy, about_w, fh), label: "About", hint: None,
                         act: Act::Run(TrayEvent::About), enabled: true });
-    let exit_w = text_w("Exit") + 2 * (TEXT_X - INSET);
-    l.items.push(Item { kind: Kind::Footer, rect: (W - INSET - exit_w, fy, exit_w, fh), label: "Exit", hint: None,
+    // Named in full: a bare "Exit" at the foot of a popup reads as "close
+    // this menu", and Brandon quit the app that way (2026-11-19).
+    let exit_w = quit_w() + 2 * (TEXT_X - INSET);
+    l.items.push(Item { kind: Kind::Footer, rect: (W - INSET - exit_w, fy, exit_w, fh), label: QUIT, hint: None,
                         act: Act::Run(TrayEvent::Exit), enabled: true });
     l.h = y + FOOTER_H;
     l
@@ -209,6 +226,11 @@ pub struct TrayMenu {
     state: MenuState,
     layout: Layout,
     hover: Option<usize>,
+    /// When `hover` last changed: the quit row's cursor blinks from then.
+    hover_since: Instant,
+    /// Whether the last frame drew that cursor, so `tick` redraws only
+    /// when it flips.
+    drawn_cursor: bool,
     /// Focus came at least once, so losing it means the user went elsewhere.
     had_focus: bool,
     /// The foreground window when the menu opened (the taskbar), for the
@@ -250,7 +272,7 @@ impl TrayMenu {
         let surface = Surface::new(&ctx, window.clone()).map_err(|e| anyhow!("softbuffer Surface::new (tray menu): {e}"))?;
         let mut me = TrayMenu {
             window, _ctx: ctx, surface, state, layout: lay,
-            hover: None, had_focus: false,
+            hover: None, hover_since: Instant::now(), drawn_cursor: false, had_focus: false,
             #[cfg(windows)]
             fg_at_open: foreground(),
             opened: Instant::now(),
@@ -270,6 +292,7 @@ impl TrayMenu {
     /// Close when the user went to another window although the menu never
     /// had focus (Windows can refuse it to a background app).
     pub fn tick(&mut self) {
+        if self.cursor_on() != self.drawn_cursor { self.window.request_redraw(); }
         #[cfg(windows)]
         if !self.had_focus && self.outcome.is_none() && self.opened.elapsed() > Duration::from_millis(150) {
             let fg = foreground();
@@ -334,9 +357,16 @@ impl TrayMenu {
         })
     }
 
+    /// The quit row is hovered and its cursor is in an "on" half-second.
+    fn cursor_on(&self) -> bool {
+        let quit = self.hover.and_then(|i| self.layout.items.get(i)).is_some_and(|it| it.label == QUIT);
+        quit && (self.hover_since.elapsed().as_millis() / BLINK.as_millis()) % 2 == 0
+    }
+
     fn set_hover(&mut self, h: Option<usize>) {
         if h != self.hover {
             self.hover = h;
+            self.hover_since = Instant::now();
             self.window.request_redraw();
         }
     }
@@ -373,8 +403,10 @@ impl TrayMenu {
         let phys = self.window.inner_size();
         let (Some(w), Some(h)) = (NonZeroU32::new(phys.width), NonZeroU32::new(phys.height)) else { return; };
         if self.surface.resize(w, h).is_err() { return; }
+        self.drawn_cursor = self.cursor_on();
         let Ok(mut buf) = self.surface.buffer_mut() else { return; };
-        draw(&mut buf, w.get() as usize, h.get() as usize, &self.layout, self.hover, self.state.sound);
+        draw(&mut buf, w.get() as usize, h.get() as usize, &self.layout, self.hover, self.state.sound,
+             self.drawn_cursor);
         let _ = buf.present();
     }
 }
@@ -403,7 +435,8 @@ fn text(buf: &mut [u32], w: usize, h: usize, x: f32, y: i32, band_h: i32, px: f3
     crate::painter::draw_unicode_text(&mut s, x, ty, px, t, rgba(c));
 }
 
-fn draw(buf: &mut [u32], w: usize, h: usize, l: &Layout, hover: Option<usize>, sound: RecordingOptions) {
+fn draw(buf: &mut [u32], w: usize, h: usize, l: &Layout, hover: Option<usize>, sound: RecordingOptions,
+        cursor_on: bool) {
     crate::hud::backdrop(buf, w, h, HEADER_H);
     crate::hud::heading(buf, w, h, PAD, 18, "FRAME FANG");
     {
@@ -459,9 +492,24 @@ fn draw(buf: &mut [u32], w: usize, h: usize, l: &Layout, hover: Option<usize>, s
                 let tw = framefang_core::text::line_width(it.label, SMALL_PX);
                 text(buf, w, h, x as f32 + (iw as f32 - tw) / 2.0, y, ih, SMALL_PX, it.label, fg);
             }
+            Kind::Footer if it.label == QUIT => {
+                if hot { fill(buf, w, h, it.rect, HOVER_FILL()); }
+                let (tx, ty) = (x + (iw - quit_w()) / 2, y + (ih - crate::bitmap_font::GLYPH_H) / 2);
+                if hot {
+                    // Lit like a heading, with the cursor blinking after it.
+                    crate::hud::glow_text(buf, w, h, tx, ty, 1, 3, QUIT);
+                    if cursor_on {
+                        let cx = tx + crate::bitmap_font::measure(QUIT, 1) + CURSOR_GAP;
+                        fill(buf, w, h, (cx, ty, CURSOR_W, crate::bitmap_font::GLYPH_H), LASER());
+                    }
+                } else {
+                    let mut s = crate::painter::U32Surface { buf: &mut *buf, stride: w as i32, height: h as i32 };
+                    crate::painter::draw_text(&mut s, tx, ty, 1, QUIT, rgba(TEXT_MUTED()));
+                }
+            }
             Kind::Footer => {
                 if hot { fill(buf, w, h, it.rect, HOVER_FILL()); }
-                let c = if hot && it.label == "Exit" { LASER() } else if hot { TEXT_BRIGHT } else { TEXT_MUTED() };
+                let c = if hot { TEXT_BRIGHT } else { TEXT_MUTED() };
                 let tw = framefang_core::text::line_width(it.label, SMALL_PX);
                 text(buf, w, h, x as f32 + (iw as f32 - tw) / 2.0, y, ih, SMALL_PX, it.label, c);
             }
@@ -574,12 +622,13 @@ mod tests {
         let l = layout(&st);
         let hovered = l.items.iter().position(|i| i.label == "Capture full screen");
         let chip = l.items.iter().position(|i| i.label == "5s");
+        let quit = l.items.iter().position(|i| i.label == QUIT);
         for scheme in crate::palette::Scheme::ALL {
             crate::palette::set(scheme);
-            for (tag, hover) in [("plain", None), ("row", hovered), ("chip", chip)] {
+            for (tag, hover) in [("plain", None), ("row", hovered), ("chip", chip), ("quit", quit)] {
                 let (w, h) = (W as usize, l.h as usize);
                 let mut buf = vec![0u32; w * h];
-                draw(&mut buf, w, h, &l, hover, st.sound);
+                draw(&mut buf, w, h, &l, hover, st.sound, true);
                 let img = image::RgbImage::from_fn(w as u32, h as u32, |x, y| {
                     let p = buf[y as usize * w + x as usize];
                     image::Rgb([(p >> 16) as u8, (p >> 8) as u8, p as u8])

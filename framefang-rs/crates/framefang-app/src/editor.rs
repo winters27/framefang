@@ -344,6 +344,38 @@ const FLYOUT_OPEN: std::time::Duration = std::time::Duration::from_millis(170);
 const COPIED_NOTICE: std::time::Duration = std::time::Duration::from_millis(1400);
 
 /// The draggable track inside a row, between the label and the readout.
+#[cfg(windows)]
+fn hwnd_of(window: &Window) -> Option<windows::Win32::Foundation::HWND> {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match window.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(h) => Some(windows::Win32::Foundation::HWND(h.hwnd.get() as *mut core::ffi::c_void)),
+        _ => None,
+    }
+}
+
+/// Make `hwnd` the window with the keyboard. Windows lets the app that owns
+/// the foreground window hand it over, so for the call this thread shares
+/// that window's input state (`AttachThreadInput`), which a plain
+/// `SetForegroundWindow` from a background app is often refused without.
+#[cfg(windows)]
+fn force_foreground(hwnd: windows::Win32::Foundation::HWND) {
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow,
+    };
+    unsafe {
+        let fg = GetForegroundWindow();
+        let theirs = if fg.is_invalid() { 0 } else { GetWindowThreadProcessId(fg, None) };
+        let ours = GetCurrentThreadId();
+        let attached = theirs != 0 && theirs != ours && AttachThreadInput(ours, theirs, true).as_bool();
+        let _ = BringWindowToTop(hwnd);
+        let _ = SetForegroundWindow(hwnd);
+        let _ = SetFocus(Some(hwnd));
+        if attached { let _ = AttachThreadInput(ours, theirs, false); }
+    }
+}
+
 fn flyout_track((rx, ry, rw, rh): (i32, i32, i32, i32)) -> (i32, i32, i32, i32) {
     let tx = rx + FLYOUT_LABEL_W;
     (tx, ry + (rh - FLYOUT_TRACK_H) / 2, rw - FLYOUT_LABEL_W - FLYOUT_VALUE_W, FLYOUT_TRACK_H)
@@ -689,6 +721,12 @@ pub struct Overlay {
     /// cloaked and is uncloaked after its first frame (`reveal`); on X11 the
     /// editor window starts hidden and is shown once it has been cut to shape.
     shown: bool,
+    /// Esc was down at the last `guard_focus`, so one press counts once.
+    esc_down: bool,
+    /// An answer `guard_focus` reached without a window event (Esc pressed
+    /// while another window had the keyboard), handed back by the next
+    /// `handle_event` so the tray closes it through its usual path.
+    pending_outcome: Option<OverlayOutcome>,
     /// The capture's hold key was down when the hotkey fired, so this
     /// capture does the opposite of the After-a-capture setting.
     pub hold_at_press: bool,
@@ -854,6 +892,35 @@ impl Overlay {
         self.show_palette_of_color();
         self.save_knobs();
         self.window.focus_window();
+    }
+
+    /// Windows: keep the keyboard on a full-screen capture window (the
+    /// picker, the record-region picker, the color pick). Called every tray
+    /// tick. Windows can refuse focus to a window a background app opens, and
+    /// then Esc went to whatever was behind the frozen screen, which stayed
+    /// up (Brandon 2026-11-19). So, while another window has the keyboard:
+    /// for its first 2 s the window claims focus again, and an Esc pressed
+    /// anywhere is answered as if it had reached the window. The editor
+    /// window is an ordinary window the user may leave, so it is left alone.
+    #[cfg(windows)]
+    pub fn guard_focus(&mut self) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE};
+        if self.editor_mode || self.pending_outcome.is_some() { return; }
+        let esc = unsafe { (GetAsyncKeyState(VK_ESCAPE.0 as i32) as u16 & 0x8000) != 0 };
+        let pressed = esc && !self.esc_down;
+        self.esc_down = esc;
+        let Some(hwnd) = hwnd_of(&self.window) else { return };
+        if unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() } == hwnd { return; }
+        if self.opened_at.elapsed() < std::time::Duration::from_secs(2) {
+            force_foreground(hwnd);
+        }
+        if pressed {
+            let out = self.handle_key(Key::Named(NamedKey::Escape));
+            if !matches!(out, OverlayOutcome::Continue) {
+                self.pending_outcome = Some(out);
+            }
+            self.window.request_redraw();
+        }
     }
 
     /// The color-pick session was cancelled: the eyedropper goes down.
@@ -1164,6 +1231,8 @@ impl Overlay {
             editor_mode: false,
             shape: Vec::new(),
             shown: !cloak && (windowed.is_none() || !crate::window_shape::supported()),
+            esc_down: false,
+            pending_outcome: None,
             hold_at_press: false,
             video_mode,
             record_mode: false,
@@ -1598,6 +1667,7 @@ impl Overlay {
     }
 
     pub fn handle_event(&mut self, event: WindowEvent) -> OverlayOutcome {
+        if let Some(out) = self.pending_outcome.take() { return out; }
         match event {
             WindowEvent::CloseRequested => self.request_close(),
 

@@ -78,8 +78,14 @@ pub fn header_rule(buf: &mut [u32], w: usize, h: usize, y: i32) {
 /// A window's heading at `(x, y)` in the scale-2 pixel font, in the accent,
 /// with a soft neon glow of the same color behind it.
 pub fn heading(buf: &mut [u32], w: usize, h: usize, x: i32, y: i32, text: &str) {
-    const SCALE: i32 = 2;
-    const R: i32 = 5; // glow radius
+    glow_text(buf, w, h, x, y, 2, 5, text);
+}
+
+/// Pixel-font `text` at `scale` in the accent, with a neon glow of radius
+/// `r` behind it. `heading` is this at scale 2.
+#[allow(non_snake_case)]
+pub fn glow_text(buf: &mut [u32], w: usize, h: usize, x: i32, y: i32, scale: i32, r: i32, text: &str) {
+    let (SCALE, R) = (scale, r);
     let accent = LASER();
     let tw = crate::bitmap_font::measure(text, SCALE);
     let th = crate::bitmap_font::GLYPH_H * SCALE;

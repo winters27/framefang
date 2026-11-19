@@ -272,6 +272,13 @@ pub fn run() -> Result<()> {
             if let Some(c) = click { self.tray_clicked(c, loop_target); }
             if let Some(m) = self.tray_menu.as_mut() { m.tick(); }
             self.finish_tray_menu(loop_target);
+            // A full-screen capture window keeps the keyboard, and hears Esc
+            // even when Windows gave the keyboard to something else.
+            #[cfg(windows)]
+            {
+                if let Some(ov) = self.overlay.as_mut() { ov.guard_focus(); }
+                if let Some(c) = self.color_pick.as_mut() { c.guard_focus(); }
+            }
             // An open Settings window follows the FFmpeg download's progress.
             if let Some(v) = self.settings_view.as_mut() { v.tick(); }
             // Collected before dispatch so the manager borrow is done with

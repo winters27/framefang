@@ -174,7 +174,8 @@ impl Tray {
         let settings  = MenuItem::new("Settings",          true,  None);
         let about     = MenuItem::new("About",             true,  None);
         let updates   = MenuItem::new("Check for updates", true,  None);
-        let exit      = MenuItem::new("Exit",              true,  None);
+        // In full, so it can't be read as "close this menu".
+        let exit      = MenuItem::new("Quit Frame Fang",   true,  None);
 
         let capture_id  = capture.id().clone();
         let capture_full_id = capture_full.id().clone();
