@@ -47,7 +47,7 @@ jobs:
       run:
         working-directory: framefang-rs
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with: { workspaces: framefang-rs }
@@ -97,7 +97,7 @@ jobs:
                     --include wix\main.wxs `
                     --output dist\Framefang.msi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: framefang-windows
           path: |
@@ -119,7 +119,7 @@ jobs:
       run:
         working-directory: framefang-rs
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with: { workspaces: framefang-rs }
@@ -155,7 +155,7 @@ jobs:
           cp ../icons/linux_hicolor/256x256/apps/framefang.png dist/framefang/
           tar -czf "dist/Framefang-linux-${{ matrix.arch }}-portable.tar.gz" -C dist framefang
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: framefang-linux-${{ matrix.arch }}
           path: framefang-rs/dist/Framefang-linux-${{ matrix.arch }}-portable.tar.gz
@@ -167,9 +167,9 @@ jobs:
     needs: linux
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: framefang-linux-x86_64
           path: dl
@@ -201,7 +201,7 @@ jobs:
           ARCH=x86_64 ./appimagetool --appimage-extract-and-run \
             Framefang.AppDir Framefang-linux-x86_64.AppImage
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: framefang-linux-appimage
           path: Framefang-linux-x86_64.AppImage
@@ -223,7 +223,7 @@ jobs:
       run:
         working-directory: framefang-rs
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -271,7 +271,7 @@ jobs:
           if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then exit "$rc"; fi
           test -f "dist/Framefang-macos-${{ matrix.label }}.dmg"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: framefang-macos-${{ matrix.label }}
           path: framefang-rs/dist/Framefang-macos-${{ matrix.label }}.dmg
@@ -286,11 +286,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Into `assets`, not `dist`: the checkout has its own dist/ (the macOS
       # and Linux packaging scripts), and hashing that broke 1.4.0's publish.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: assets
           merge-multiple: true
