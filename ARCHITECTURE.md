@@ -33,17 +33,22 @@ Linux build deps (CI installs these — see `.github/workflows/build-rust.yml`):
 Windows + macOS need no extra system packages.
 
 CI: a tagged push to `v*` runs `.github/workflows/release.yml`, which builds on
-Windows and attaches these to the GitHub Release, each as its own file (nothing
-zipped):
+Windows, macOS and Linux and attaches these to the GitHub Release, each as its
+own file:
 
-- `Framefang.msi`: the installer
-- `Framefang-portable.exe`: the app itself, to run without installing
+- `Framefang.msi`: the Windows installer
+- `Framefang-portable.exe`: Windows, to run without installing
+- `Framefang-macos-arm64.dmg` / `Framefang-macos-x64.dmg`: the macOS app
+  (`dist/macos/make-app.sh`), not yet signed or notarized
+- `Framefang-linux-x86_64.AppImage`: Linux, one file to run
+- `Framefang-linux-x86_64-portable.tar.gz` / `Framefang-linux-arm64-portable.tar.gz`:
+  the bare Linux binary (a tarball keeps its executable bit)
 - `SHA256SUMS`: the checksums the in-app updater verifies
 
-There are no macOS or Linux release builds yet. The updater already knows the
-names it would look for there (`updates_form.rs`, `pick_asset_url`): a Linux
-`framefang-linux-<arch>.tar.gz` or AppImage, and a macOS
-`framefang-macos-<arch>-update.tar.gz`.
+Windows is required for a release; a failed macOS or Linux job leaves its files
+out and shows red in the run. Running the workflow by hand from the Actions tab
+builds everything as artifacts and publishes nothing. The in-app updater finds
+its file by these names (`updates_form.rs`, `pick_asset_url`).
 
 macOS deliberately ships no bare Mach-O asset: a binary downloaded through a
 browser is quarantined and can't be launched from Finder, so the `.dmg` is the

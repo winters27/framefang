@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Framefang
+GenericName=Screenshot Tool
+Comment=Capture, annotate, paste
+Exec=framefang
+Icon=framefang
+Categories=Graphics;Utility;
+StartupNotify=false
+Terminal=false
+Keywords=screenshot;capture;annotate;screen recorder;tray;

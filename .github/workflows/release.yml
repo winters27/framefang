@@ -1,4 +1,4 @@
-# Build Framefang for Windows and publish a GitHub Release.
+# Build Framefang for Windows, macOS and Linux and publish a GitHub Release.
 #
 # Runs when a version tag (v1.2.3) is pushed, and by hand from the Actions tab
 # (a hand run builds and keeps the files as workflow artifacts, but publishes
@@ -6,15 +6,26 @@
 #
 # Release assets, named the way the in-app updater looks for them
 # (crates/framefang-app/src/updates_form.rs, pick_asset_url):
-#   Framefang.msi                  installer (WiX 3, per-machine)
-#   Framefang-portable.exe         portable: the app itself, nothing to unzip
-#   SHA256SUMS                     sha256 of each asset, checked before install
+#   Framefang.msi                            Windows installer (WiX 3, per-machine)
+#   Framefang-portable.exe                   Windows, no install: the app itself
+#   Framefang-macos-arm64.dmg                macOS, Apple silicon
+#   Framefang-macos-x64.dmg                  macOS, Intel
+#   Framefang-linux-x86_64.AppImage          Linux, one file to run
+#   Framefang-linux-x86_64-portable.tar.gz   Linux, the bare binary
+#   Framefang-linux-arm64-portable.tar.gz    Linux on ARM, the bare binary
+#   SHA256SUMS                               sha256 of each asset
 #
-# Every asset is published loose, never zipped: the portable build is a single
-# exe, so a zip around it only added a step. (Up to 1.3.0 it shipped as
+# Assets are published loose. The only archives are the Linux portables: a
+# bare Linux binary downloaded in a browser loses its executable bit, and the
+# tarball keeps it. (Up to 1.3.0 the Windows portable was a zip,
 # framefang-windows-x86_64.zip; the updater still accepts that name.)
 #
-# FFmpeg is not bundled: recording and conversion use the user's own ffmpeg.
+# Windows is the release: the macOS and Linux jobs may fail without stopping
+# it, and the release then carries whatever did build (a failed job shows red
+# in the run).
+#
+# FFmpeg is not bundled: recording and conversion use the user's own ffmpeg,
+# or the build Framefang downloads on Windows.
 #
 # Release notes come from release-notes/<tag>.md when that file exists.
 
@@ -94,10 +105,183 @@ jobs:
             framefang-rs/dist/Framefang-portable.exe
           if-no-files-found: error
 
+  # ── Linux: the bare binary as a tarball, on x86_64 and ARM ─────────────────
+  linux:
+    name: Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-latest }
+          - { arch: arm64,  runner: ubuntu-24.04-arm }
+    defaults:
+      run:
+        working-directory: framefang-rs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: framefang-rs }
+
+      # X11 / Wayland windows and capture, the GTK tray, D-Bus portals,
+      # PipeWire screen recording (bindgen needs clang), udev, and xdo for
+      # the global hotkeys.
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwayland-dev libxkbcommon-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxcb-composite0-dev libxcb-randr0-dev libxcb-cursor-dev \
+            libxcb-keysyms1-dev libxcb-icccm4-dev \
+            libgtk-3-dev libdbus-1-dev libayatana-appindicator3-dev \
+            libpipewire-0.3-dev libspa-0.2-dev libclang-dev clang \
+            libgbm-dev libudev-dev libxdo-dev libssl-dev pkg-config
+
+      - name: Test
+        run: cargo test --workspace --release
+
+      - name: Build
+        run: cargo build --release --bin framefang
+
+      - name: Stage the portable tarball
+        run: |
+          set -eux
+          mkdir -p dist/framefang
+          cp target/release/framefang dist/framefang/
+          chmod +x dist/framefang/framefang
+          cp ../dist/linux/framefang.desktop dist/framefang/
+          cp ../icons/linux_hicolor/256x256/apps/framefang.png dist/framefang/
+          tar -czf "dist/Framefang-linux-${{ matrix.arch }}-portable.tar.gz" -C dist framefang
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: framefang-linux-${{ matrix.arch }}
+          path: framefang-rs/dist/Framefang-linux-${{ matrix.arch }}-portable.tar.gz
+          if-no-files-found: error
+
+  # ── Linux AppImage, repackaged from the x86_64 tarball ─────────────────────
+  appimage:
+    name: Linux AppImage
+    needs: linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: framefang-linux-x86_64
+          path: dl
+
+      - name: Get appimagetool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends file desktop-file-utils libfuse2
+          wget -q -O appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+
+      - name: Assemble the AppDir
+        run: |
+          set -eux
+          tar -xzf dl/Framefang-linux-x86_64-portable.tar.gz -C dl
+          APPDIR=Framefang.AppDir
+          install -Dm0755 dl/framefang/framefang "$APPDIR/usr/bin/framefang"
+          install -Dm0755 dist/appimage/AppRun "$APPDIR/AppRun"
+          install -Dm0644 dist/linux/framefang.desktop "$APPDIR/usr/share/applications/framefang.desktop"
+          cp dist/linux/framefang.desktop "$APPDIR/framefang.desktop"
+          install -Dm0644 icons/linux_hicolor/256x256/apps/framefang.png \
+            "$APPDIR/usr/share/icons/hicolor/256x256/apps/framefang.png"
+          cp icons/linux_hicolor/256x256/apps/framefang.png "$APPDIR/framefang.png"
+          cp "$APPDIR/framefang.png" "$APPDIR/.DirIcon"
+
+      - name: Build the AppImage
+        run: |
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run \
+            Framefang.AppDir Framefang-linux-x86_64.AppImage
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: framefang-linux-appimage
+          path: Framefang-linux-x86_64.AppImage
+          if-no-files-found: error
+
+  # ── macOS: Framefang.app in a drag-to-Applications .dmg ────────────────────
+  # Not signed or notarized: the first launch goes through System Settings >
+  # Privacy & Security > Open Anyway.
+  macos:
+    name: macOS ${{ matrix.label }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, label: arm64 }
+          - { target: x86_64-apple-darwin,  label: x64 }
+    defaults:
+      run:
+        working-directory: framefang-rs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: framefang-rs }
+
+      # The runner is Apple silicon, so only the arm64 build can run tests.
+      - name: Test
+        if: matrix.label == 'arm64'
+        run: cargo test --workspace --release
+
+      - name: Build
+        run: cargo build --release --bin framefang --target ${{ matrix.target }}
+
+      - name: Version
+        id: ver
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then v="${GITHUB_REF_NAME#v}"
+          else v=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1); fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Assemble Framefang.app
+        run: |
+          sh ../dist/macos/make-app.sh \
+            --binary "target/${{ matrix.target }}/release/framefang" \
+            --version "${{ steps.ver.outputs.version }}" \
+            --arch "${{ matrix.label }}" \
+            --out-dir dist
+
+      # create-dmg exits 2 on the harmless "couldn't detach" warning hosted
+      # runners give; anything else is a failure.
+      - name: Build the .dmg
+        run: |
+          brew install create-dmg
+          set +e
+          create-dmg \
+            --volname "Framefang" \
+            --window-size 500 320 \
+            --icon-size 96 \
+            --icon "Framefang.app" 125 125 \
+            --app-drop-link 375 125 \
+            "dist/Framefang-macos-${{ matrix.label }}.dmg" \
+            "dist/Framefang.app"
+          rc=$?
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then exit "$rc"; fi
+          test -f "dist/Framefang-macos-${{ matrix.label }}.dmg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: framefang-macos-${{ matrix.label }}
+          path: framefang-rs/dist/Framefang-macos-${{ matrix.label }}.dmg
+          if-no-files-found: error
+
+  # ── Publish: Windows must have built; the rest go out if they did ──────────
   release:
     name: Publish release
-    needs: windows
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [ windows, linux, appimage, macos ]
+    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.windows.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -106,12 +290,14 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: framefang-windows
           path: dist
+          merge-multiple: true
 
       - name: Checksums
         working-directory: dist
-        run: sha256sum Framefang.msi Framefang-portable.exe > SHA256SUMS && cat SHA256SUMS
+        run: |
+          ls -l
+          sha256sum $(ls | sort) > SHA256SUMS && cat SHA256SUMS
 
       - name: Create the release
         env:
@@ -123,4 +309,4 @@ jobs:
           gh release create "$TAG" \
             --title "Framefang ${TAG}" \
             "$@" \
-            dist/Framefang.msi dist/Framefang-portable.exe dist/SHA256SUMS
+            dist/*

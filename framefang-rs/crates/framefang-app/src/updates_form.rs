@@ -783,16 +783,18 @@ fn pick_asset_url(assets: &[RawAsset], channel: InstallChannel) -> Option<String
         }
     }
 
+    // Release asset names (`.github/workflows/release.yml`), matched without
+    // regard to case.
     let needle: &str = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        "framefang-linux-x86_64.tar.gz"
+        "framefang-linux-x86_64-portable.tar.gz"
     } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
-        "framefang-linux-arm64.tar.gz"
+        "framefang-linux-arm64-portable.tar.gz"
     } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        // The updater payload, not the .dmg: an update replaces only the
-        // binary inside an already-installed Framefang.app.
-        "framefang-macos-arm64-update.tar.gz"
+        // The .dmg: a Mac app bundle updates through the browser, so the
+        // user gets the same installer as a first download.
+        "framefang-macos-arm64.dmg"
     } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        "framefang-macos-x64-update.tar.gz"
+        "framefang-macos-x64.dmg"
     } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
         // The portable exe, published loose since 1.3.1; releases up to
         // 1.3.0 zipped it.
@@ -804,7 +806,7 @@ fn pick_asset_url(assets: &[RawAsset], channel: InstallChannel) -> Option<String
         return None;
     };
     assets.iter()
-        .find(|a| a.name.contains(needle))
+        .find(|a| a.name.to_ascii_lowercase().contains(needle))
         .map(|a| a.browser_download_url.clone())
 }
 
@@ -1069,6 +1071,29 @@ mod tests {
         assert_eq!(update_progress(10, None, "v1.3.1").1, None);
         // Every line is plain ASCII for the bitmap font.
         assert!(line.is_ascii());
+    }
+
+    #[test]
+    fn each_platform_finds_its_own_file_in_a_full_release() {
+        let assets: Vec<RawAsset> = [
+            "Framefang.msi", "Framefang-portable.exe",
+            "Framefang-macos-arm64.dmg", "Framefang-macos-x64.dmg",
+            "Framefang-linux-x86_64.AppImage",
+            "Framefang-linux-x86_64-portable.tar.gz", "Framefang-linux-arm64-portable.tar.gz",
+            "SHA256SUMS",
+        ].iter().map(|n| RawAsset { name: (*n).into(), browser_download_url: format!("https://x/{n}"), size: 1 }).collect();
+        let pick = |c| pick_asset_url(&assets, c).map(|u| u.rsplit('/').next().unwrap().to_owned());
+        if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+            assert_eq!(pick(InstallChannel::WindowsMsi).as_deref(), Some("Framefang.msi"));
+            assert_eq!(pick(InstallChannel::WindowsPortable).as_deref(), Some("Framefang-portable.exe"));
+        }
+        if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            assert_eq!(pick(InstallChannel::AppImage).as_deref(), Some("Framefang-linux-x86_64.AppImage"));
+            assert_eq!(pick(InstallChannel::Portable).as_deref(), Some("Framefang-linux-x86_64-portable.tar.gz"));
+        }
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            assert_eq!(pick(InstallChannel::MacAppBundle).as_deref(), Some("Framefang-macos-arm64.dmg"));
+        }
     }
 
     #[test]
