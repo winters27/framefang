@@ -127,7 +127,7 @@ impl ConvertImageView {
         let win_h = WIN_H + crate::chrome::TITLE_H as u32;
         let (cx, cy) = centered_origin(loop_target, WIN_W, win_h);
         let attrs = crate::chrome::frameless(WindowAttributes::default())
-            .with_title("Framefang — Convert image")
+            .with_title("Frame Fang — Convert image")
             .with_resizable(false)
             .with_inner_size(PhysicalSize::new(WIN_W, win_h))
             .with_position(PhysicalPosition::new(cx, cy))
@@ -445,7 +445,7 @@ impl ConvertImageView {
         let mut surf = BufferSurface { buf: &mut buf, w: win_w as i32, h: win_h as i32 };
 
         // Title.
-        crate::hud::heading(surf.buf, win_w, win_h, PAD, 22, "FRAMEFANG // CONVERT IMAGE");
+        crate::hud::heading(surf.buf, win_w, win_h, PAD, 22, "FRAME FANG // CONVERT IMAGE");
         draw_text(&mut surf, PAD, 50, 1, "Re-encode PNG / JPG / WEBP / BMP without leaving the tray.",
                   argb_to_framefang(TEXT_MUTED()));
 

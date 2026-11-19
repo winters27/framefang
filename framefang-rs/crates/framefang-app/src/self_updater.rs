@@ -89,7 +89,7 @@ fn run(
     let channel = crate::install_source::channel();
     if channel.is_package_managed() {
         return Err(format!(
-            "this Framefang was installed as a {} — update it through that package manager",
+            "this Frame Fang was installed as a {} — update it through that package manager",
             channel.label()
         ));
     }
@@ -589,7 +589,7 @@ fn spawn_and_exit(current_exe: &Path) -> ! {
     if let Err(e) = spawn_res {
         // We've already swapped the binary so the next manual launch
         // will get the new build. Log + die so the user can re-open.
-        eprintln!("self-updater: relaunch failed: {e} — please reopen Framefang");
+        eprintln!("self-updater: relaunch failed: {e} — please reopen Frame Fang");
     }
     std::process::exit(0);
 }
@@ -683,7 +683,7 @@ mod tests {
         assert!(line.contains(r#"start "" /wait msiexec /i "C:\Users\A B\AppData\Local\Temp\framefang-update-1.msi""#), "{line}");
         assert!(line.contains("/passive /norestart"), "progress bar only, no wizard: {line}");
         assert!(line.contains(r#"& start "" "C:\Program Files\Framefang\framefang.exe""#),
-                "reopens Framefang even when the install was declined: {line}");
+                "reopens Frame Fang even when the install was declined: {line}");
     }
 
     #[test]

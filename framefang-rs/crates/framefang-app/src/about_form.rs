@@ -77,7 +77,7 @@ impl AboutView {
         let win_h = WIN_H + crate::chrome::TITLE_H as u32;
         let (cx, cy) = centered_origin(loop_target, WIN_W, win_h);
         let attrs = crate::chrome::frameless(WindowAttributes::default())
-            .with_title("About Framefang")
+            .with_title("About Frame Fang")
             .with_resizable(false)
             .with_inner_size(PhysicalSize::new(WIN_W, win_h))
             .with_position(PhysicalPosition::new(cx, cy))
@@ -225,7 +225,7 @@ impl AboutView {
         let mut surf = BufferSurface { buf: &mut buf, w: win_w as i32, h: win_h as i32 };
 
         // Title strip.
-        crate::hud::heading(surf.buf, win_w, win_h, PAD, 22, "FRAMEFANG // ABOUT");
+        crate::hud::heading(surf.buf, win_w, win_h, PAD, 22, "FRAME FANG // ABOUT");
         // ASCII separator only — bitmap_font.rs ships glyphs for 0x20..=0x7E,
         // so a U+00B7 middle dot would render as `?`.
         let version = format!("v{}  //  the lightweight screenshot tool", env!("CARGO_PKG_VERSION"));

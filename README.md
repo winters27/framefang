@@ -2,7 +2,7 @@
 <!-- Centered HTML header and wide table rows are deliberate on GitHub. -->
 
 <p align="center">
-  <img src=".github/assets/social-preview.png" alt="Framefang: capture, annotate, paste" width="820">
+  <img src=".github/assets/social-preview.png" alt="Frame Fang: capture, annotate, paste" width="820">
 </p>
 
 <p align="center">
@@ -28,7 +28,7 @@
 
 ## Highlights
 
-Framefang sits quietly in the tray until you press its key. A screenshot
+Frame Fang sits quietly in the tray until you press its key. A screenshot
 takes about as long as dragging a box.
 
 - **Instant freeze.** The screen freezes the moment you press the key, so
@@ -42,7 +42,7 @@ takes about as long as dragging a box.
 ## Download
 
 Grab it from the [latest release](https://github.com/winters27/framefang/releases/latest).
-Framefang updates itself from the tray menu.
+Frame Fang updates itself from the tray menu.
 
 | Platform | Get it |
 | --- | --- |
@@ -56,7 +56,7 @@ Framefang updates itself from the tray menu.
 > & Security > Open Anyway**.
 
 > [!TIP]
-> On Windows 11, Print Screen opens the Snipping Tool by default. Framefang's
+> On Windows 11, Print Screen opens the Snipping Tool by default. Frame Fang's
 > Settings shows the exact switch to turn off, with a button that opens its
 > page. Or bind any other key you like.
 
@@ -78,7 +78,7 @@ Framefang updates itself from the tray menu.
 
 > [!NOTE]
 > Recording and video conversion need FFmpeg. Settings can download
-> Framefang's own trimmed build, checked against its published checksum, or
+> Frame Fang's own trimmed build, checked against its published checksum, or
 > you can install it yourself:
 >
 > ```powershell
@@ -114,7 +114,7 @@ Framefang updates itself from the tray menu.
 
 ## Coming from another tool?
 
-Framefang covers the everyday screenshot loop of the **Windows Snipping
+Frame Fang covers the everyday screenshot loop of the **Windows Snipping
 Tool**, **Snip & Sketch**, **ShareX**, **Greenshot**, **Lightshot** and
 **Flameshot**: capture a region, mark it up, copy or save it. It keeps to that
 loop and does it quickly, with no uploaders, accounts or workflows to set up.
@@ -122,9 +122,9 @@ loop and does it quickly, with no uploaders, accounts or workflows to set up.
 ## FAQ
 
 <details>
-<summary><b>On Windows 11, how do I make Print Screen open Framefang?</b></summary>
+<summary><b>On Windows 11, how do I make Print Screen open Frame Fang?</b></summary>
 
-Open Framefang's Settings. While Print Screen is your capture key, it shows
+Open Frame Fang's Settings. While Print Screen is your capture key, it shows
 the system switch to turn off (Bluetooth & devices > Keyboard) and a button
 that opens that page.
 
@@ -176,7 +176,7 @@ reports are welcome.
 
 ## License
 
-[Apache License 2.0](LICENSE). Framefang began as a fork of
+[Apache License 2.0](LICENSE). Frame Fang began as a fork of
 [Kashot](https://github.com/singhpratech/kashot) by Prateek Singh. See
 [NOTICE](NOTICE) for what changed and
 [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) for bundled components.

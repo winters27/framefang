@@ -1,5 +1,5 @@
 #!/bin/sh
-# Assemble Framefang.app from an already-built `framefang` binary.
+# Assemble "Frame Fang.app" from an already-built `framefang` binary.
 #
 # The one definition of the macOS bundle: the release workflow
 # (.github/workflows/release.yml) calls this script, so a local run produces
@@ -69,7 +69,7 @@ esac
 TEMPLATE="$SCRIPT_DIR/Info.plist.in"
 [ -f "$TEMPLATE" ] || die "missing plist template: $TEMPLATE"
 
-APP="$OUT_DIR/Framefang.app"
+APP="$OUT_DIR/Frame Fang.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 

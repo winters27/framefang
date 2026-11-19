@@ -56,7 +56,7 @@ impl Toast {
     pub fn new(loop_target: &ActiveEventLoop, pos: (i32, i32)) -> Result<Self> {
         let (w, h) = size();
         let attrs = WindowAttributes::default()
-            .with_title("Framefang")
+            .with_title("Frame Fang")
             .with_decorations(false)
             .with_resizable(false)
             .with_active(false)

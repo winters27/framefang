@@ -369,7 +369,7 @@ mod tests {
         let progs = ["ffmpeg.exe", r"C:\Program Files\Framefang\ffmpeg.exe"];
         #[cfg(not(windows))]
         let progs = ["ffmpeg", "/usr/bin/ffmpeg", "screencapture",
-                     "/Applications/Framefang.app/Contents/Resources/ffmpeg"];
+                     "/Applications/Frame Fang.app/Contents/Resources/ffmpeg"];
         for prog in progs {
             let name = program_basename(&Command::new(prog));
             assert!(RECORDER_IMAGES.contains(&name.as_str()),

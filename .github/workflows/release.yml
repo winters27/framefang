@@ -245,7 +245,7 @@ jobs:
           else v=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1); fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
 
-      - name: Assemble Framefang.app
+      - name: Assemble Frame Fang.app
         run: |
           sh ../dist/macos/make-app.sh \
             --binary "target/${{ matrix.target }}/release/framefang" \
@@ -260,13 +260,13 @@ jobs:
           brew install create-dmg
           set +e
           create-dmg \
-            --volname "Framefang" \
+            --volname "Frame Fang" \
             --window-size 500 320 \
             --icon-size 96 \
-            --icon "Framefang.app" 125 125 \
+            --icon "Frame Fang.app" 125 125 \
             --app-drop-link 375 125 \
             "dist/Framefang-macos-${{ matrix.label }}.dmg" \
-            "dist/Framefang.app"
+            "dist/Frame Fang.app"
           rc=$?
           if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then exit "$rc"; fi
           test -f "dist/Framefang-macos-${{ matrix.label }}.dmg"

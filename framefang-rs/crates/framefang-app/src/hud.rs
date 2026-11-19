@@ -178,7 +178,7 @@ mod tests {
     fn a_heading_glows_around_its_letters() {
         let (w, h) = (300usize, 40usize);
         let mut b = vec![0u32; w * h];
-        heading(&mut b, w, h, 10, 10, "FRAMEFANG");
+        heading(&mut b, w, h, 10, 10, "FRAME FANG");
         assert!(b[5 * w + 30] != 0, "light spills above the letters");
         assert_eq!(b[39 * w + 299], 0, "far away stays dark");
     }

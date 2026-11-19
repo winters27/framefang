@@ -79,7 +79,7 @@ const ROW_H: i32 = 34;
 /// refining row and a clear gap before its control (pinned by a test).
 const LABEL_W: i32 = 224;
 /// The window's heading, drawn at scale 2 left of the header buttons.
-const TITLE: &str = "FRAMEFANG // SETTINGS";
+const TITLE: &str = "FRAME FANG // SETTINGS";
 // Header buttons, right-anchored: Edit as JSON, Cancel, Save.
 const SAVE_W:   i32 = 92;
 const CANCEL_W: i32 = 92;
@@ -235,7 +235,7 @@ impl SettingsView {
         let win_h = content_height(&rows) + crate::chrome::TITLE_H as u32;
         let (cx, cy) = centered_origin(loop_target, WIN_W, win_h);
         let attrs = crate::chrome::frameless(WindowAttributes::default())
-            .with_title("Framefang — Settings")
+            .with_title("Frame Fang — Settings")
             .with_resizable(false)
             .with_inner_size(PhysicalSize::new(WIN_W, win_h))
             .with_position(PhysicalPosition::new(cx, cy))
@@ -526,7 +526,7 @@ impl SettingsView {
                     PathBuf::from(&self.draft.save_directory)
                 };
                 if let Some(p) = rfd::FileDialog::new()
-                    .set_title("Framefang — Screenshots folder")
+                    .set_title("Frame Fang — Screenshots folder")
                     .set_directory(&starting)
                     .pick_folder()
                 {
@@ -542,7 +542,7 @@ impl SettingsView {
                     PathBuf::from(&self.draft.recordings_directory)
                 };
                 if let Some(p) = rfd::FileDialog::new()
-                    .set_title("Framefang — Recordings folder")
+                    .set_title("Frame Fang — Recordings folder")
                     .set_directory(&starting)
                     .pick_folder()
                 {
@@ -868,7 +868,7 @@ fn render_system_line<S: painter::Surface>(
     let (rx, ry, rw, rh) = row.rect;
     let text_y = ry + (rh - bitmap_font::GLYPH_H) / 2;
     let (line, line_color) = if takes {
-        ("Print Screen opens the Snipping Tool, not Framefang", WARN)
+        ("Print Screen opens the Snipping Tool, not Frame Fang", WARN)
     } else {
         (page.line, TEXT_MUTED())
     };
@@ -982,7 +982,7 @@ fn guide_text(g: &WindowsGuide) -> (String, String, u32) {
         )
     } else {
         (
-            "Print Screen goes straight to Framefang".to_owned(),
+            "Print Screen goes straight to Frame Fang".to_owned(),
             format!("Keep this off in {} for Print Screen to work:", g.page),
             LASER(),
         )

@@ -132,7 +132,7 @@ impl UpdatesView {
         let win_h = WIN_H + crate::chrome::TITLE_H as u32;
         let (cx, cy) = centered_origin(loop_target, WIN_W, win_h);
         let attrs = crate::chrome::frameless(WindowAttributes::default())
-            .with_title("Framefang — Updates")
+            .with_title("Frame Fang — Updates")
             .with_resizable(false)
             .with_inner_size(PhysicalSize::new(WIN_W, win_h))
             .with_position(PhysicalPosition::new(cx, cy))
@@ -471,7 +471,7 @@ impl UpdatesView {
         let mut surf = BufferSurface { buf: &mut buf, w: win_w as i32, h: win_h as i32 };
 
         // Title strip.
-        crate::hud::heading(surf.buf, win_w, win_h, PAD, 22, "FRAMEFANG // UPDATES");
+        crate::hud::heading(surf.buf, win_w, win_h, PAD, 22, "FRAME FANG // UPDATES");
         draw_text(&mut surf, PAD, 50, 1, "Check for new releases on GitHub.",
                   argb_to_framefang(TEXT_MUTED()));
 
@@ -712,7 +712,7 @@ fn fetch_latest_release() -> Result<RawRelease, String> {
 fn update_progress(got: u64, total: Option<u64>, tag: &str) -> (String, Option<f32>) {
     let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
     match total {
-        Some(t) if got >= t => (format!("Installing {tag}... Framefang restarts by itself."), Some(1.0)),
+        Some(t) if got >= t => (format!("Installing {tag}... Frame Fang restarts by itself."), Some(1.0)),
         Some(t) => (format!("Downloading {tag}  {:.1} / {:.1} MB", mb(got), mb(t)), Some(got as f32 / t as f32)),
         None => (format!("Downloading {tag}..."), None),
     }

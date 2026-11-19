@@ -76,7 +76,7 @@ impl FirstRunView {
         let win_h = WIN_H + crate::chrome::TITLE_H as u32;
         let (cx, cy) = centered_origin(loop_target, WIN_W, win_h);
         let attrs = crate::chrome::frameless(WindowAttributes::default())
-            .with_title("Welcome to Framefang")
+            .with_title("Welcome to Frame Fang")
             .with_resizable(false)
             .with_inner_size(PhysicalSize::new(WIN_W, win_h))
             .with_position(PhysicalPosition::new(cx, cy))
@@ -182,14 +182,14 @@ impl FirstRunView {
         let mut surf = BufferSurface { buf: &mut buf, w: win_w as i32, h: win_h as i32 };
 
         // Title strip.
-        crate::hud::heading(surf.buf, win_w, win_h, PAD, 22, "FRAMEFANG // WELCOME");
+        crate::hud::heading(surf.buf, win_w, win_h, PAD, 22, "FRAME FANG // WELCOME");
         let version = format!("v{}  //  first run", env!("CARGO_PKG_VERSION"));
         draw_text(&mut surf, PAD, 50, 1, &version, argb_to_framefang(TEXT_MUTED()));
 
         // The one thing a first-time user needs to know.
         let mut y = HEADER_H + 26;
         draw_text(&mut surf, PAD, y, 1,
-            "Framefang is running in your tray / menu bar.", argb_to_framefang(TEXT_BRIGHT));
+            "Frame Fang is running in your tray / menu bar.", argb_to_framefang(TEXT_BRIGHT));
 
         // Resolved settings, so the user can confirm both without opening the
         // Settings dialog.
@@ -231,10 +231,10 @@ fn locator_notes(wayland: bool) -> Vec<String> {
     let mut notes: Vec<String> = Vec::new();
     if cfg!(target_os = "windows") {
         notes.push("Windows hides new tray icons behind the taskbar chevron.".to_owned());
-        notes.push("Click it, then drag the Framefang icon onto the bar to pin it.".to_owned());
+        notes.push("Click it, then drag the Frame Fang icon onto the bar to pin it.".to_owned());
     } else if cfg!(target_os = "macos") {
-        notes.push("Look for the Framefang icon at the top right of the menu bar.".to_owned());
-        notes.push("Framefang runs as a menu-bar agent - it has no Dock icon.".to_owned());
+        notes.push("Look for the Frame Fang icon at the top right of the menu bar.".to_owned());
+        notes.push("Frame Fang runs as a menu-bar agent - it has no Dock icon.".to_owned());
     } else {
         notes.push("The icon needs an AppIndicator / tray host on your desktop.".to_owned());
         notes.push("GNOME needs the AppIndicator extension to show it.".to_owned());

@@ -57,7 +57,7 @@ pub fn offered() -> bool {
 /// What to tell someone who has no FFmpeg, per platform.
 pub fn missing_message() -> &'static str {
     if cfg!(target_os = "windows") {
-        "FFmpeg isn't installed. Download it in Framefang's Settings (Captures > FFmpeg)."
+        "FFmpeg isn't installed. Download it in Frame Fang's Settings (Captures > FFmpeg)."
     } else if cfg!(target_os = "macos") {
         "FFmpeg isn't installed. Install it with: brew install ffmpeg"
     } else {

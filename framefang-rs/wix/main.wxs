@@ -31,7 +31,7 @@
 
     <Product
         Id='*'
-        Name='Framefang'
+        Name='Frame Fang'
         UpgradeCode='EF6E048C-A0C6-4413-ADE6-679F0E461580'
         Manufacturer='winters27'
         Language='1033'
@@ -40,7 +40,7 @@
 
         <Package Id='*'
             Keywords='Installer'
-            Description='Framefang — fast screenshots with annotations'
+            Description='Frame Fang: fast screenshots with annotations'
             Manufacturer='winters27'
             InstallerVersion='450'
             Languages='1033'
@@ -53,7 +53,7 @@
             DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.' />
 
         <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1' />
-        <Property Id='DiskPrompt' Value='Framefang Installation' />
+        <Property Id='DiskPrompt' Value='Frame Fang Installation' />
 
         <Directory Id='TARGETDIR' Name='SourceDir'>
             <Directory Id='ProgramFiles64Folder' Name='PFiles'>
@@ -84,10 +84,10 @@
             </Directory>
 
             <Directory Id='ProgramMenuFolder'>
-                <Directory Id='ApplicationProgramsFolder' Name='Framefang'>
+                <Directory Id='ApplicationProgramsFolder' Name='Frame Fang'>
                     <Component Id='StartMenuShortcut' Guid='D1084C35-9CC7-44EF-9A63-AC5E84CAD8CE' Win64='yes'>
                         <Shortcut Id='FramefangStartMenuShortcut'
-                                  Name='Framefang'
+                                  Name='Frame Fang'
                                   Description='Fast screenshots with annotations'
                                   Target='[APPLICATIONFOLDER]framefang.exe'
                                   WorkingDirectory='APPLICATIONFOLDER'
@@ -109,7 +109,7 @@
         <Feature
             Id='Binaries'
             Title='Application'
-            Description='Installs the Framefang binary.'
+            Description='Installs Frame Fang.'
             Level='1'
             ConfigurableDirectory='APPLICATIONFOLDER'
             AllowAdvertise='no'
@@ -151,7 +151,7 @@
                      Value='LaunchFramefang'>WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1</Publish>
         </UI>
         <Property Id='WIXUI_INSTALLDIR' Value='APPLICATIONFOLDER' />
-        <Property Id='WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT' Value='Launch Framefang' />
+        <Property Id='WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT' Value='Launch Frame Fang' />
         <Property Id='WIXUI_EXITDIALOGOPTIONALCHECKBOX' Value='1' />
         <Property Id='WixShellExecTarget' Value='[#exe0]' />
         <CustomAction Id='LaunchFramefang'
