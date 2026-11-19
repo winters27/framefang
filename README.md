@@ -59,9 +59,11 @@ Framefang updates itself from the tray menu.
 | Feature | What it does |
 | --- | --- |
 | **Region capture** | Drag over any part of any monitor, across mixed scaling and multiple screens. |
+| **Window and screen capture** | Point at a window and it lights up; click to take just that window. The bar at the top switches to a whole screen or every screen. |
 | **Full screen** | Bind a key and it saves the whole desktop to your screenshots folder. |
 | **Annotate** | Pen, arrows, shapes, highlighter, text, numbered steps and pixelate. |
-| **Copy, save, pin** | Copy to the clipboard, save as PNG, or pin the picture on top of other windows. |
+| **Any color** | Palettes, a spectrum for any other color, and an eyedropper that takes one from the picture. |
+| **Copy, save, pin** | Copy to the clipboard, save as PNG (or Save as PNG or JPEG), or pin the picture on top of other windows. |
 | **Copy only** | Captures go straight to the clipboard, ready to paste into chat, email or docs. |
 | **Screen recorder** | Record the screen or a region to MP4, with system audio and microphone. |
 | **Converters** | Images (PNG, JPG, WEBP, BMP) and videos (MP4, MOV, WEBM, MKV, GIF). |
@@ -84,6 +86,9 @@ Framefang updates itself from the tray menu.
 | Key | Does |
 | --- | --- |
 | Capture key | Capture a region (set it in Settings) |
+| Click | Take the lit window (or screen) |
+| `Tab` | Next mode: region or window, screen, all screens |
+| `Ctrl+A` | The whole screen you're on (again for every screen) |
 | Hold `Shift` | Flip between editor and copy only, once |
 | `Esc` | Cancel |
 
@@ -97,6 +102,7 @@ Framefang updates itself from the tray menu.
 | `Ctrl+Z` / `Ctrl+Y` | Undo / redo |
 | `Ctrl+C` | Copy to the clipboard |
 | `Ctrl+S` or `Enter` | Save |
+| `Ctrl+Shift+S` | Save as, with a name and PNG or JPEG |
 | `Ctrl+P` | Pin on top of other windows |
 | `Esc` | Put the tool down, then close |
 
@@ -131,7 +137,8 @@ when you want the editor for that one capture.
 <summary><b>Where are screenshots saved?</b></summary>
 
 In your Pictures folder unless you pick another one in Settings. Copy-only
-captures go to the clipboard and are not saved to disk.
+captures go to the clipboard and are not saved to disk. `Ctrl+Shift+S` (or
+Shift with the Save button) lets you pick the name, folder and format.
 
 </details>
 

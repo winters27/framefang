@@ -256,7 +256,7 @@ impl RecordingIndicator {
 /// On gate/API failure we bubble the Err up; the tray loop then records
 /// without a floating panel (tray menu still stops).
 #[cfg(windows)]
-fn exclude_from_capture(window: &Rc<Window>) -> Result<()> {
+pub(crate) fn exclude_from_capture(window: &Rc<Window>) -> Result<()> {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
         SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE,

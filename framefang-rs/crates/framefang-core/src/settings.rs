@@ -231,6 +231,17 @@ pub struct AppSettings {
     #[serde(rename = "SwitchKey", default = "default_switch_key")]
     pub switch_key: String,
 
+    /// Screenshots show the mouse pointer where it was when they were
+    /// taken. Off by default. Windows only for now.
+    #[serde(rename = "CaptureCursor", default)]
+    pub capture_cursor: bool,
+
+    /// What a click in the capture screen takes, picked in its mode bar and
+    /// kept for the next capture: `"Auto"` (drag a region, or click the
+    /// window under the cursor), `"Screen"` or `"AllScreens"`.
+    #[serde(rename = "CaptureMode", default = "default_capture_mode")]
+    pub capture_mode: String,
+
     /// Each tool's own color and stroke width, keyed by `Tool::name`.
     /// A tool with no entry uses `ToolStyle::default_for`.
     #[serde(rename = "ToolStyles", default)]
@@ -295,6 +306,8 @@ impl Default for AppSettings {
             close_after_copy:    false,
             open_editor:         true,
             switch_key:          default_switch_key(),
+            capture_cursor:      false,
+            capture_mode:        default_capture_mode(),
             tool_styles:         Default::default(),
             save_directory:      String::new(),
             recordings_directory: String::new(),
@@ -313,6 +326,7 @@ impl Default for AppSettings {
 }
 
 fn default_true()        -> bool    { true }
+fn default_capture_mode() -> String { "Auto".to_owned() }
 fn default_switch_key()  -> String  { SwitchKey::Shift.name().to_owned() }
 
 /// The key that flips one capture between opening the editor and just

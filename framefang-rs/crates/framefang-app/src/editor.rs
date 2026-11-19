@@ -63,6 +63,10 @@ pub enum OverlayOutcome {
     /// User accepted a region (Enter / right-click / Ctrl+S). Caller saves
     /// the cropped bitmap to the configured output folder.
     Accepted(ImageBuffer<Rgba<u8>, Vec<u8>>),
+    /// Ctrl+Shift+S, or Shift with the Save button: the caller asks where
+    /// and in which format, with the overlay hidden meanwhile, and brings it
+    /// back (`set_hidden(false)`) if the user cancels.
+    SaveAs(ImageBuffer<Rgba<u8>, Vec<u8>>),
     /// User pressed Ctrl+C — caller writes the cropped bitmap to the
     /// system clipboard via arboard instead of saving to disk.
     Copied(ImageBuffer<Rgba<u8>, Vec<u8>>),
@@ -125,7 +129,7 @@ const EDITOR_CLEAR: u32 = {
 const EDITOR_FRAME: u32 = 0x00_3A_3A_40;
 /// The editor's one green (highlights, notices, the action-panel pulse, the
 /// video timeline): deep, saturated phosphor green rather than mint.
-const NEON_GREEN: u32 = 0x00_00_FF_41;
+pub(crate) const NEON_GREEN: u32 = 0x00_00_FF_41;
 /// Text on a green notice: near-white with a breath of the same green.
 const NEON_GREEN_TEXT: u32 = 0x00_D6_FF_DE;
 /// The action-panel pulse: three slow breaths, ending dark.
@@ -341,27 +345,48 @@ fn opening_tool(settings: &AppSettings) -> Tool {
     Tool::ALL.iter().copied().find(|t| t.name() == settings.last_tool).unwrap_or(Tool::Pen)
 }
 
-/// `t`'s own color and width, as the stroke it draws with.
+/// `t`'s own color and width, as the stroke it draws with. The color can be
+/// off every palette (the spectrum and the eyedropper pick any color); the
+/// flyout then rings the current-color chip instead of a swatch.
 fn stroke_for(settings: &AppSettings, t: Tool) -> Stroke {
+    use framefang_core::color::Rgba;
     let s = settings.tool_style(t);
-    Stroke {
-        color: on_a_palette(framefang_core::color::Rgba::from_argb(s.color_argb)),
-        thickness: Knob::Thickness.clamp(s.thickness),
-    }
+    let color = Rgba::from_argb(s.color_argb).with_alpha(0xFF);
+    // The old pure-red default, saved before there were palettes, opens as
+    // the first palette's red, as it always has.
+    let color = if color == Rgba::new_opaque(255, 0, 0) {
+        framefang_core::annotation::Palettes::ALL[0].colors[0]
+    } else { color };
+    Stroke { color, thickness: Knob::Thickness.clamp(s.thickness) }
 }
 
-/// `c`, or the nearest palette color when it is on none. Colors are only
-/// ever picked from a palette, so the one way to be off them is an older
-/// saved color (the old pure-red default); snapping it means the flyout
-/// always has a swatch to ring as the tool's color.
-fn on_a_palette(c: framefang_core::color::Rgba) -> framefang_core::color::Rgba {
-    let all = framefang_core::annotation::Palettes::ALL.iter().flat_map(|p| p.colors.iter().copied());
-    if all.clone().any(|p| p == c) { return c; }
-    let d = |p: &framefang_core::color::Rgba| {
-        let (dr, dg, db, da) = (p.r as i32 - c.r as i32, p.g as i32 - c.g as i32, p.b as i32 - c.b as i32, p.a as i32 - c.a as i32);
-        dr * dr + dg * dg + db * db + da * da
+/// Share of the spectrum's width given to hues; the strip after it is grays.
+const SPECTRUM_HUES: f32 = 0.88;
+
+/// The color at `(u, v)` in the flyout's spectrum, both 0 to 1: hue runs
+/// across, from light at the top through full color to dark at the bottom,
+/// and the last strip runs from white down to black.
+fn spectrum_color(u: f32, v: f32) -> framefang_core::color::Rgba {
+    let (u, v) = (u.clamp(0.0, 1.0), v.clamp(0.0, 1.0));
+    if u >= SPECTRUM_HUES {
+        let g = ((1.0 - v) * 255.0).round() as u8;
+        return framefang_core::color::Rgba::new_opaque(g, g, g);
+    }
+    hsl(u / SPECTRUM_HUES * 360.0, 1.0, 0.92 - v * 0.80)
+}
+
+/// HSL (hue in degrees, saturation and lightness 0 to 1) as an opaque color.
+fn hsl(h: f32, s: f32, l: f32) -> framefang_core::color::Rgba {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let hp = (h.rem_euclid(360.0)) / 60.0;
+    let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
+    let (r, g, b) = match hp as u32 {
+        0 => (c, x, 0.0), 1 => (x, c, 0.0), 2 => (0.0, c, x),
+        3 => (0.0, x, c), 4 => (x, 0.0, c), _ => (c, 0.0, x),
     };
-    all.min_by_key(d).unwrap_or(c)
+    let m = l - c / 2.0;
+    let ch = |v: f32| ((v + m).clamp(0.0, 1.0) * 255.0).round() as u8;
+    framefang_core::color::Rgba::new_opaque(ch(r), ch(g), ch(b))
 }
 
 /// Every tool but Pixelate has a color (pixelate shows the picture itself).
@@ -390,6 +415,16 @@ struct FlyoutLayout {
     knobs: Vec<(Knob, Rect4)>,
     /// Previous palette, next palette, the name between them, the swatches.
     colors: Option<(Rect4, Rect4, Rect4, [Rect4; 16])>,
+    /// Under the swatches: the eyedropper, the tool's current color below
+    /// it, and the spectrum beside both.
+    custom: Option<CustomColors>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CustomColors {
+    eyedropper: Rect4,
+    current: Rect4,
+    spectrum: Rect4,
 }
 
 fn flyout_layout(t: Tool) -> FlyoutLayout {
@@ -401,6 +436,7 @@ fn flyout_layout(t: Tool) -> FlyoutLayout {
         knobs.push((*k, (FLYOUT_PAD, y, inner, FLYOUT_ROW_H)));
         y += FLYOUT_ROW_H;
     }
+    let mut custom = None;
     let colors = has_colors(t).then(|| {
         if !knobs.is_empty() { y += FLYOUT_SECTION_GAP; }
         let arrow = PALETTE_ROW_H;
@@ -415,9 +451,20 @@ fn flyout_layout(t: Tool) -> FlyoutLayout {
             (gx + c * (SWATCH + SWATCH_GAP), y + r * (SWATCH + SWATCH_GAP), SWATCH, SWATCH)
         });
         y += SWATCH * 2 + SWATCH_GAP;
+        // Any other color: two more rows on the same grid. The first column
+        // holds the eyedropper over the current color, and the spectrum
+        // fills the other seven.
+        y += FLYOUT_SECTION_GAP;
+        let col = SWATCH + SWATCH_GAP;
+        custom = Some(CustomColors {
+            eyedropper: (gx, y, SWATCH, SWATCH),
+            current: (gx, y + col, SWATCH, SWATCH),
+            spectrum: (gx + col, y, grid_w - col, SWATCH * 2 + SWATCH_GAP),
+        });
+        y += SWATCH * 2 + SWATCH_GAP;
         (prev, next, name, swatches)
     });
-    FlyoutLayout { w: FLYOUT_W, h: y + FLYOUT_PAD, knobs, colors }
+    FlyoutLayout { w: FLYOUT_W, h: y + FLYOUT_PAD, knobs, colors, custom }
 }
 
 fn offset((x, y, w, h): Rect4, (ox, oy): (i32, i32)) -> Rect4 { (x + ox, y + oy, w, h) }
@@ -610,6 +657,15 @@ pub struct Overlay {
     /// The flyout knob being dragged; it follows CursorMoved until the
     /// button comes up, and the values are saved then.
     dragging_knob: Option<Knob>,
+    /// The eyedropper is armed: the next click takes the color under the
+    /// cursor, with the magnifier showing which pixel that is.
+    picking_color: bool,
+    /// The spectrum is being dragged; the color follows the cursor until
+    /// the button comes up, and is saved then.
+    dragging_spectrum: bool,
+    /// Where in the spectrum the color was last picked (0 to 1 each way),
+    /// for its marker. Only drawn while the tool still has that color.
+    spectrum_pick: Option<(f32, f32)>,
     /// Text tool em-size in px, its own value rather than riding thickness.
     text_size: f32,
     /// Pixelate block size in px.
@@ -688,6 +744,19 @@ pub struct Overlay {
     /// Selection rect at the moment the canvas was last cleared. Undoing
     /// the clear restores it, so a mis-hit Esc costs nothing at all.
     last_selection: Option<(i32, i32, i32, i32)>,
+    /// The windows on screen when it froze, frontmost first, as virtual-
+    /// screen frames and titles (`set_windows`). Empty where the platform
+    /// cannot list them; the hover then shows the screen.
+    windows: Vec<(Rect4, String)>,
+    /// What a click takes before a region is dragged (`pick`).
+    pick_mode: crate::pick::PickMode,
+    /// What a click would take now, in frame pixels, with its label.
+    target: Option<(Rect4, String)>,
+    /// Where the highlight glides from, and since when.
+    glide_from: Rect4,
+    glide_at: std::time::Instant,
+    /// A press in Screen or All screens mode, waiting for its release.
+    pick_pressed: bool,
 }
 
 impl Drop for Overlay {
@@ -740,7 +809,16 @@ impl Overlay {
         screenshot: ImageBuffer<Rgba<u8>, Vec<u8>>,
         settings: AppSettings,
     ) -> Result<Self> {
-        Self::build(loop_target, screenshot, desktop, settings, false, None, None, None)
+        let mut me = Self::build(loop_target, screenshot, desktop, settings, false, None, None, None)?;
+        me.pick_mode = crate::pick::PickMode::parse(&me.settings.capture_mode);
+        Ok(me)
+    }
+
+    /// The windows that were on screen when it froze (frontmost first, in
+    /// virtual-screen pixels), for the hover highlight.
+    pub fn set_windows(&mut self, windows: Vec<framefang_platform::windows_list::OnScreenWindow>) {
+        self.windows = windows.into_iter().map(|w| (w.rect, w.title)).collect();
+        self.update_target();
     }
 
     /// Open the editor window for a region the picker handed off: a
@@ -853,6 +931,7 @@ impl Overlay {
     ) -> Result<Self> {
         let mut me = Self::build(loop_target, screenshot, desktop, settings, false, None, None, None)?;
         me.record_mode = true;
+        me.pick_mode = crate::pick::PickMode::parse(&me.settings.capture_mode);
         Ok(me)
     }
 
@@ -1028,6 +1107,9 @@ impl Overlay {
             flyout: None,
             flyout_opened: std::time::Instant::now(),
             dragging_knob: None,
+            picking_color: false,
+            dragging_spectrum: false,
+            spectrum_pick: None,
             text_size: Knob::TextSize.clamp(settings.last_text_size),
             pixel_size: Knob::PixelSize.clamp(settings.pixelate_block as f32) as u32,
             settings,
@@ -1053,6 +1135,12 @@ impl Overlay {
             move_total: (0.0, 0.0),
             pending_discard: None,
             last_selection: None,
+            windows: Vec::new(),
+            pick_mode: crate::pick::PickMode::Auto,
+            target: None,
+            glide_from: (0, 0, 0, 0),
+            glide_at: std::time::Instant::now(),
+            pick_pressed: false,
         })
     }
 
@@ -1075,6 +1163,39 @@ impl Overlay {
     /// after the overlay closes to pull back any per-tool slider values
     /// (currently just `marker_opacity`) the user changed mid-session.
     pub fn settings(&self) -> &AppSettings { &self.settings }
+
+    /// Off screen while a Save As dialog is up, and back with its picture
+    /// and marks if the user cancels it.
+    pub fn set_hidden(&mut self, hidden: bool) {
+        self.window.set_visible(!hidden);
+        if !hidden {
+            // Keys let go while the dialog had the keyboard never reached
+            // this window, so Shift or Ctrl could otherwise read as held.
+            self.mods = ModifiersState::empty();
+            self.hover_tip = None;
+            self.window.focus_window();
+            self.window.request_redraw();
+        }
+    }
+
+    /// Where a notice `size` pixels big goes once this window closes, in
+    /// virtual-screen pixels: centered under the selection, or just inside
+    /// its bottom edge when the screen ends there, and always on the
+    /// selection's monitor.
+    pub fn notice_spot(&self, size: (u32, u32)) -> Option<(i32, i32)> {
+        const GAP: i32 = 12;
+        let sel = self.selection?;
+        let (bx, by, bw, bh) = self.panel_bounds(sel);
+        let (w, h) = (size.0 as i32, size.1 as i32);
+        let x = (sel.0 + (sel.2 - w) / 2).clamp(bx + GAP, (bx + bw - w - GAP).max(bx + GAP));
+        let below = sel.1 + sel.3 + GAP;
+        let y = if below + h <= by + bh - GAP { below } else { sel.1 + sel.3 - h - GAP };
+        let y = y.clamp(by + GAP, (by + bh - h - GAP).max(by + GAP));
+        let origin = if self.editor_mode {
+            self.window.inner_position().map(|p| (p.x, p.y)).unwrap_or(self.frame_origin)
+        } else { self.frame_origin };
+        Some(vdesk::frame_to_virtual(origin, (x, y)))
+    }
 
     // ── tool flyout ────────────────────────────────────────────────────
     //
@@ -1107,6 +1228,7 @@ impl Overlay {
         self.leave_select_mode();
         self.flyout = reopen.then_some(t);
         if reopen { self.flyout_opened = std::time::Instant::now(); }
+        self.stop_picking();
         // The cursor has not moved, so the tip computed before the click
         // would stay up and sit on top of the flyout.
         self.hover_tip = self.compute_hover_tip();
@@ -1118,6 +1240,7 @@ impl Overlay {
     fn put_tool_down(&mut self) {
         self.tool_armed = false;
         self.flyout = None;
+        self.picking_color = false;
         self.leave_select_mode();
         self.hover_tip = self.compute_hover_tip();
         self.update_resize_cursor();
@@ -1171,20 +1294,82 @@ impl Overlay {
     /// color, an arrow flips the palette. `true` when it was one of those.
     fn press_flyout_colors(&mut self) -> bool {
         let Some(((fx, fy, _, _), _, _)) = self.flyout_rect() else { return false; };
-        let Some((prev, next, _, swatches)) = self.flyout.and_then(|t| flyout_layout(t).colors) else { return false; };
+        let Some(layout) = self.flyout.map(flyout_layout) else { return false; };
+        let (Some((prev, next, _, swatches)), Some(custom)) = (layout.colors, layout.custom) else { return false; };
         let n = framefang_core::annotation::Palettes::ALL.len();
         let hit = |r: Rect4| rect_contains(offset(r, (fx, fy)), self.cursor);
+        if hit(custom.eyedropper) {
+            self.picking_color = !self.picking_color;
+            self.hover_tip = None;
+            self.update_resize_cursor();
+            self.window.request_redraw();
+            return true;
+        }
+        if hit(custom.spectrum) {
+            self.dragging_spectrum = true;
+            self.set_color_from_spectrum();
+            return true;
+        }
         if hit(prev) || hit(next) {
             self.palette_index = if hit(prev) { (self.palette_index + n - 1) % n } else { (self.palette_index + 1) % n };
             self.settings.palette_index = self.palette_index as i32;
         } else if let Some(i) = swatches.iter().position(|r| hit(*r)) {
-            self.stroke.color = framefang_core::annotation::Palettes::get(self.palette_index).colors[i];
+            self.set_color(framefang_core::annotation::Palettes::get(self.palette_index).colors[i]);
         } else {
             return false;
         }
         self.save_knobs();
         self.window.request_redraw();
         true
+    }
+
+    /// The tool draws in `c` from now on, the text being typed included.
+    /// Picking any color puts the eyedropper back down.
+    fn set_color(&mut self, c: framefang_core::color::Rgba) {
+        self.stroke.color = c;
+        if let Some(a) = self.current.as_mut() {
+            if let framefang_core::annotation::AnnotationKind::Text { color, .. } = &mut a.kind {
+                *color = c;
+            }
+        }
+        self.stop_picking();
+        self.window.request_redraw();
+    }
+
+    /// The color under the cursor in the spectrum, while it is pressed or
+    /// dragged. Saved when the button comes up.
+    fn set_color_from_spectrum(&mut self) {
+        let Some(((fx, fy, _, _), _, _)) = self.flyout_rect() else { return; };
+        let Some(custom) = self.flyout.and_then(|t| flyout_layout(t).custom) else { return; };
+        let (sx, sy, sw, sh) = offset(custom.spectrum, (fx, fy));
+        let u = (self.cursor.0 - sx) as f32 / (sw - 1).max(1) as f32;
+        let v = (self.cursor.1 - sy) as f32 / (sh - 1).max(1) as f32;
+        let (u, v) = (u.clamp(0.0, 1.0), v.clamp(0.0, 1.0));
+        self.spectrum_pick = Some((u, v));
+        self.set_color(spectrum_color(u, v));
+    }
+
+    /// Put the eyedropper down without picking anything.
+    fn stop_picking(&mut self) {
+        if !self.picking_color { return; }
+        self.picking_color = false;
+        self.update_resize_cursor();
+        self.window.request_redraw();
+    }
+
+    /// The eyedropper's click: the tool takes the color of the pixel under
+    /// the cursor. In the editor window only the picture counts; the canvas
+    /// around it is not part of the capture.
+    fn pick_color_at_cursor(&mut self) {
+        if self.editor_mode && !self.cursor_in_selection() { return; }
+        let (ox, oy) = self.bitmap_offset();
+        let (x, y) = (self.cursor.0 + ox, self.cursor.1 + oy);
+        if x < 0 || y < 0 || x >= self.screenshot.width() as i32 || y >= self.screenshot.height() as i32 { return; }
+        let p = self.screenshot.get_pixel(x as u32, y as u32).0;
+        self.spectrum_pick = None;
+        self.set_color(framefang_core::color::Rgba::new_opaque(p[0], p[1], p[2]));
+        self.show_palette_of_color();
+        self.save_knobs();
     }
 
     fn knob_value(&self, k: Knob) -> f32 {
@@ -1386,6 +1571,10 @@ impl Overlay {
                     self.set_knob_from_cursor(k);
                     return OverlayOutcome::Continue;
                 }
+                if self.dragging_spectrum {
+                    self.set_color_from_spectrum();
+                    return OverlayOutcome::Continue;
+                }
                 if self.dragging_playhead {
                     self.set_scrub_from_cursor(false);
                     return OverlayOutcome::Continue;
@@ -1427,11 +1616,16 @@ impl Overlay {
                         // C# MakeButton(tip, …) tooltip text.
                         let prev = self.hover_tip;
                         self.hover_tip = self.compute_hover_tip();
-                        if prev != self.hover_tip { self.window.request_redraw(); }
+                        // The eyedropper's magnifier follows the cursor.
+                        if prev != self.hover_tip || self.picking_color { self.window.request_redraw(); }
                     }
                     State::Idle => {
                         // Magnifier follows the cursor in Idle so the user
-                        // can place the first selection edge by pixel.
+                        // can place the first selection edge by pixel, and
+                        // the highlight follows what a click would take.
+                        self.update_target();
+                        let on_bar = rect_contains(self.mode_bar().0, self.cursor);
+                        self.window.set_cursor(if on_bar { CursorIcon::Pointer } else { CursorIcon::Crosshair });
                         self.window.request_redraw();
                     }
                     _ => {}
@@ -1592,6 +1786,12 @@ impl Overlay {
         match key {
             Key::Named(NamedKey::Escape) => self.handle_escape(),
             Key::Named(NamedKey::Enter) => self.commit(),
+            // Tab: the next capture mode, before any region exists.
+            Key::Named(NamedKey::Tab) if self.state == State::Idle && self.has_hover() => {
+                let next = self.pick_mode.next(self.screens());
+                self.set_pick_mode(next);
+                OverlayOutcome::Continue
+            }
             // Select mode: Delete / Backspace remove the picked annotation.
             // Both are undoable; outside select mode neither key does
             // anything, exactly as before.
@@ -1600,6 +1800,10 @@ impl Overlay {
                 OverlayOutcome::Continue
             }
             Key::Character(s) => {
+                // Ctrl+A picks the whole screen, in record mode too.
+                if self.mods.control_key() && s.eq_ignore_ascii_case("a") {
+                    return self.select_all();
+                }
                 // Record mode has no tools to switch to and nothing to save,
                 // copy or pin, so every character shortcut would be a lie.
                 if self.record_mode {
@@ -1622,6 +1826,9 @@ impl Overlay {
                 }
                 if ctrl {
                     match lc {
+                        // Ctrl+Shift+S → save under a name and format of
+                        // the user's choosing
+                        's' if shift => return self.commit_as_save_as(),
                         // Ctrl+S → commit-and-save (same as Enter)
                         's' => return self.commit(),
                         // Ctrl+C → commit-and-copy
@@ -1654,6 +1861,10 @@ impl Overlay {
     /// user work — which never happens on this press, it only arms the
     /// confirmation bar.
     fn handle_escape(&mut self) -> OverlayOutcome {
+        if self.picking_color {
+            self.stop_picking();
+            return OverlayOutcome::Continue;
+        }
         if self.state == State::Drawing {
             self.current = None;
             self.state   = State::Selected;
@@ -1922,6 +2133,13 @@ impl Overlay {
             self.window.request_redraw();
             return OverlayOutcome::Continue;
         }
+        // The eyedropper's click takes the color under the cursor, anywhere
+        // but on the flyout, whose own controls stay live (its eyedropper
+        // button puts it back down, a swatch picks that color instead).
+        if self.picking_color && !self.flyout_rect().is_some_and(|(r, _, _)| rect_contains(r, self.cursor)) {
+            self.pick_color_at_cursor();
+            return OverlayOutcome::Continue;
+        }
         // The tool flyout comes first, before the typing check below, so the
         // Text size slider resizes the text being typed instead of ending
         // it. A press on a row grabs its knob, one on a swatch or palette
@@ -1932,13 +2150,9 @@ impl Overlay {
             self.set_knob_from_cursor(k);
             return OverlayOutcome::Continue;
         }
+        // A color recolors the text being typed too (`set_color`), like the
+        // size slider resizes it.
         if self.press_flyout_colors() {
-            // Recolor the text being typed too, like the size slider does.
-            if let Some(a) = self.current.as_mut() {
-                if let framefang_core::annotation::AnnotationKind::Text { color, .. } = &mut a.kind {
-                    *color = self.stroke.color;
-                }
-            }
             return OverlayOutcome::Continue;
         }
         if self.flyout_rect().is_some_and(|(r, _, _)| rect_contains(r, self.cursor)) {
@@ -1992,6 +2206,7 @@ impl Overlay {
                     return match action {
                         ActionButton::Pin    => self.commit_as_pin(),
                         ActionButton::Copy   => self.commit_as_copy(),
+                        ActionButton::Save if self.mods.shift_key() => self.commit_as_save_as(),
                         ActionButton::Save   => self.commit(),
                         ActionButton::Record => self.commit_as_record(),
                         ActionButton::Close  => self.request_close(),
@@ -2022,6 +2237,21 @@ impl Overlay {
 
         match self.state {
             State::Idle => {
+                use crate::pick::PickMode;
+                // The mode bar: a chip switches what a click takes.
+                let (bar, chips) = self.mode_bar();
+                if rect_contains(bar, self.cursor) {
+                    if let Some((m, _)) = chips.iter().find(|(_, r)| rect_contains(*r, self.cursor)) {
+                        self.set_pick_mode(*m);
+                    }
+                    return OverlayOutcome::Continue;
+                }
+                self.update_target();
+                // Screen and All screens take a click, never a drag.
+                if self.pick_mode.available(self.screens()) != PickMode::Auto {
+                    self.pick_pressed = true;
+                    return OverlayOutcome::Continue;
+                }
                 self.state     = State::Selecting;
                 self.anchor    = self.cursor;
                 self.selection = Some((self.cursor.0, self.cursor.1, 0, 0));
@@ -2154,7 +2384,7 @@ impl Overlay {
         // End a flyout knob drag and persist the values, so the next session
         // opens with them. Best-effort: a save failure is logged, never
         // fatal (same contract as `AppSettings::save` everywhere else).
-        if self.dragging_knob.take().is_some() {
+        if self.dragging_knob.take().is_some() || std::mem::take(&mut self.dragging_spectrum) {
             self.save_knobs();
             return OverlayOutcome::Continue;
         }
@@ -2165,24 +2395,22 @@ impl Overlay {
             self.set_scrub_from_cursor(true);
         }
         match self.state {
+            State::Idle if std::mem::take(&mut self.pick_pressed) => {
+                return self.take_target();
+            }
             State::Selecting => {
                 let r = rect_from(self.anchor, self.cursor);
-                if r.2 < 4 || r.3 < 4 {
+                if r.2 < 4 && r.3 < 4 {
+                    // A click rather than a drag: what the highlight shows.
+                    return self.take_target();
+                } else if r.2 < 4 || r.3 < 4 {
+                    // A sliver: nothing to take.
                     self.state     = State::Idle;
                     self.selection = None;
                 } else {
                     self.selection = Some(r);
                     self.state     = State::Selected;
-                    if self.is_picker() {
-                        // Copy-only capture: the picture goes to the
-                        // clipboard and nothing opens.
-                        if !self.settings.opens_editor(self.switch_held()) {
-                            if let Some(rect) = self.selection_in_bitmap() {
-                                return OverlayOutcome::Copied(crop(&self.screenshot, rect));
-                            }
-                        }
-                        if let Some(out) = self.hand_off() { return out; }
-                    }
+                    return self.finish_selection(self.switch_held());
                 }
                 self.window.request_redraw();
             }
@@ -2205,6 +2433,156 @@ impl Overlay {
             _ => {}
         }
         OverlayOutcome::Continue
+    }
+
+    /// A region was just picked (a drag let go, or Ctrl+A). The picker then
+    /// copies it and closes (copy only, or the other way round when `switch`
+    /// says the switch key is held), hands it to the editor window, or keeps
+    /// editing it in place when the editor would not fit.
+    fn finish_selection(&mut self, switch: bool) -> OverlayOutcome {
+        if self.is_picker() {
+            if !self.settings.opens_editor(switch) {
+                if let Some(rect) = self.selection_in_bitmap() {
+                    return OverlayOutcome::Copied(crop(&self.screenshot, rect));
+                }
+            }
+            if let Some(out) = self.hand_off() { return out; }
+        }
+        self.window.request_redraw();
+        OverlayOutcome::Continue
+    }
+
+    /// Ctrl+A: the whole monitor under the cursor, or, pressed on a
+    /// selection that already is that monitor, every monitor. Before any
+    /// region exists it finishes like a released drag. A locked selection
+    /// (the editor window, a video frame) has nothing to select.
+    fn select_all(&mut self) -> OverlayOutcome {
+        use framefang_core::settings::SwitchKey;
+        if self.locked() || !matches!(self.state, State::Idle | State::Selected) {
+            return OverlayOutcome::Continue;
+        }
+        let size = self.window.inner_size();
+        let whole = (0, 0, size.width as i32, size.height as i32);
+        let screen = self.chrome_bounds(self.cursor);
+        let next = if self.selection == Some(screen) { whole } else { screen };
+        let was_idle = self.state == State::Idle;
+        self.selection = Some(next);
+        self.state = State::Selected;
+        self.hover_tip = None;
+        if was_idle {
+            // Ctrl is part of this shortcut, so it only counts as the switch
+            // key when it was already held with the capture key.
+            let switch = self.hold_at_press
+                || (self.settings.switch_key() != SwitchKey::Ctrl && self.switch_held());
+            return self.finish_selection(switch);
+        }
+        self.window.request_redraw();
+        OverlayOutcome::Continue
+    }
+
+    // ── the hover highlight ───────────────────────────────────────────
+    //
+    // Before any region exists, the capture screen lights up what a click
+    // would take (`pick`): the window under the cursor, its screen, or
+    // every screen. A drag still draws a region in the first mode.
+
+    /// The capture screens that have a hover: the picker and record mode.
+    fn has_hover(&self) -> bool { !self.locked() }
+
+    /// How many screens the capture spans.
+    fn screens(&self) -> usize { self.desktop.monitors().len().max(1) }
+
+    /// The highlight shows while nothing is selected, and through the first
+    /// few pixels of a press, which may still turn out to be a click.
+    fn hover_showing(&self) -> bool {
+        self.has_hover() && match self.state {
+            State::Idle => true,
+            State::Selecting => self.selection.is_some_and(|r| r.2 < 4 && r.3 < 4),
+            _ => false,
+        }
+    }
+
+    /// Re-aim the highlight at what is under the cursor now, gliding there
+    /// from where it is if that changed.
+    fn update_target(&mut self) {
+        use crate::pick::PickMode;
+        if !self.has_hover() { return; }
+        let size = self.window.inner_size();
+        let whole = (0, 0, size.width as i32, size.height as i32);
+        let screen = self.chrome_bounds(self.cursor);
+        let screens = self.screens();
+        let screen_label = || if screens > 1 {
+            let n = self.desktop.monitors().iter().position(|m| {
+                let (mx, my) = vdesk::virtual_to_frame(self.frame_origin, (m.x, m.y));
+                (mx, my) == (screen.0, screen.1)
+            }).map_or(1, |i| i + 1);
+            format!("Screen {n}")
+        } else { "Screen".to_owned() };
+        let next = match self.pick_mode.available(screens) {
+            PickMode::AllScreens => Some((whole, "All screens".to_owned())),
+            PickMode::Screen => Some((screen, screen_label())),
+            PickMode::Auto => {
+                let p = vdesk::frame_to_virtual(self.frame_origin, self.cursor);
+                let hit = crate::pick::window_at(&self.windows, p).and_then(|(r, title)| {
+                    let (fx, fy) = vdesk::virtual_to_frame(self.frame_origin, (r.0, r.1));
+                    let r = crate::pick::clip((fx, fy, r.2, r.3), whole)?;
+                    let name = if title.trim().is_empty() { "Window".to_owned() }
+                               else { crate::pick::shorten(title.trim(), 48) };
+                    Some((r, name))
+                });
+                hit.or_else(|| Some((screen, screen_label())))
+            }
+        };
+        if next.as_ref().map(|t| t.0) != self.target.as_ref().map(|t| t.0) {
+            self.glide_from = match &self.target {
+                Some(_) => self.shown_target(),
+                None => next.as_ref().map_or((0, 0, 0, 0), |t| crate::pick::arrival(t.0)),
+            };
+            self.glide_at = std::time::Instant::now();
+        }
+        self.target = next;
+    }
+
+    /// Where the highlight is drawn this frame, part way through its glide.
+    fn shown_target(&self) -> Rect4 {
+        match &self.target {
+            Some((r, _)) => crate::pick::glide(self.glide_from, *r, self.glide_at.elapsed()),
+            None => (0, 0, 0, 0),
+        }
+    }
+
+    /// Switch what a click takes, and keep it for the next capture.
+    fn set_pick_mode(&mut self, mode: crate::pick::PickMode) {
+        if mode == self.pick_mode { return; }
+        self.pick_mode = mode;
+        self.settings.capture_mode = mode.name().to_owned();
+        if let Err(e) = self.settings.save() {
+            eprintln!("framefang: capture mode save failed: {e}");
+        }
+        self.update_target();
+        self.window.request_redraw();
+    }
+
+    /// The mode bar and its chips, on the screen under the cursor.
+    fn mode_bar(&self) -> (Rect4, Vec<(crate::pick::PickMode, Rect4)>) {
+        let modes = crate::pick::PickMode::offered(self.screens());
+        crate::pick::bar_layout(self.chrome_bounds(self.cursor), modes,
+            |s| framefang_core::text::layout(s, FLYOUT_TEXT_PX).width().ceil() as i32)
+    }
+
+    /// A click (not a drag): take what the highlight shows.
+    fn take_target(&mut self) -> OverlayOutcome {
+        self.update_target();
+        let Some((r, _)) = self.target.clone() else {
+            self.state = State::Idle;
+            self.selection = None;
+            self.window.request_redraw();
+            return OverlayOutcome::Continue;
+        };
+        self.selection = Some(r);
+        self.state = State::Selected;
+        self.hover_tip = None;
+        self.finish_selection(self.switch_held())
     }
 
     /// Mutate the selection rect according to the edge being dragged.
@@ -2264,15 +2642,22 @@ impl Overlay {
             let label = match btn {
                 ActionButton::Pin    => "Pin to screen",
                 ActionButton::Copy   => "Copy (Ctrl+C)",
-                ActionButton::Save   => "Save (Ctrl+S)",
+                ActionButton::Save if self.video_mode => "Save (Ctrl+S)",
+                ActionButton::Save   => "Save (Ctrl+S)  -  Shift: Save as",
                 ActionButton::Record => if self.record_mode { "Record (Enter)" } else { "Record this region" },
                 ActionButton::Close  => "Close (Esc)",
             };
             return Some((label, self.cursor.0 + 14, self.cursor.1 + 14));
         }
-        // The flyout labels its own rows; no tooltip over it.
-        if self.flyout_rect().is_some_and(|(r, _, _)| rect_contains(r, self.cursor)) {
-            return None;
+        // The flyout labels its own rows; no tooltip over it, but for the
+        // eyedropper, which is only an icon.
+        if let Some(((fx, fy, fw, fh), _, _)) = self.flyout_rect() {
+            if rect_contains((fx, fy, fw, fh), self.cursor) {
+                let on_dropper = self.flyout.and_then(|t| flyout_layout(t).custom)
+                    .is_some_and(|c| rect_contains(offset(c.eyedropper, (fx, fy)), self.cursor));
+                return (on_dropper && !self.picking_color)
+                    .then_some(("Pick a color from the picture", self.cursor.0 + 14, self.cursor.1 + 14));
+            }
         }
         // Video timeline — same gates as the click handler so the tip can
         // only ever appear where a click would actually land.
@@ -2310,6 +2695,13 @@ impl Overlay {
     }
 
     fn update_resize_cursor(&self) {
+        // The eyedropper aims with the crosshair. Over the flyout, whose
+        // controls still work, it is the arrow.
+        if self.picking_color {
+            let on_flyout = self.flyout_rect().is_some_and(|(r, _, _)| rect_contains(r, self.cursor));
+            self.window.set_cursor(if on_flyout { CursorIcon::Default } else { CursorIcon::Crosshair });
+            return;
+        }
         if self.editor_mode {
             if let Some(icon) = self.editor_cursor() {
                 self.window.set_cursor(icon);
@@ -2419,6 +2811,16 @@ impl Overlay {
                 OverlayOutcome::CopiedOpen(img)
             }
             None => OverlayOutcome::Continue,
+        }
+    }
+
+    /// Save As. A video session's Save burns the clip, which has no format
+    /// to choose, so there it is the ordinary Save.
+    fn commit_as_save_as(&mut self) -> OverlayOutcome {
+        if self.video_mode || self.record_mode { return self.commit(); }
+        match self.compose_final() {
+            Some(img) => OverlayOutcome::SaveAs(img),
+            None      => OverlayOutcome::Continue,
         }
     }
 
@@ -2564,9 +2966,22 @@ impl Overlay {
                 color: self.stroke.color,
                 palette: self.palette_index,
                 open: ease_out(t),
+                picking: self.picking_color,
+                spectrum_pick: self.spectrum_pick,
             })
         });
         let locked = self.locked();
+        // Where the eyedropper would take a color from.
+        let picking_here = self.picking_color
+            && !flyout_draw.as_ref().is_some_and(|f| rect_contains(f.rect, self.cursor))
+            && (!self.editor_mode || self.cursor_in_selection());
+        // The hover highlight, part way through its glide, and its label.
+        let hover = self.hover_showing()
+            .then(|| self.target.as_ref().map(|(r, label)| (self.shown_target(), label.clone(), (r.2, r.3))))
+            .flatten();
+        let gliding = hover.is_some() && self.glide_at.elapsed() < crate::pick::GLIDE;
+        let pick_mode = self.pick_mode.available(self.screens());
+        let mode_bar = (self.state == State::Idle && self.has_hover()).then(|| self.mode_bar());
         // Offset of framebuffer (0, 0) inside the capture: zero whenever the
         // overlay covers the virtual desktop as asked.
         let shot_off      = self.bitmap_offset();
@@ -2584,14 +2999,18 @@ impl Overlay {
         let shot_h = self.screenshot.height() as usize;
         let shot   = self.screenshot.as_raw();
 
-        let sel_rect = self.selection.map(|(x, y, w, h)| (x, y, x + w, y + h));
+        // While the highlight shows, a press that has not moved yet is no
+        // selection to draw.
+        let sel_rect = self.selection.filter(|_| hover.is_none()).map(|(x, y, w, h)| (x, y, x + w, y + h));
 
-        // Pass 1: screenshot, dimmed outside the selection. Off-capture
-        // pixels (a gap between differently-sized monitors, or a window the
-        // WM pushed past the capture) paint black.
+        // Pass 1: screenshot, dimmed outside the selection (or, before
+        // there is one, outside the highlight). Off-capture pixels (a gap
+        // between differently-sized monitors, or a window the WM pushed past
+        // the capture) paint black.
         let t_start = std::time::Instant::now();
         let backdrop_shot = crate::backdrop::Shot { rgba: shot, width: shot_w, height: shot_h, offset: shot_off };
-        buf.copy_from_slice(self.backdrop.frame(win_w, win_h, &backdrop_shot, sel_rect));
+        let lit = hover.as_ref().map(|((x, y, w, h), _, _)| (*x, *y, x + w, y + h)).or(sel_rect);
+        buf.copy_from_slice(self.backdrop.frame(win_w, win_h, &backdrop_shot, lit));
         let t_backdrop = t_start.elapsed();
 
         // Pass 2: annotations, clipped to the selection. We render into the
@@ -2700,6 +3119,10 @@ impl Overlay {
                 draw_rect_border(&mut buf, win_w, win_h, hx - 3, hy - 3, hx + 3, hy + 3, BLUE);
             }
         }
+        // Pass 3.5: the hover highlight's frame and label.
+        if let Some((r, label, size)) = &hover {
+            draw_target(&mut buf, win_w, win_h, *r, label, *size);
+        }
         // Where the window cannot be cut to shape, an edge so it at least
         // reads as a window over the live desktop.
         if self.editor_mode && !crate::window_shape::supported() {
@@ -2774,16 +3197,27 @@ impl Overlay {
         // both out; it disappears the moment the drag starts.
         if matches!(self.state, State::Idle) {
             draw_idle_hint(&mut buf, win_w, win_h, cursor_bounds,
-                           if self.record_mode { RECORD_HINT } else { IDLE_HINT });
+                           if self.record_mode { RECORD_HINT } else { pick_mode.hint() });
+        }
+        if let Some((bar, chips)) = &mode_bar {
+            let hovered = chips.iter().find(|(_, r)| rect_contains(*r, self.cursor)).map(|(m, _)| *m);
+            draw_mode_bar(&mut buf, win_w, win_h, *bar, chips, pick_mode, hovered);
         }
 
         // Pass 6: magnifier — only useful when the user is positioning the
         // selection edge by individual pixels. Once a region is locked in,
         // the toolbar+palette take over and the lens just gets in the way.
         // Drawn after the hint so the lens is never covered by it.
-        if matches!(self.state, State::Idle | State::Selecting) {
+        // The eyedropper brings it back over the picture, to show the pixel
+        // a click would take.
+        // Only where a drag can start: Screen and All screens take a click.
+        let can_drag = locked || pick_mode == crate::pick::PickMode::Auto;
+        let on_bar = mode_bar.as_ref().is_some_and(|(b, _)| rect_contains(*b, self.cursor));
+        if (matches!(self.state, State::Idle | State::Selecting) && can_drag && !on_bar) || picking_here {
+            // The eyedropper's lens opens up and to the left: the tool panel
+            // and its flyout are to the right and would be covered.
             draw_magnifier(&mut buf, win_w, win_h, cursor_bounds,
-                           &self.screenshot, self.cursor, shot_off);
+                           &self.screenshot, self.cursor, shot_off, picking_here);
         }
 
         // Pass 6.5: video timeline — video mode only, and only when the
@@ -2876,7 +3310,13 @@ impl Overlay {
         // The flyout's slide-out runs at 60 frames a second; the glow and
         // pulse only need 30.
         let sliding = self.flyout.is_some() && self.flyout_opened.elapsed() < FLYOUT_OPEN;
-        if is_selected_now && self.selection.is_some() {
+        if gliding {
+            // The highlight's glide, at 60 frames a second until it lands.
+            let since = self.last_anim_frame.map_or(ANIM_FRAME, |t| t.elapsed());
+            if since < ANIM_FRAME / 2 { std::thread::sleep(ANIM_FRAME / 2 - since); }
+            self.last_anim_frame = Some(std::time::Instant::now());
+            self.window.request_redraw();
+        } else if is_selected_now && self.selection.is_some() {
             let frame = if sliding { ANIM_FRAME / 2 } else { ANIM_FRAME };
             let since = self.last_anim_frame.map_or(frame, |t| t.elapsed());
             if since < frame {
@@ -3398,11 +3838,16 @@ struct FlyoutFrame {
     palette: usize,
     /// 0 → 1, eased.
     open: f32,
+    /// The eyedropper is armed: its button shows it held.
+    picking: bool,
+    /// Where the color was last picked in the spectrum, for its marker.
+    spectrum_pick: Option<(f32, f32)>,
 }
 
 fn draw_flyout(buf: &mut [u32], win_w: usize, win_h: usize, f: &FlyoutFrame) {
     const BG:      u32 = 0x00_22_22_24;   // the tool panel's own surface
     const BTN:     u32 = 0x00_2E_2E_32;   // the tool panel's buttons
+    const BTN_ARMED: u32 = 0x00_64_95_ED; // the tool panel's picked tool
     const GROOVE:  u32 = 0x00_14_14_17;
     const REST:    u32 = 0x00_44_44_4A;
     const EDGE:    u32 = 0x00_3A_3A_40;
@@ -3443,8 +3888,40 @@ fn draw_flyout(buf: &mut [u32], win_w: usize, win_h: usize, f: &FlyoutFrame) {
             draw_rounded_rect(&mut s, sw, sh, r.0, r.1, r.0 + r.2, r.1 + r.3, 4, rgb(c));
             if c == f.color { chosen = Some(*r); }
         }
-        // The tool's own color: a white ring with a gap of panel between.
-        if let Some(r) = chosen {
+        // Any other color. The eyedropper, lit while it is armed.
+        if let Some(c) = &f.layout.custom {
+            let r = c.eyedropper;
+            draw_rounded_rect(&mut s, sw, sh, r.0, r.1, r.0 + r.2, r.1 + r.3, 5, if f.picking { BTN_ARMED } else { BTN });
+            crate::icons::render_icon(&mut s, sw, sh, r.0, r.1, r.0 + r.2, r.1 + r.3,
+                                      crate::icons::IconKind::Eyedropper, [0xE8, 0xE8, 0xEC, 0xFF], None);
+            // The tool's color below it, framed like a swatch.
+            let r = c.current;
+            draw_rounded_rect(&mut s, sw, sh, r.0 - 1, r.1 - 1, r.0 + r.2 + 1, r.1 + r.3 + 1, 5, EDGE);
+            draw_rounded_rect(&mut s, sw, sh, r.0, r.1, r.0 + r.2, r.1 + r.3, 4, ink);
+            // The spectrum, framed with the swatches' hairline.
+            let (x0, y0, w, h) = c.spectrum;
+            draw_rounded_rect(&mut s, sw, sh, x0 - 1, y0 - 1, x0 + w + 1, y0 + h + 1, 5, EDGE);
+            for y in 0..h {
+                for x in 0..w {
+                    let p = spectrum_color(x as f32 / (w - 1).max(1) as f32, y as f32 / (h - 1).max(1) as f32);
+                    let (px, py) = ((x0 + x) as usize, (y0 + y) as usize);
+                    if px < sw && py < sh { s[py * sw + px] = rgb(p); }
+                }
+            }
+            // Its marker, a ringed dot of the color, only while the tool
+            // still draws in it.
+            if let Some((u, v)) = f.spectrum_pick.filter(|&(u, v)| spectrum_color(u, v) == f.color) {
+                let mx = x0 + ((w - 1) as f32 * u).round() as i32;
+                let my = y0 + ((h - 1) as f32 * v).round() as i32;
+                let mut surf = crate::painter::U32Surface { buf: &mut s, stride: fw, height: fh };
+                crate::painter::fill_disc(&mut surf, mx, my, 7, text(GROOVE));
+                crate::painter::fill_disc(&mut surf, mx, my, 6, text(VALUE));
+                crate::painter::fill_disc(&mut surf, mx, my, 4, f.color);
+            }
+        }
+        // The tool's own color: a white ring with a gap of panel between,
+        // on its swatch, or on the current-color chip when it is on none.
+        if let Some(r) = chosen.or(f.layout.custom.map(|c| c.current)) {
             draw_rounded_rect(&mut s, sw, sh, r.0 - 3, r.1 - 3, r.0 + r.2 + 3, r.1 + r.3 + 3, 7, VALUE);
             draw_rounded_rect(&mut s, sw, sh, r.0 - 1, r.1 - 1, r.0 + r.2 + 1, r.1 + r.3 + 1, 5, BG);
             draw_rounded_rect(&mut s, sw, sh, r.0, r.1, r.0 + r.2, r.1 + r.3, 4, ink);
@@ -3692,11 +4169,11 @@ fn draw_tooltip(
 /// The one-line hint shown while nothing is selected yet. Plain ASCII —
 /// the 5x7 bitmap font substitutes '?' for anything outside 0x20..=0x7E,
 /// so no dashes or arrows beyond the keyboard set.
-const IDLE_HINT: &str = "drag to select a region  -  Esc to close";
-
+/// The capture screen's own line is its mode's (`PickMode::hint`).
+///
 /// Record-mode variant: names the confirm key, because there is no Save button
 /// to fall back on and the rectangle alone doesn't say how to start.
-const RECORD_HINT: &str = "drag the area to record  -  Enter to start  -  Esc to close";
+const RECORD_HINT: &str = "pick the area to record  -  Tab for modes  -  Enter to start  -  Esc to close";
 
 /// Bottom-center hint chip, painted only in `State::Idle`. Same dark fill +
 /// hairline border as the tooltip chip so it reads as overlay chrome, but
@@ -3733,6 +4210,80 @@ fn draw_idle_hint(
         &mut surf, x0 + PAD_X, y0 + PAD_Y, SCALE, hint,
         framefang_core::color::Rgba::new_opaque(0x9A, 0x9A, 0xA2),
     );
+}
+
+/// The selection's blue, which the hover highlight shares so a click looks
+/// like it simply keeps what was lit.
+const SELECTION_BLUE: u32 = 0x00_64_95_ED;
+
+/// The hover highlight: a crisp 2 px frame in the selection's blue with a
+/// soft halo outside it, and a label naming what a click would take and how
+/// big it is (`size`, the target's own, not the glide's).
+fn draw_target(buf: &mut [u32], win_w: usize, win_h: usize, r: Rect4, label: &str, size: (i32, i32)) {
+    let (x0, y0, x1, y1) = (r.0, r.1, r.0 + r.2, r.1 + r.3);
+    if r.2 <= 0 || r.3 <= 0 { return; }
+    let (br, bg, bb) = ((SELECTION_BLUE >> 16) & 0xFF, (SELECTION_BLUE >> 8) & 0xFF, SELECTION_BLUE & 0xFF);
+    for (d, a) in [(3, 22), (2, 50), (1, 95)] {
+        blend_rect_outline(buf, win_w, win_h, x0 - d, y0 - d, x1 + d, y1 + d, br, bg, bb, a);
+    }
+    draw_rect_border(buf, win_w, win_h, x0, y0, x1, y1, SELECTION_BLUE);
+    draw_rect_border(buf, win_w, win_h, x0 + 1, y0 + 1, x1 - 1, y1 - 1, SELECTION_BLUE);
+
+    // The label: a tab in the frame's blue, sitting on the frame's top edge
+    // outside it, so it never covers what is being captured. A target at
+    // the top of the screen has no room above; the tab then hangs just
+    // inside its top-left corner. The name is white, the size a step
+    // quieter.
+    const PAD_X: i32 = 10;
+    const CHIP_H: i32 = 26;
+    let dims = format!("{} x {}", size.0, size.1);
+    let tw = |s: &str| framefang_core::text::layout(s, FLYOUT_TEXT_PX).width().ceil() as i32;
+    let (name_w, dims_w) = (tw(label), tw(&dims));
+    let chip_w = PAD_X * 2 + name_w + 12 + dims_w;
+    let (cx, cy) = if y0 - CHIP_H >= 0 { (x0, y0 - CHIP_H) } else { (x0 + 2, y0 + 2) };
+    let cx = cx.clamp(0, (win_w as i32 - chip_w).max(0));
+    let cy = cy.clamp(0, (win_h as i32 - CHIP_H).max(0));
+    draw_filled_rect(buf, win_w, win_h, cx, cy, cx + chip_w, cy + CHIP_H, SELECTION_BLUE);
+    let ty = cy as f32 + (CHIP_H as f32 - framefang_core::text::line_height(FLYOUT_TEXT_PX)) / 2.0;
+    let mut surf = crate::painter::U32Surface { buf, stride: win_w as i32, height: win_h as i32 };
+    let tx = (cx + PAD_X) as f32;
+    crate::painter::draw_unicode_text(&mut surf, tx, ty, FLYOUT_TEXT_PX, label,
+                                      framefang_core::color::Rgba::new_opaque(0xFF, 0xFF, 0xFF));
+    crate::painter::draw_unicode_text(&mut surf, tx + (name_w + 12) as f32, ty, FLYOUT_TEXT_PX, &dims,
+                                      framefang_core::color::Rgba::new_opaque(0xD8, 0xE3, 0xFA));
+}
+
+/// The capture screen's mode bar: one chip per mode, the current one in the
+/// selection's blue, and a quiet `Tab` after them for the key that cycles.
+fn draw_mode_bar(
+    buf: &mut [u32], win_w: usize, win_h: usize,
+    bar: Rect4, chips: &[(crate::pick::PickMode, Rect4)],
+    current: crate::pick::PickMode, hovered: Option<crate::pick::PickMode>,
+) {
+    let (bx, by, bw, bh) = bar;
+    draw_filled_rect(buf, win_w, win_h, bx, by, bx + bw, by + bh, 0x00_22_22_24);
+    draw_rect_border(buf, win_w, win_h, bx, by, bx + bw, by + bh, 0x00_3A_3A_40);
+    let line_h = framefang_core::text::line_height(FLYOUT_TEXT_PX);
+    for (m, (x, y, w, h)) in chips {
+        let (fill, ink) = if *m == current {
+            (SELECTION_BLUE, framefang_core::color::Rgba::new_opaque(0xFF, 0xFF, 0xFF))
+        } else if hovered == Some(*m) {
+            (0x00_38_38_3E, framefang_core::color::Rgba::new_opaque(0xE8, 0xE8, 0xEC))
+        } else {
+            (0x00_2E_2E_32, framefang_core::color::Rgba::new_opaque(0xC0, 0xC0, 0xC6))
+        };
+        draw_filled_rect(buf, win_w, win_h, *x, *y, x + w, y + h, fill);
+        let mut surf = crate::painter::U32Surface { buf: &mut *buf, stride: win_w as i32, height: win_h as i32 };
+        let tw = framefang_core::text::layout(m.label(), FLYOUT_TEXT_PX).width();
+        crate::painter::draw_unicode_text(&mut surf, *x as f32 + (*w as f32 - tw) / 2.0,
+                                          *y as f32 + (*h as f32 - line_h) / 2.0, FLYOUT_TEXT_PX, m.label(), ink);
+    }
+    let key_x = bx + bw - crate::pick::BAR_KEY_W;
+    let tw = framefang_core::text::layout("Tab", FLYOUT_TEXT_PX).width();
+    let mut surf = crate::painter::U32Surface { buf, stride: win_w as i32, height: win_h as i32 };
+    crate::painter::draw_unicode_text(&mut surf, key_x as f32 + (crate::pick::BAR_KEY_W as f32 - tw) / 2.0,
+                                      by as f32 + (bh as f32 - line_h) / 2.0, FLYOUT_TEXT_PX, "Tab",
+                                      framefang_core::color::Rgba::new_opaque(0x7A, 0x7A, 0x82));
 }
 
 /// Bare modifier presses — winit delivers these as ordinary key events, and
@@ -3835,14 +4386,21 @@ fn draw_magnifier(
     shot:     &image::ImageBuffer<image::Rgba<u8>, Vec<u8>>,
     cursor:   (i32, i32),
     shot_off: (i32, i32),
+    // Open up and to the left of the cursor first, rather than down and
+    // to the right.
+    up_left:  bool,
 ) {
     let (bx, by, bw, bh) = bounds;
     let chip = MAG_SIZE + 4;          // includes border
-    let mut x0 = cursor.0 + MAG_OFFSET;
-    let mut y0 = cursor.1 + MAG_OFFSET;
-    if x0 + chip > bx + bw { x0 = cursor.0 - MAG_OFFSET - chip; }
-    if y0 + chip > by + bh { y0 = cursor.1 - MAG_OFFSET - chip; }
-    if x0 < bx || y0 < by { return; } // not enough room either way
+    let (right, below) = (cursor.0 + MAG_OFFSET, cursor.1 + MAG_OFFSET);
+    let (left, above) = (cursor.0 - MAG_OFFSET - chip, cursor.1 - MAG_OFFSET - chip);
+    let x0 = if up_left {
+        if left >= bx { left } else { right }
+    } else if right + chip > bx + bw { left } else { right };
+    let y0 = if up_left {
+        if above >= by { above } else { below }
+    } else if below + chip > by + bh { above } else { below };
+    if x0 < bx || y0 < by || x0 + chip > bx + bw || y0 + chip > by + bh { return; } // no room either way
 
     let shot_w = shot.width()  as i32;
     let shot_h = shot.height() as i32;
@@ -4217,6 +4775,17 @@ mod tests {
             // Everything sits inside the flyout.
             let mut rects: Vec<Rect4> = l.knobs.iter().map(|(_, r)| *r).collect();
             if let Some((p, n, name, sw)) = l.colors { rects.extend([p, n, name]); rects.extend(sw); }
+            // Any-color row: with the palette, under its swatches, and none
+            // of its parts overlapping.
+            assert_eq!(l.colors.is_some(), l.custom.is_some(), "{t:?}");
+            if let (Some(c), Some((_, _, _, sw))) = (l.custom, l.colors) {
+                let last_swatch = sw.iter().map(|r| r.1 + r.3).max().unwrap();
+                assert!(c.eyedropper.1 > last_swatch, "{t:?} under the swatches");
+                assert!(c.current.1 >= c.eyedropper.1 + c.eyedropper.3, "{t:?} current under the eyedropper");
+                assert!(c.spectrum.0 >= c.eyedropper.0 + c.eyedropper.2, "{t:?} spectrum beside them");
+                assert_eq!(c.spectrum.0 + c.spectrum.2, sw[7].0 + sw[7].2, "{t:?} spectrum ends with the grid");
+                rects.extend([c.eyedropper, c.current, c.spectrum]);
+            }
             for r in rects {
                 assert!(r.0 >= 0 && r.1 >= 0 && r.0 + r.2 <= l.w && r.1 + r.3 <= l.h, "{t:?} {r:?}");
             }
@@ -4256,6 +4825,36 @@ mod tests {
         assert_eq!(p.pos.0 + p.picture_at.0, 1720, "the picture stays put");
         assert!(p.picture_at.0 > EDITOR_EDGE, "the tools are on its left");
         assert!(p.pos.0 + p.size.0 as i32 <= 2560);
+    }
+
+    #[test]
+    fn the_spectrum_runs_through_the_hues_and_ends_in_grays() {
+        use framefang_core::color::Rgba as C;
+        // Full red sits halfway down the left edge.
+        let mid = (0.92 - 0.5) / 0.80;
+        assert_eq!(spectrum_color(0.0, mid), C::new_opaque(255, 0, 0));
+        // A third of the way along the hues is green, two thirds blue.
+        let g = spectrum_color(SPECTRUM_HUES / 3.0, mid);
+        assert!(g.g > 250 && g.r < 5 && g.b < 5, "{g:?}");
+        let b = spectrum_color(SPECTRUM_HUES * 2.0 / 3.0, mid);
+        assert!(b.b > 250 && b.r < 5 && b.g < 5, "{b:?}");
+        // Light at the top, dark at the bottom.
+        let (top, bottom) = (spectrum_color(0.0, 0.0), spectrum_color(0.0, 1.0));
+        assert!(top.g > 200 && bottom.r < 70, "{top:?} {bottom:?}");
+        // The gray strip: white to black.
+        assert_eq!(spectrum_color(1.0, 0.0), C::new_opaque(255, 255, 255));
+        assert_eq!(spectrum_color(1.0, 1.0), C::new_opaque(0, 0, 0));
+        // Out-of-range input is clamped, never a panic or a wrapped hue.
+        assert_eq!(spectrum_color(-1.0, 5.0), spectrum_color(0.0, 1.0));
+    }
+
+    #[test]
+    fn a_picked_color_survives_the_next_session() {
+        use framefang_core::tool::Tool as T;
+        let mut s = AppSettings::default();
+        let teal = framefang_core::color::Rgba::new_opaque(18, 140, 126);
+        s.set_tool_style(T::Pen, framefang_core::settings::ToolStyle { color_argb: teal.to_argb(), thickness: 3.0 });
+        assert_eq!(stroke_for(&s, T::Pen).color, teal, "off every palette, and kept");
     }
 
     #[test]

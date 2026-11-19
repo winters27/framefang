@@ -141,6 +141,9 @@ pub fn run() -> Result<()> {
         /// their `WindowEvent`s by `WindowId` and drops them when their
         /// handler signals close.
         pinned:     Vec<PinView>,
+        /// The "Copied to clipboard" pill after a copy that closed the
+        /// capture window. Dropped by `about_to_wait` once it has faded.
+        toast:      Option<crate::toast::Toast>,
         /// Settings dialog window, present while the user is editing
         /// preferences. Routed by `WindowId` like the overlay + pinned
         /// windows. `None` when no settings dialog is open.
@@ -357,6 +360,9 @@ pub fn run() -> Result<()> {
         fn capture_inner(&mut self, loop_target: &ActiveEventLoop, user_delay: Duration, settle: bool) {
             if self.capturing || self.overlay.is_some() { return; }
             self.capturing = true;
+            // A pill still fading from the last copy would sit on top of the
+            // new frozen desktop (it is kept out of the capture itself).
+            self.toast = None;
             // Read now, while the hotkey is still down: holding the switch
             // key with it makes this capture do the other thing.
             let switch_at_press = !settle && user_delay.is_zero()
@@ -410,7 +416,11 @@ pub fn run() -> Result<()> {
             // the hotkey and nothing appeared on screen, and stderr is not a
             // surface a tray-resident app's user ever reads.
             match capture_all_screens() {
-                Ok(shot) => {
+                Ok(mut shot) => {
+                    // The windows as the frozen picture shows them, read
+                    // before the capture screen opens on top of them all.
+                    let windows = framefang_platform::windows_list::on_screen_windows();
+                    if self.settings.capture_cursor { framefang_platform::cursor::draw_into(&mut shot); }
                     // Remember what desktop this selection is being dragged
                     // over: if the user turns the capture into a recording via
                     // the action row's Record button, that's what the rectangle
@@ -430,6 +440,7 @@ pub fn run() -> Result<()> {
                         Ok(mut ov) => {
                             ov.set_display_map(shot.map);
                             ov.hold_at_press = switch_at_press;
+                            ov.set_windows(windows);
                             self.overlay = Some(ov);
                         }
                         Err(e) => {
@@ -476,6 +487,7 @@ pub fn run() -> Result<()> {
 
             match capture_all_screens() {
                 Ok(shot) => {
+                    let windows = framefang_platform::windows_list::on_screen_windows();
                     self.overlay_desktop = Some(shot.desktop_bounds());
                     self.pending_region_audio = Some(opts);
                     match Overlay::new_for_region_record(
@@ -483,6 +495,7 @@ pub fn run() -> Result<()> {
                     {
                         Ok(mut ov) => {
                             ov.set_display_map(shot.map);
+                            ov.set_windows(windows);
                             self.overlay = Some(ov);
                         }
                         Err(e) => {
@@ -544,6 +557,7 @@ pub fn run() -> Result<()> {
         fn capture_full_screen(&mut self, settle: bool) {
             if self.capturing || self.overlay.is_some() { return; }
             self.capturing = true;
+            self.toast = None;
 
             // Same settle delay as capture_after so the tray menu / flyout fully
             // dismisses before xcap shoots the desktop — otherwise the menu's
@@ -557,7 +571,8 @@ pub fn run() -> Result<()> {
             if settle { std::thread::sleep(Duration::from_millis(250)); }
 
             match capture_all_screens() {
-                Ok(shot) => {
+                Ok(mut shot) => {
+                    if self.settings.capture_cursor { framefang_platform::cursor::draw_into(&mut shot); }
                     let img = shot.bitmap;
                     if self.settings.auto_copy { self.copy_final(img.clone()); }
                     match save_capture(&mut self.settings, &img) {
@@ -614,7 +629,8 @@ pub fn run() -> Result<()> {
         /// bitmap is dropped here and never reaches the save folder — so a
         /// silent stderr line meant the user pasted stale clipboard contents
         /// and never learned the shot was gone.
-        fn copy_final(&mut self, img: image::ImageBuffer<image::Rgba<u8>, Vec<u8>>) {
+        /// `true` when the picture is on the clipboard.
+        fn copy_final(&mut self, img: image::ImageBuffer<image::Rgba<u8>, Vec<u8>>) -> bool {
             let (w, h) = (img.width() as usize, img.height() as usize);
             let bytes  = img.into_raw();
             match arboard::Clipboard::new() {
@@ -628,14 +644,45 @@ pub fn run() -> Result<()> {
                         eprintln!("Clipboard copy failed: {e}");
                         notify("Framefang — copy failed",
                             &framefang_core::failure::clipboard_failure(&e.to_string()), true);
+                        false
                     } else {
                         eprintln!("Copied {w}×{h} to clipboard");
+                        true
                     }
                 }
                 Err(e) => {
                     eprintln!("Clipboard unavailable: {e}");
                     notify("Framefang — copy failed",
                         &framefang_core::failure::clipboard_failure(&e.to_string()), true);
+                    false
+                }
+            }
+        }
+
+        /// Save As: the user names the file and picks PNG or JPEG. `true`
+        /// once it is written. `false` when the dialog was cancelled or the
+        /// write failed, and the editor then comes back with the picture.
+        fn save_final_as(&mut self, img: &image::ImageBuffer<image::Rgba<u8>, Vec<u8>>) -> bool {
+            let dir = save_directory(&self.settings);
+            let Some(path) = rfd::FileDialog::new()
+                .set_title("Save screenshot as")
+                .set_directory(&dir)
+                .set_file_name(capture_file_name())
+                .add_filter("PNG image", &["png"])
+                .add_filter("JPEG image", &["jpg", "jpeg"])
+                .save_file()
+            else { return false; };
+            match write_image(path, img) {
+                Ok(path) => {
+                    if self.settings.auto_copy { self.copy_final(img.clone()); }
+                    eprintln!("Saved {}", path.display());
+                    notify("Framefang — screenshot saved", &format!("{}", path.display()), false);
+                    true
+                }
+                Err(e) => {
+                    eprintln!("Save failed: {e}");
+                    notify("Framefang — screenshot not saved", &format!("{e}"), true);
+                    false
                 }
             }
         }
@@ -1203,9 +1250,11 @@ pub fn run() -> Result<()> {
             // Decide the routing target *before* consuming the event so we
             // only dispatch once. Overlay wins if it owns the id; otherwise
             // search the pinned-window list.
-            enum Target { Overlay, Pinned(usize), Settings, Recording, About, FirstRun, Updates, ConvertImage, ConvertVideo, Unknown }
+            enum Target { Overlay, Pinned(usize), Settings, Recording, About, FirstRun, Updates, ConvertImage, ConvertVideo, Toast, Unknown }
             let target = if self.overlay.as_ref().map(|ov| ov.window_id() == id).unwrap_or(false) {
                 Target::Overlay
+            } else if self.toast.as_ref().is_some_and(|t| t.window_id() == id) {
+                Target::Toast
             } else if self.settings_view.as_ref().map(|s| s.window_id() == id).unwrap_or(false) {
                 Target::Settings
             } else if self.recording_view.as_ref().map(|r| r.window_id() == id).unwrap_or(false) {
@@ -1230,6 +1279,10 @@ pub fn run() -> Result<()> {
             let mut accepted:     Option<image::ImageBuffer<image::Rgba<u8>, Vec<u8>>> = None;
             let mut accepted_video: Option<VideoCommit> = None;
             let mut copied:       Option<image::ImageBuffer<image::Rgba<u8>, Vec<u8>>> = None;
+            let mut save_as:      Option<image::ImageBuffer<image::Rgba<u8>, Vec<u8>>> = None;
+            // Where the "Copied" pill goes, read off the overlay before it is
+            // dropped. Only a copy that closes the window gets one.
+            let mut toast_spot:   Option<(i32, i32)> = None;
             let mut pinned_payload: Option<(image::ImageBuffer<image::Rgba<u8>, Vec<u8>>, (i32, i32))> = None;
             let mut record_region: Option<(i32, i32, i32, i32)> = None;
             let mut chosen: Option<Box<ChosenRegion>> = None;
@@ -1243,6 +1296,7 @@ pub fn run() -> Result<()> {
                             OverlayOutcome::Continue        => {}
                             OverlayOutcome::Cancelled       => { drop_overlay = true; }
                             OverlayOutcome::Accepted(img)   => { drop_overlay = true; accepted = Some(img); }
+                            OverlayOutcome::SaveAs(img)     => { save_as = Some(img); }
                             OverlayOutcome::AcceptedVideo(commit) => { drop_overlay = true; accepted_video = Some(commit); }
                             OverlayOutcome::Copied(img)     => { drop_overlay = true; copied   = Some(img); }
                             OverlayOutcome::CopiedOpen(img) => { copied = Some(img); }
@@ -1388,7 +1442,27 @@ pub fn run() -> Result<()> {
                         }
                     }
                 }
+                Target::Toast => {
+                    if matches!(ev, WindowEvent::RedrawRequested) {
+                        if let Some(t) = self.toast.as_mut() { t.redraw(); }
+                    }
+                }
                 Target::Unknown => {}
+            }
+
+            // Save As asks with the overlay out of the way, and brings it back
+            // if the user cancels.
+            if let Some(img) = save_as {
+                if let Some(ov) = self.overlay.as_mut() { ov.set_hidden(true); }
+                if self.save_final_as(&img) {
+                    drop_overlay = true;
+                } else if let Some(ov) = self.overlay.as_mut() {
+                    ov.set_hidden(false);
+                }
+            }
+
+            if drop_overlay && copied.is_some() {
+                toast_spot = self.overlay.as_ref().and_then(|ov| ov.notice_spot(crate::toast::size()));
             }
 
             if drop_overlay {
@@ -1405,6 +1479,7 @@ pub fn run() -> Result<()> {
                     self.settings.tool_styles    = ov.settings().tool_styles.clone();
                     self.settings.last_tool      = ov.settings().last_tool.clone();
                     self.settings.palette_index  = ov.settings().palette_index;
+                    self.settings.capture_mode   = ov.settings().capture_mode.clone();
                 }
                 self.overlay = None;
                 // A cancelled region-selection session must not leave its audio
@@ -1446,7 +1521,16 @@ pub fn run() -> Result<()> {
                 if self.settings.auto_copy { self.copy_final(img.clone()); }
                 self.save_final(img);
             }
-            if let Some(img) = copied   { self.copy_final(img); }
+            if let Some(img) = copied {
+                if self.copy_final(img) {
+                    if let Some(spot) = toast_spot {
+                        match crate::toast::Toast::new(_loop_target, spot) {
+                            Ok(t) => self.toast = Some(t),
+                            Err(e) => eprintln!("framefang: copied notice: {e}"),
+                        }
+                    }
+                }
+            }
             if let Some((img, pos)) = pinned_payload {
                 if self.settings.auto_copy { self.copy_final(img.clone()); }
                 match PinView::new(_loop_target, img, pos) {
@@ -1477,6 +1561,8 @@ pub fn run() -> Result<()> {
             // `resumed` too, so the welcome window can never be raised on a
             // tick where the tray icon doesn't exist yet.
             self.maybe_show_first_run(loop_target);
+            // The "Copied" pill's fade is timed, so every pass steps it.
+            if self.toast.as_mut().is_some_and(|t| !t.tick()) { self.toast = None; }
             // Poll roughly 30Hz when idle.
             let now = Instant::now();
             if now.duration_since(self.last_tick) >= Duration::from_millis(33) {
@@ -1501,6 +1587,7 @@ pub fn run() -> Result<()> {
         recorder: Recorder::new(),
         overlay: None,
         pinned:  Vec::new(),
+        toast:   None,
         settings_view:  None,
         recording_view: None,
         about_view:     None,
@@ -1538,8 +1625,7 @@ fn save_capture(
     std::fs::create_dir_all(&dir)
         .map_err(|e| anyhow!(framefang_core::failure::save_folder_failure(
             &dir.display().to_string(), &e.to_string())))?;
-    let stamp = Local::now().format("%Y%m%d_%H%M%S");
-    let path  = dir.join(format!("framefang_{stamp}.png"));
+    let path  = dir.join(capture_file_name());
     bmp.save(&path)
         .map_err(|e| anyhow!(framefang_core::failure::save_write_failure(
             &path.display().to_string(), &e.to_string())))?;
@@ -1547,6 +1633,38 @@ fn save_capture(
         settings.save_directory = dir.to_string_lossy().to_string();
     }
     Ok(path)
+}
+
+/// A screenshot's file name: `framefang_YYYYMMDD_HHMMSS.png`.
+fn capture_file_name() -> String {
+    format!("framefang_{}.png", Local::now().format("%Y%m%d_%H%M%S"))
+}
+
+/// Write `bmp` where Save As said, in the format its extension names: JPEG
+/// for `.jpg` / `.jpeg`, PNG for `.png` and for a name with no image
+/// extension, which gets `.png` added. Returns the path written.
+fn write_image(path: PathBuf, bmp: &image::ImageBuffer<image::Rgba<u8>, Vec<u8>>) -> Result<PathBuf> {
+    let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
+    let fail = |p: &std::path::Path, e: &dyn std::fmt::Display|
+        anyhow!(framefang_core::failure::save_write_failure(&p.display().to_string(), &e.to_string()));
+    match ext.as_deref() {
+        Some("jpg" | "jpeg") => {
+            let file = std::fs::File::create(&path).map_err(|e| fail(&path, &e))?;
+            let rgb = image::DynamicImage::ImageRgba8(bmp.clone()).to_rgb8();
+            image::codecs::jpeg::JpegEncoder::new_with_quality(std::io::BufWriter::new(file), 92)
+                .encode_image(&rgb)
+                .map_err(|e| fail(&path, &e))?;
+            Ok(path)
+        }
+        Some("png") => { bmp.save(&path).map_err(|e| fail(&path, &e))?; Ok(path) }
+        _ => {
+            let mut named = path.into_os_string();
+            named.push(".png");
+            let path = PathBuf::from(named);
+            bmp.save(&path).map_err(|e| fail(&path, &e))?;
+            Ok(path)
+        }
+    }
 }
 
 fn save_directory(s: &AppSettings) -> PathBuf {

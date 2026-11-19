@@ -60,6 +60,8 @@ wasapi = "0.15"
 # a message-only window for the hotkeys' second path (see raw_keys.rs).
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Dwm",      # visible frames and cloaking of the windows on screen (windows_list.rs)
+    "Win32_Graphics_Gdi",      # the mouse pointer drawn into a capture (cursor.rs)
     "Win32_System_LibraryLoader",
     "Win32_UI_Input",
     "Win32_UI_Input_KeyboardAndMouse",

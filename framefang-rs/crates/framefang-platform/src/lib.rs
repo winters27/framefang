@@ -12,6 +12,8 @@ pub mod capture;
 pub mod capture_portal;
 pub mod child_guard;
 pub mod clipboard;
+/// The mouse pointer, drawn into a capture when Settings asks for it.
+pub mod cursor;
 pub mod hotkey;
 /// GlobalShortcuts-portal hotkey backend, selected by `hotkey::HotkeyManager`
 /// on Wayland sessions.
@@ -25,6 +27,8 @@ mod raw_keys;
 pub mod recorder;
 pub mod session;
 pub mod tray;
+/// The windows on screen at capture time, for the hover highlight.
+pub mod windows_list;
 
 pub use capture::{capture_all_screens, Captured, MonitorFrame};
 pub use child_guard::reap_orphaned_recorder;

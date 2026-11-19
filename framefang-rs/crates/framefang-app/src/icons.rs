@@ -20,6 +20,9 @@ pub enum IconKind {
     /// Record: the universal filled dot, ringed so it still reads as a button
     /// glyph rather than a stray pixel at 36 px.
     Record,
+    /// The flyout's color picker: a pipette, bulb up and right, drawn to
+    /// fit a swatch-sized button rather than the panels' 36 px ones.
+    Eyedropper,
 }
 
 /// Color override for the Color/Thickness/etc. icons. `accent_rgba` is used
@@ -399,6 +402,38 @@ pub fn render_icon(
             pb.push_circle(cx, cy, (outer - 4.0).max(2.0));
             if let Some(p) = pb.finish() {
                 pixmap.fill_path(&p, &p2, FillRule::Winding, Transform::identity(), None);
+            }
+        }
+        IconKind::Eyedropper => {
+            // In a box this small the panels' 8 px padding would leave no
+            // glyph, so it is laid out on the box itself.
+            let u = cw.min(ch) / 21.0;
+            let at = |x: f32, y: f32| (cx + (x - 10.5) * u, cy + (y - 10.5) * u);
+            // The glass tube, tip at the lower left.
+            let thin = Stroke { width: 1.8 * u, ..stroke.clone() };
+            let mut tube = PathBuilder::new();
+            let (x, y) = at(5.0, 16.0);
+            tube.move_to(x, y);
+            let (x, y) = at(12.5, 8.5);
+            tube.line_to(x, y);
+            if let Some(p) = tube.finish() {
+                pixmap.stroke_path(&p, &paint, &thin, Transform::identity(), None);
+            }
+            // The collar across it.
+            let mut collar = PathBuilder::new();
+            let (x, y) = at(10.0, 7.0);
+            collar.move_to(x, y);
+            let (x, y) = at(14.0, 11.0);
+            collar.line_to(x, y);
+            if let Some(p) = collar.finish() {
+                pixmap.stroke_path(&p, &paint, &thin, Transform::identity(), None);
+            }
+            // The bulb, filled.
+            let mut bulb = PathBuilder::new();
+            let (x, y) = at(14.5, 6.5);
+            bulb.push_circle(x, y, 2.8 * u);
+            if let Some(p) = bulb.finish() {
+                pixmap.fill_path(&p, &paint, FillRule::Winding, Transform::identity(), None);
             }
         }
     }

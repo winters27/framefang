@@ -138,6 +138,9 @@ enum WidgetKind {
     AutoCopy,
     /// The editor's Copy also closes the editor. Shown under AutoCopy.
     CloseAfterCopy,
+    /// Screenshots show the mouse pointer. Laid out only where the platform
+    /// can draw it (`framefang_platform::cursor::SUPPORTED`).
+    CaptureCursor,
     OpenJson,
     SaveBtn,
     CancelBtn,
@@ -566,6 +569,9 @@ impl SettingsView {
             WidgetKind::CloseAfterCopy => {
                 self.draft.close_after_copy = !self.draft.close_after_copy;
             }
+            WidgetKind::CaptureCursor => {
+                self.draft.capture_cursor = !self.draft.capture_cursor;
+            }
             WidgetKind::StartWithOs => {
                 self.draft.start_with_windows = !self.draft.start_with_windows;
             }
@@ -666,6 +672,10 @@ impl SettingsView {
             cx += KEY_CHIP_W + CHIP_GAP;
         }
         y += ROW_H + ROW_GAP;
+        // What goes into the picture, before where it goes.
+        if framefang_platform::cursor::SUPPORTED {
+            rows.push(Row { kind: WidgetKind::CaptureCursor, label: "Include the mouse pointer", rect: (x, y, row_w, ROW_H) }); y += ROW_H + ROW_GAP;
+        }
         rows.push(Row { kind: WidgetKind::AutoCopy,        label: "Copy screenshots automatically", rect: (x, y, row_w, ROW_H) }); y += ROW_H + ROW_GAP;
         rows.push(Row { kind: WidgetKind::CloseAfterCopy,   label: "Close the editor after copying", rect: (x, y, row_w, ROW_H) }); y += ROW_H + 22;
 
@@ -1231,10 +1241,11 @@ fn render_row<S: painter::Surface>(
             let ty = val_y + (val_h - bitmap_font::GLYPH_H) / 2;
             draw_text(surf, val_x + 8, ty, 1, &truncated, argb_to_framefang(color));
         }
-        WidgetKind::StartWithOs | WidgetKind::AutoCopy | WidgetKind::CloseAfterCopy => {
+        WidgetKind::StartWithOs | WidgetKind::AutoCopy | WidgetKind::CloseAfterCopy | WidgetKind::CaptureCursor => {
             let on = match row.kind {
                 WidgetKind::AutoCopy         => draft.auto_copy,
                 WidgetKind::CloseAfterCopy   => draft.close_after_copy,
+                WidgetKind::CaptureCursor    => draft.capture_cursor,
                 _                            => draft.start_with_windows,
             };
             draw_toggle(surf, val_x, val_y, val_h, on);
@@ -1609,7 +1620,7 @@ mod tests {
             let indent = match r.kind {
                 WidgetKind::CloseAfterCopy => SUB_INDENT,
                 WidgetKind::SaveFolder | WidgetKind::RecordingsFolder | WidgetKind::Ffmpeg | WidgetKind::AutoCopy
-                | WidgetKind::AfterCapture
+                | WidgetKind::CaptureCursor | WidgetKind::AfterCapture
                 | WidgetKind::HotkeyDisplay(_) | WidgetKind::Theme | WidgetKind::StartWithOs => 0,
                 _ => continue,
             };
@@ -1653,10 +1664,11 @@ mod tests {
         assert_eq!(theme2.rect.1 - (last_hotkey.rect.1 + ROW_H), 40, "same spacing as the other sections");
         assert!(content_height(&without) < content_height(&rows));
         // The After-a-capture row (2026-11-17) took the last 40 px a 768 px
-        // screen had: with the card it now needs about 808 (title bar and a
-        // 48 px taskbar included), so 1366x768 cuts off the bottom row. Pinned
-        // so the next row is a deliberate choice too.
-        assert!(content_height(&rows) + crate::chrome::TITLE_H as u32 + 48 <= 808, "fits an 808 px screen");
+        // screen had: with the card it needed about 808 (title bar and a
+        // 48 px taskbar included), so 1366x768 cuts off the bottom row. The
+        // mouse-pointer row (2026-11-19, Brandon asked for it) adds 40 more.
+        // Pinned so the next row is a deliberate choice too.
+        assert!(content_height(&rows) + crate::chrome::TITLE_H as u32 + 48 <= 848, "fits an 848 px screen");
     }
 
     #[test]
