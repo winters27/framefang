@@ -1,80 +1,81 @@
 [package]
-name        = "framefang-platform"
-version     = { workspace = true }
-edition     = { workspace = true }
-authors     = { workspace = true }
-license     = { workspace = true }
-repository  = { workspace = true }
-description = "Framefang — platform shims (capture, hotkey, tray, clipboard)"
+name = "framefang-platform"
+description = "Frame Fang's operating-system layer: screen capture, hotkeys, tray icon, clipboard and recording"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
-framefang-core   = { path = "../framefang-core" }
-xcap          = { workspace = true }
-global-hotkey = { workspace = true }
-tray-icon     = { workspace = true }
-arboard       = { workspace = true }
-image         = { workspace = true }
-chrono        = { workspace = true }
-thiserror     = { workspace = true }
-anyhow        = { workspace = true }
+framefang-core = { path = "../framefang-core" }
+anyhow.workspace = true
+arboard.workspace = true
+chrono.workspace = true
+global-hotkey.workspace = true
+image.workspace = true
+thiserror.workspace = true
+tray-icon.workspace = true
+xcap.workspace = true
 
-# Single-instance guard (flock) and PR_SET_PDEATHSIG on Linux, both of which
-# are raw syscalls with no safe wrapper in std. Dual MIT / Apache-2.0.
+# Every Unix: flock for the one-instance lock, and PR_SET_PDEATHSIG on Linux
+# so a recorder child dies with us. Neither has a safe std wrapper.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# tray-icon on Linux speaks StatusNotifierItem via libayatana-appindicator,
-# which requires GTK to be initialized on the main thread before any menu /
-# tray-icon construction, and needs GTK's main context iterated to deliver
-# menu-click events. We init it in `Tray::new` and pump it from the winit
-# event loop via `Tray::pump_events`.
 [target.'cfg(target_os = "linux")'.dependencies]
+# The Linux tray backend (StatusNotifierItem through libayatana-appindicator)
+# runs on GTK: GTK has to be set up on the main thread before the first menu
+# item exists, and its main loop has to be turned for clicks to arrive.
+# `Tray::new` does the first and `Tray::pump_events` the second.
 gtk = "0.18"
-
-# Wayland has no key grab and no X11 screen to read, so everything an X11
-# session gets for free is a portal round-trip here: GlobalShortcuts for the
-# hotkey, Screenshot as a capture fallback, ScreenCast for recording.
-# `ashpd` is already in the tree (rfd pulls it for its file pickers) — matching
-# its `async-std` flavour keeps a single zbus runtime in the process, and
-# `pollster` (also already in the tree, same reason) drives the futures from
-# our own threads without dragging in tokio.
-ashpd    = { version = "0.11", default-features = false, features = ["async-std"] }
-pollster = "0.4"
+# Wayland gives a client neither a key grab nor a readable screen, so the
+# hotkey (GlobalShortcuts), the capture fallback (Screenshot) and recording
+# (ScreenCast) all go through xdg-desktop-portal. rfd already brings `ashpd`
+# in for its file dialogs; using the same async-std flavour means one zbus
+# runtime in the process. `pollster`, also already in the tree, runs those
+# futures on our own threads so tokio never has to come in.
+ashpd = { version = "0.11", default-features = false, features = ["async-std"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-
-# Wayland screen recording: the ScreenCast portal hands back a PipeWire node,
-# and ffmpeg has no PipeWire input, so we pump the frames ourselves.
-# `pipewire` is already a transitive dependency via xcap, so this adds a
-# direct edge rather than a new system requirement (libpipewire-0.3-dev was
-# already needed to build).
+pollster = "0.4"
+# ScreenCast answers with a PipeWire node and ffmpeg can't read one, so the
+# recorder pulls the frames itself (recorder_wayland.rs). xcap already
+# depends on pipewire, so building needed libpipewire-0.3-dev before this
+# line too: it is a direct edge, not a new requirement.
 pipewire = "0.9"
 
-# Windows system-audio capture. WASAPI loopback on the default render endpoint
-# pulls what the speakers are playing without any virtual-cable driver, and the
-# default capture endpoint gives the mic. Both feed ffmpeg over a loopback TCP
-# socket (see recorder_windows_audio.rs). No Media Foundation / COM hand-rolling.
 [target.'cfg(target_os = "windows")'.dependencies]
+# Sound for recordings (recorder_windows_audio.rs): the default playback
+# device opened in loopback mode is "what you hear", the default capture
+# device is the microphone, and neither needs Stereo Mix or a virtual cable.
+# The samples reach ffmpeg over a socket on 127.0.0.1.
 wasapi = "0.15"
-# Job Objects, so the recorder child is terminated by the kernel when our
-# process handle to the job closes (see child_guard.rs). Raw keyboard input and
-# a message-only window for the hotkeys' second path (see raw_keys.rs).
 windows = { version = "0.62", features = [
+    # Shared by everything below.
     "Win32_Foundation",
-    "Win32_Graphics_Dwm",      # visible frames and cloaking of the windows on screen (windows_list.rs)
-    "Win32_Graphics_Gdi",      # the mouse pointer drawn into a capture (cursor.rs)
+    # A Job Object holds the recorder child so the kernel ends it when our
+    # handle closes (child_guard.rs). SECURITY_ATTRIBUTES is in the
+    # CreateJobObjectW signature, and IO_COUNTERS sits inside
+    # JOBOBJECT_EXTENDED_LIMIT_INFORMATION.
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    # The hotkeys' second route: raw keyboard input into a message-only
+    # window (raw_keys.rs).
     "Win32_System_LibraryLoader",
     "Win32_UI_Input",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
-    # UI Automation: which part of a window scrolls, for SCROLL mode's
-    # highlight (scroll_parts.rs).
+    # Window frames and cloaking for the hover highlight (windows_list.rs),
+    # and the pointer drawn into a capture (cursor.rs).
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    # UI Automation finds the part of a window that scrolls, for SCROLL
+    # mode's highlight (scroll_parts.rs).
     "Win32_UI_Accessibility",
     "Win32_System_Com",
-    "Win32_Security",          # SECURITY_ATTRIBUTES in the CreateJobObjectW signature
-    "Win32_System_JobObjects",
-    "Win32_System_Threading",  # IO_COUNTERS inside JOBOBJECT_EXTENDED_LIMIT_INFORMATION
-    # Windows.Media.Ocr for reading text (ocr.rs): the engine, the bitmap it
-    # reads, the buffer that bitmap is copied from, and the language lists.
+    # Windows.Media.Ocr reads text (ocr.rs): the engine, its bitmap, the
+    # buffer that bitmap is filled from, and the language lists.
     "Media_Ocr",
     "Graphics_Imaging",
     "Storage_Streams",
@@ -83,20 +84,40 @@ windows = { version = "0.62", features = [
     "Globalization",
 ] }
 
-# macOS system-audio capture. ScreenCaptureKit captures the system audio mix
-# without a loopback driver (BlackHole / Aggregate); we pull the PCM out of the
-# delivered CMSampleBuffers and stream it into ffmpeg over a loopback TCP socket
-# (see recorder_macos_audio.rs), exactly like the Windows path.
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSString", "NSError", "NSArray", "NSObjCRuntime", "NSDictionary"] }
-# Reading text (ocr.rs): Vision's recognizer, on a CGImage made from the
-# picture's bytes.
-objc2-vision = { version = "0.3", default-features = false, features = ["std", "VNRequest", "VNRecognizeTextRequest", "VNRequestHandler", "VNObservation", "VNTypes", "objc2-core-graphics", "objc2-core-foundation"] }
-objc2-core-graphics = { version = "0.3", features = ["CGImage", "CGColorSpace", "CGDataProvider"] }
-objc2-screen-capture-kit = { version = "0.3", features = ["SCStream", "SCShareableContent", "SCError"] }
-objc2-core-media = { version = "0.3", features = ["CMSampleBuffer", "CMBlockBuffer", "CMFormatDescription", "objc2-core-audio-types"] }
-objc2-core-audio-types = { version = "0.3", features = ["CoreAudioBaseTypes"] }
-objc2-core-foundation = { version = "0.3", features = ["CFData"] }
+# Sound for recordings (recorder_macos_audio.rs): ScreenCaptureKit hands us
+# the system mix with no BlackHole or Aggregate device. The PCM is taken out
+# of each CMSampleBuffer and sent to ffmpeg over a 127.0.0.1 socket, the same
+# way the Windows recorder does it.
 block2 = "0.6"
 dispatch2 = "0.3"
+objc2 = "0.6"
+objc2-core-audio-types = { version = "0.3", features = ["CoreAudioBaseTypes"] }
+objc2-core-foundation = { version = "0.3", features = ["CFData"] }
+objc2-core-media = { version = "0.3", features = [
+    "CMSampleBuffer",
+    "CMBlockBuffer",
+    "CMFormatDescription",
+    "objc2-core-audio-types",
+] }
+objc2-foundation = { version = "0.3", features = [
+    "NSString",
+    "NSError",
+    "NSArray",
+    "NSObjCRuntime",
+    "NSDictionary",
+] }
+objc2-screen-capture-kit = { version = "0.3", features = ["SCStream", "SCShareableContent", "SCError"] }
+# Text recognition (ocr.rs): Vision's text request, run on a CGImage built
+# from the picture's bytes.
+objc2-core-graphics = { version = "0.3", features = ["CGImage", "CGColorSpace", "CGDataProvider"] }
+objc2-vision = { version = "0.3", default-features = false, features = [
+    "std",
+    "VNRequest",
+    "VNRecognizeTextRequest",
+    "VNRequestHandler",
+    "VNObservation",
+    "VNTypes",
+    "objc2-core-graphics",
+    "objc2-core-foundation",
+] }

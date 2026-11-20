@@ -1,40 +1,32 @@
-//! Single source for the winit window icon that every Framefang window
-//! (overlay, pin, settings, about, updates, convert-image, convert-video,
-//! recording indicator) attaches to itself.
-//!
-//! Loads the same 256×256 brand PNG that the tray icon, the Linux desktop
-//! launcher, the Windows .ico, and the macOS .icns all derive from — so
-//! the taskbar / dock / Alt-Tab thumbnail are visually identical to the
-//! tray icon and the installer artwork. One source of truth.
-//!
-//! The decode happens once on first call; subsequent calls reuse the
-//! lazily-built `Icon`. Failure is non-fatal — a window with no icon
-//! still works, the OS just falls back to its generic placeholder.
+/*!
+The window icon every Frame Fang window sets on itself (editor overlay, pins,
+the settings, about, updates and convert dialogs, the recording indicator).
 
-use std::sync::OnceLock;
-use winit::window::Icon;
+It is decoded from the same 256 by 256 brand PNG the tray icon, the Linux
+launcher entry, the Windows `.ico` and the macOS `.icns` are made from, so the
+taskbar, Dock and Alt-Tab pictures match the tray and the installer.
+*/
 
-/// 256×256 is big enough that any OS thumbnail size downsamples cleanly,
-/// and small enough that the embedded PNG (~6 KB) doesn't bloat the
-/// binary. The same file feeds the macOS .icns build and is referenced
-/// by the Linux .desktop entry.
-const ICON_PNG: &[u8] = include_bytes!(
-    "../../../../icons/linux_hicolor/256x256/apps/framefang.png"
-);
+use {std::sync::OnceLock, winit::window::Icon};
 
-/// Shared lazily-built icon. `OnceLock` avoids re-decoding the PNG every
-/// time we open a window, which would otherwise happen 5+ times in a
-/// normal tray session (one per dialog open).
-static ICON: OnceLock<Option<Icon>> = OnceLock::new();
+/// The brand PNG, compiled in. 256 pixels downsamples cleanly to any size an
+/// OS asks for while staying only a few kilobytes.
+const BRAND_PNG: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../icons/linux_hicolor/256x256/apps/framefang.png"));
 
-/// Returns the shared brand icon, decoded on first call. `None` means the
-/// PNG bytes failed to decode (shouldn't happen — embedded at compile
-/// time) or `Icon::from_rgba` rejected them. Callers should treat `None`
-/// as "no icon" rather than a hard error.
+/// Decoded once, since a normal session opens several windows and each
+/// would otherwise decode the PNG again.
+static DECODED: OnceLock<Option<Icon>> = OnceLock::new();
+
+/// The brand icon, or `None` if it could not be built. That should not
+/// happen with a compiled-in PNG, and it is not an error worth surfacing: a
+/// window without an icon works fine and the OS shows its generic one.
 pub fn shared() -> Option<Icon> {
-    ICON.get_or_init(|| {
-        let img = image::load_from_memory(ICON_PNG).ok()?.into_rgba8();
-        let (w, h) = img.dimensions();
-        Icon::from_rgba(img.into_raw(), w, h).ok()
-    }).clone()
+    DECODED.get_or_init(decode).clone()
+}
+
+fn decode() -> Option<Icon> {
+    let rgba = image::load_from_memory(BRAND_PNG).ok()?.into_rgba8();
+    let (width, height) = rgba.dimensions();
+    Icon::from_rgba(rgba.into_raw(), width, height).ok()
 }

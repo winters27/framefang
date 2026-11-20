@@ -1,98 +1,119 @@
-//! Persistent app settings. Stored as JSON at the platform's config dir,
-//! e.g. `%APPDATA%/Framefang/settings.json` on Windows, `~/.config/Framefang/settings.json`
-//! on Linux, `~/Library/Application Support/Framefang/settings.json` on macOS.
+//! Frame Fang's settings, and the settings.json file that keeps them.
+//!
+//! The file sits in the per-user config folder the `directories` crate finds
+//! for Frame Fang (under `%APPDATA%` on Windows, `~/.config` on Linux and
+//! `~/Library/Application Support` on macOS). Its field names, value forms
+//! and defaults are a promise to every existing install: a file written by
+//! any earlier version must keep loading to the same values.
 
-use std::fs;
-use std::io;
-use std::path::PathBuf;
+use std::{fs, io, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::theme::ThemeName;
 
+/// The name of the settings file inside the config folder.
+const SETTINGS_FILE: &str = "settings.json";
+
 bitflags::bitflags! {
-    /// Hotkey modifier mask. Numeric values match Win32 `MOD_*` so the same
-    /// settings.json works on the C# Windows build and the Rust build.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    /// The modifier keys a shortcut needs held. The bits are Win32's
+    /// `MOD_*` values on every platform, and settings.json stores the mask
+    /// as a plain number.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub struct Modifiers: u32 {
-        const ALT     = 0x0001;
+        const ALT = 0x0001;
         const CONTROL = 0x0002;
-        const SHIFT   = 0x0004;
-        const SUPER   = 0x0008;
+        const SHIFT = 0x0004;
+        const SUPER = 0x0008;
     }
 }
 
+// The mask goes to and from JSON as its number. Bits Frame Fang does not
+// know are dropped on the way in rather than refusing the file.
 impl Serialize for Modifiers {
-    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
-        ser.serialize_u32(self.bits())
+    fn serialize<S>(&self, out: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.bits().serialize(out)
     }
 }
 
 impl<'de> Deserialize<'de> for Modifiers {
-    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
-        let bits = u32::deserialize(de)?;
-        Ok(Modifiers::from_bits_truncate(bits))
+    fn deserialize<D>(input: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        u32::deserialize(input).map(Self::from_bits_truncate)
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// A keyboard shortcut: some modifiers held plus one key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Hotkey {
-    pub modifiers:   Modifiers,
-    /// Win32 virtual-key code. `0x2C` (`VK_SNAPSHOT` / Print Screen) is the
-    /// default on Windows and Linux; macOS defaults to `0x37` (`7`) instead,
-    /// because Apple keyboards have no Print Screen key at all.
+    pub modifiers: Modifiers,
+    /// The key, as a Win32 virtual-key code on every platform.
     pub virtual_key: u32,
 }
 
+/// The region capture shortcut a new install starts with.
+///
+/// Print Screen (`0x2C`) on Windows and Linux. Mac keyboards have no Print
+/// Screen key, and `global-hotkey` would turn `0x2C` into Carbon key code
+/// `0x46`, which no Mac keyboard sends, so that shortcut could never fire.
+/// The Mac gets Cmd+Shift+7 instead; Cmd+Shift+5 already opens the system's
+/// own Screenshot app.
+#[cfg(not(target_os = "macos"))]
+const FIRST_CAPTURE: Hotkey = Hotkey { modifiers: Modifiers::empty(), virtual_key: 0x2C };
+#[cfg(target_os = "macos")]
+const FIRST_CAPTURE: Hotkey = Hotkey { modifiers: Modifiers::SUPER.union(Modifiers::SHIFT), virtual_key: 0x37 };
+
 impl Default for Hotkey {
-    fn default() -> Self {
-        Hotkey {
-            modifiers: default_hotkey_modifiers_flags(),
-            virtual_key: default_vk(),
-        }
-    }
+    fn default() -> Self { FIRST_CAPTURE }
 }
 
 impl Hotkey {
-    /// Human-readable rendering, e.g. `"Ctrl + Shift + P"` or `"Print Screen"`.
-    /// Unknown VKs render as `"(0xNN)"` so the user can at least see they have
-    /// an unsupported key bound.
+    /// The shortcut as Settings writes it, such as `"Ctrl + Shift + P"` or
+    /// `"Print Screen"`. A key with no name in [`KEYS`] shows as `"(0xNN)"`,
+    /// so a user who bound an unusual key can still see that one is set.
     pub fn describe(&self) -> String {
-        let key = vk_label(self.virtual_key)
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("(0x{:02X})", self.virtual_key));
-        let mods = self.modifiers.describe();
-        if mods.is_empty() { key } else { format!("{} + {}", mods, key) }
+        let key = match vk_label(self.virtual_key) {
+            Some(name) => name.to_owned(),
+            None => format!("(0x{:02X})", self.virtual_key),
+        };
+        let held = self.modifiers.describe();
+        if held.is_empty() { key } else { format!("{held} + {key}") }
     }
 }
 
-impl Modifiers {
-    /// Render the active modifier set as `"Ctrl + Shift + Alt + Win"` (in the
-    /// order Windows users expect). Returns the empty string when no modifiers
-    /// are set.
-    ///
-    /// macOS uses that platform's names and ordering instead --
-    /// `"Cmd + Ctrl + Opt + Shift"`. Names are spelled out rather than drawn
-    /// with the Apple modifier glyphs because every string here goes through a
-    /// 5x7 ASCII bitmap font.
-    #[cfg(not(target_os = "macos"))]
-    pub fn describe(&self) -> String {
-        let mut parts: Vec<&str> = Vec::new();
-        if self.contains(Modifiers::CONTROL) { parts.push("Ctrl"); }
-        if self.contains(Modifiers::SHIFT)   { parts.push("Shift"); }
-        if self.contains(Modifiers::ALT)     { parts.push("Alt"); }
-        if self.contains(Modifiers::SUPER)   { parts.push("Win"); }
-        parts.join(" + ")
-    }
+/// Modifier names in the order people on this platform say them. They are
+/// spelled out, never the Mac's modifier symbols, because all of this is
+/// drawn with an ASCII-only 5x7 bitmap font.
+#[cfg(not(target_os = "macos"))]
+const MODIFIER_NAMES: [(Modifiers, &str); 4] = [
+    (Modifiers::CONTROL, "Ctrl"),
+    (Modifiers::SHIFT, "Shift"),
+    (Modifiers::ALT, "Alt"),
+    (Modifiers::SUPER, "Win"),
+];
+#[cfg(target_os = "macos")]
+const MODIFIER_NAMES: [(Modifiers, &str); 4] = [
+    (Modifiers::SUPER, "Cmd"),
+    (Modifiers::CONTROL, "Ctrl"),
+    (Modifiers::ALT, "Opt"),
+    (Modifiers::SHIFT, "Shift"),
+];
 
-    #[cfg(target_os = "macos")]
+impl Modifiers {
+    /// The held modifiers joined with `" + "`, such as `"Ctrl + Shift"` (or
+    /// `"Cmd + Shift"` on a Mac); empty when none are held.
     pub fn describe(&self) -> String {
-        let mut parts: Vec<&str> = Vec::new();
-        if self.contains(Modifiers::SUPER)   { parts.push("Cmd"); }
-        if self.contains(Modifiers::CONTROL) { parts.push("Ctrl"); }
-        if self.contains(Modifiers::ALT)     { parts.push("Opt"); }
-        if self.contains(Modifiers::SHIFT)   { parts.push("Shift"); }
-        parts.join(" + ")
+        let names: Vec<&str> = MODIFIER_NAMES
+            .iter()
+            .filter(|(bit, _)| self.contains(*bit))
+            .map(|(_, name)| *name)
+            .collect();
+        names.join(" + ")
     }
 }
 
@@ -160,8 +181,8 @@ pub fn key_info(vk: u32) -> Option<&'static KeyInfo> {
     KEYS.iter().find(|i| i.vk == vk)
 }
 
-/// Map a Win32 virtual-key code to a short, user-facing label, or `None` for
-/// a key not in [`KEYS`] (callers show "(0xNN)").
+/// The short name Settings shows for a Win32 key code, or `None` for a key
+/// missing from [`KEYS`] (callers then show its code).
 pub fn vk_label(vk: u32) -> Option<&'static str> {
     key_info(vk).map(|i| i.label)
 }
@@ -189,40 +210,45 @@ pub fn blocks_typing(hk: &Hotkey) -> bool {
     !bindable_alone(hk.virtual_key) && !hk.modifiers.intersects(typing_safe_modifiers())
 }
 
+/// Everything Frame Fang remembers between runs.
+///
+/// Each field is stored under its own name in PascalCase (`last_tool` is
+/// `LastTool`), apart from the few renamed below. A field missing from the
+/// file takes its value from [`AppSettings::default`], which is how a file
+/// from before a setting existed still loads.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
 pub struct AppSettings {
-    #[serde(rename = "LastTool", default = "default_tool")]
+    /// The tool the editor opens with: a [`crate::tool::Tool::name`].
     pub last_tool: String,
 
-    #[serde(rename = "LastColorArgb", default = "default_color_argb")]
+    /// The colour picked last, packed as ARGB in a signed 32-bit number.
+    /// Tools now keep their own colours; this is what an unstyled tool
+    /// starts from.
     pub last_color_argb: i32,
 
-    #[serde(rename = "LastThickness", default = "default_thickness")]
+    /// The stroke width picked last, in pixels. Like the colour, the
+    /// starting point for a tool without a style of its own.
     pub last_thickness: f32,
 
     /// Text tool em-size in px, set from the Text tool's flyout.
-    #[serde(rename = "LastTextSize", default = "default_text_size")]
     pub last_text_size: f32,
 
     /// Pixelate block size in px, set from the Pixelate tool's flyout.
-    #[serde(rename = "PixelateBlock", default = "default_pixelate_block")]
     pub pixelate_block: u32,
 
     /// Every screenshot also goes to the clipboard: the region as soon as it
     /// is picked (and again, finished, when it is saved or pinned), and a
     /// full-screen capture as it is saved. Off by default.
-    #[serde(rename = "AutoCopy", default)]
     pub auto_copy: bool,
 
     /// The editor's Copy (button or Ctrl+C) also closes the editor. Off by
     /// default: Copy puts the picture on the clipboard and the editor stays
     /// open for more marks.
-    #[serde(rename = "CloseAfterCopy", default)]
     pub close_after_copy: bool,
 
     /// What a region capture does when the drag is let go: open the editor
     /// (the default), or put the picture on the clipboard and close.
-    #[serde(rename = "OpenEditor", default = "default_true")]
     pub open_editor: bool,
 
     /// What a scrolling capture does when it is finished, apart from a
@@ -230,181 +256,163 @@ pub struct AppSettings {
     /// `"CopyOnly"` (see [`AfterCapture`]). A long page is worth a look
     /// even when quick captures only copy (Brandon 2026-11-20: "how do we
     /// even edit these pics? no editor comes up").
-    #[serde(rename = "ScrollAfterCapture", default = "default_scroll_after_capture")]
     pub scroll_after_capture: String,
 
     /// The key that, held with the capture key or as the drag is let go,
     /// makes that one capture do the other thing: `"Shift"`, `"Ctrl"` or
     /// `"Alt"` (see [`SwitchKey`]).
-    #[serde(rename = "SwitchKey", default = "default_switch_key")]
     pub switch_key: String,
 
     /// Screenshots show the mouse pointer where it was when they were
     /// taken. Off by default. Windows only for now.
-    #[serde(rename = "CaptureCursor", default)]
     pub capture_cursor: bool,
 
     /// What a click in the capture screen takes, picked in its mode bar and
     /// kept for the next capture: `"Auto"` (drag a region, or click the
     /// window under the cursor), `"Screen"` or `"AllScreens"`.
-    #[serde(rename = "CaptureMode", default = "default_capture_mode")]
     pub capture_mode: String,
 
     /// Each tool's own color and stroke width, keyed by `Tool::name`.
     /// A tool with no entry uses `ToolStyle::default_for`.
-    #[serde(rename = "ToolStyles", default)]
     pub tool_styles: std::collections::BTreeMap<String, ToolStyle>,
 
-    #[serde(rename = "SaveDirectory", default)]
+    /// Where screenshots are saved. Empty means the platform's usual
+    /// pictures folder.
     pub save_directory: String,
 
-    #[serde(rename = "RecordingsDirectory", default)]
+    /// Where recordings are saved. Empty means the platform's usual videos
+    /// folder.
     pub recordings_directory: String,
 
     /// The FFmpeg the user picked in Settings. Empty: found by itself (next
     /// to the app, PATH, then the downloaded copy).
-    #[serde(rename = "FfmpegPath", default)]
     pub ffmpeg_path: String,
 
-    #[serde(rename = "HotkeyModifiers", default = "default_hotkey_modifiers")]
+    /// Region capture's shortcut: a Win32 modifier mask and key code, read
+    /// together through [`AppSettings::hotkey`].
     pub hotkey_modifiers: u32,
 
-    #[serde(rename = "HotkeyVirtualKey", default = "default_vk")]
     pub hotkey_virtual_key: u32,
 
-    /// Optional second binding: capture the whole desktop straight to disk.
-    /// Same Win32 wire encoding as `HotkeyModifiers` / `HotkeyVirtualKey`;
-    /// a virtual key of `0` (the default, and what a file written before
-    /// these keys existed decodes to) means "not bound". See
-    /// `crate::hotkeys` for the accessors.
-    #[serde(rename = "FullScreenHotkeyModifiers", default)]
+    /// Full screen capture's shortcut, if the user set one. This and every
+    /// later shortcut pair use the same numbers as `HotkeyModifiers` and
+    /// `HotkeyVirtualKey`, with a key code of `0` meaning "none". That zero
+    /// is also what a file without these fields reads as. `crate::hotkeys`
+    /// reads and writes them by action.
+    #[serde(rename = "FullScreenHotkeyModifiers")]
     pub fullscreen_hotkey_modifiers: u32,
 
-    #[serde(rename = "FullScreenHotkeyVirtualKey", default)]
+    #[serde(rename = "FullScreenHotkeyVirtualKey")]
     pub fullscreen_hotkey_virtual_key: u32,
 
-    /// Optional third binding: start the screen recording, or stop the one
-    /// that's running. Encoding and "not bound" rule as above.
-    #[serde(rename = "RecordHotkeyModifiers", default)]
+    /// The shortcut that starts a recording, or stops the running one.
     pub record_hotkey_modifiers: u32,
 
-    #[serde(rename = "RecordHotkeyVirtualKey", default)]
     pub record_hotkey_virtual_key: u32,
 
-    #[serde(rename = "StartWithWindows", default)]
+    /// Start Frame Fang when the user signs in (the name dates from when
+    /// only Windows did this).
     pub start_with_windows: bool,
 
-    #[serde(rename = "PaletteIndex", default)]
+    /// Which colour palette the toolbar shows, as an index into
+    /// [`crate::annotation::Palettes::ALL`].
     pub palette_index: i32,
 
-    #[serde(rename = "Theme", default = "default_theme")]
+    /// The dialogs' colour scheme by name (Pink, Green, Cyan, Yellow,
+    /// Orange). A file holding the older "Light" or "Dark" gets Pink.
     pub theme: String,
 
-    /// Alpha (0..=255) applied to the Marker (highlighter) stroke. Default
-    /// `0xC8` (200, ≈78 %) preserves the historical look; the editor's
-    /// per-tool slider mutates this and persists it on mouseup.
-    #[serde(rename = "MarkerOpacity", default = "default_marker_opacity")]
+    /// How opaque the Marker's stroke is, 0 to 255. The default of 200
+    /// (about 78 percent) is the look the Marker has always had; the
+    /// editor's slider changes it and saves it when the mouse is let go.
     pub marker_opacity: u8,
 
     /// The sound a recording started from the tray menu takes: "None",
     /// "Mic", "PC" (what the computer plays) or "Both". Chosen with the
     /// menu's Sound chips.
-    #[serde(rename = "RecordSound", default = "default_record_sound")]
     pub record_sound: String,
 
     /// How saved screenshots and recordings are named: tokens like
     /// `{yyyy}`, `{date}`, `{app}` (see `crate::file_name`). The default
     /// gives the name every version before this one used.
-    #[serde(rename = "FileNamePattern", default = "default_file_name_pattern")]
     pub file_name_pattern: String,
 
     /// The last pattern that was not one of Settings' presets, kept so
     /// picking a preset and then CUSTOM brings it back.
-    #[serde(rename = "FileNameCustom", default)]
     pub file_name_custom: String,
 
     /// What a recording ends as: `"MP4"` or `"GIF"` (see [`RecordFormat`]).
-    #[serde(rename = "RecordFormat", default = "default_record_format")]
     pub record_format: String,
 
     /// A frame added to every saved or copied screenshot: `"None"`,
     /// `"Border"` or `"Shadow"` (see [`OutputFrame`]).
-    #[serde(rename = "OutputFrame", default = "default_output_frame")]
     pub output_frame: String,
 
     /// Optional binding: take the last captured rectangle again. Encoding and
     /// "not bound" rule as the other optional hotkeys.
-    #[serde(rename = "LastRegionHotkeyModifiers", default)]
     pub last_region_hotkey_modifiers: u32,
 
-    #[serde(rename = "LastRegionHotkeyVirtualKey", default)]
     pub last_region_hotkey_virtual_key: u32,
 
     /// Optional binding: open the picker in TEXT mode, to copy the words in
     /// a region.
-    #[serde(rename = "TextHotkeyModifiers", default)]
     pub text_hotkey_modifiers: u32,
 
-    #[serde(rename = "TextHotkeyVirtualKey", default)]
     pub text_hotkey_virtual_key: u32,
 
     /// Optional binding: open the picker in QR mode, to read a QR code.
-    #[serde(rename = "QrHotkeyModifiers", default)]
     pub qr_hotkey_modifiers: u32,
 
-    #[serde(rename = "QrHotkeyVirtualKey", default)]
     pub qr_hotkey_virtual_key: u32,
 
     /// Optional binding: open the picker in SCROLL mode.
-    #[serde(rename = "ScrollHotkeyModifiers", default)]
     pub scroll_hotkey_modifiers: u32,
 
-    #[serde(rename = "ScrollHotkeyVirtualKey", default)]
     pub scroll_hotkey_virtual_key: u32,
 
     /// How much the Magnify lens enlarges: 2, 3 or 4, set from its flyout.
-    #[serde(rename = "MagnifyZoom", default = "default_magnify_zoom")]
     pub magnify_zoom: u32,
 
     /// A QR code that holds a web link opens it in the browser instead of
     /// copying it. Off: every QR code is copied.
-    #[serde(rename = "OpenQrLinks", default)]
     pub open_qr_links: bool,
 
     /// Held as a QR read is let go, a link does the other thing (opens
     /// instead of copying, or the other way round): `"Shift"`, `"Ctrl"` or
     /// `"Alt"`. Its own key, set apart from the capture switch key.
-    #[serde(rename = "QrSwitchKey", default = "default_qr_switch_key")]
     pub qr_switch_key: String,
 
     /// Held as the part to scroll is clicked, a scrolling capture does the
     /// other thing (the editor, or just copying; see `ScrollAfterCapture`).
     /// Its own key, Shift unless set.
-    #[serde(rename = "ScrollSwitchKey", default = "default_scroll_switch_key")]
     pub scroll_switch_key: String,
 
     /// How numbered steps look: shape, each part's color, shadow (see
     /// [`crate::step`]). `None` until one is picked: a plain disc in the
     /// Step tool's own color.
-    #[serde(rename = "StepLook", default)]
     pub step_look: Option<crate::step::StepLook>,
 
     /// The Highlight tool's look (its color is the tool's own).
-    #[serde(rename = "HighlightStyle", default)]
     pub highlight_style: crate::mark::MarkStyle,
 
     /// Keep the last 10 captures (copy-only included) for the tray's RECENT
     /// list. Turning it off deletes them.
-    #[serde(rename = "KeepRecentCaptures", default = "default_true")]
+    #[serde(rename = "KeepRecentCaptures")]
     pub keep_recent: bool,
 }
 
-fn default_magnify_zoom() -> u32 { 2 }
+/// Pure red as ARGB: the colour a fresh install had picked before tools
+/// kept colours of their own. It sits on no palette, see
+/// [`ToolStyle::default_for`].
+const FACTORY_COLOR_ARGB: i32 = 0xFFFF_0000_u32 as i32;
+/// The starting stroke width in pixels.
+const FACTORY_THICKNESS: f32 = 3.0;
+/// The starting Pixelate block size in pixels.
+const FACTORY_PIXELATE_BLOCK: u32 = 10;
 
-fn default_record_sound() -> String { "None".to_owned() }
+fn default_tool() -> String { crate::tool::Tool::default().name().to_owned() }
+
 pub fn default_file_name_pattern() -> String { crate::file_name::DEFAULT_PATTERN.to_owned() }
-fn default_record_format() -> String { RecordFormat::Mp4.name().to_owned() }
-fn default_output_frame() -> String { OutputFrame::None.name().to_owned() }
 
 /// What a recording ends as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -446,61 +454,69 @@ impl OutputFrame {
 }
 
 impl Default for AppSettings {
+    /// A fresh install. This is also where every field missing from a file
+    /// gets its value, so changing one of these changes how old files load.
     fn default() -> Self {
+        let capture = FIRST_CAPTURE;
         AppSettings {
-            last_tool:           default_tool(),
-            last_color_argb:     default_color_argb(),
-            last_thickness:      default_thickness(),
-            last_text_size:      default_text_size(),
-            pixelate_block:      default_pixelate_block(),
-            auto_copy:           false,
-            close_after_copy:    false,
-            open_editor:         true,
-            scroll_after_capture: default_scroll_after_capture(),
-            switch_key:          default_switch_key(),
-            capture_cursor:      false,
-            capture_mode:        default_capture_mode(),
-            tool_styles:         Default::default(),
-            save_directory:      String::new(),
+            // Tools and how they draw.
+            last_tool: default_tool(),
+            last_color_argb: FACTORY_COLOR_ARGB,
+            last_thickness: FACTORY_THICKNESS,
+            last_text_size: crate::text::DEFAULT_PX,
+            pixelate_block: FACTORY_PIXELATE_BLOCK,
+            marker_opacity: 200,
+            magnify_zoom: 2,
+            palette_index: 0,
+            tool_styles: Default::default(),
+            step_look: None,
+            highlight_style: Default::default(),
+
+            // What a capture does.
+            open_editor: true,
+            auto_copy: false,
+            close_after_copy: false,
+            scroll_after_capture: AfterCapture::CopyAndEdit.name().to_owned(),
+            switch_key: SwitchKey::Shift.name(),
+            qr_switch_key: SwitchKey::Ctrl.name(),
+            scroll_switch_key: SwitchKey::Shift.name(),
+            open_qr_links: false,
+            capture_cursor: false,
+            capture_mode: "Auto".to_owned(),
+            keep_recent: true,
+
+            // Files, folders and recording.
+            save_directory: String::new(),
             recordings_directory: String::new(),
-            ffmpeg_path:         String::new(),
-            hotkey_modifiers:    default_hotkey_modifiers(),
-            hotkey_virtual_key:  default_vk(),
-            fullscreen_hotkey_modifiers:   0,
+            ffmpeg_path: String::new(),
+            file_name_pattern: default_file_name_pattern(),
+            file_name_custom: String::new(),
+            record_format: RecordFormat::Mp4.name().to_owned(),
+            record_sound: "None".to_owned(),
+            output_frame: OutputFrame::None.name().to_owned(),
+
+            // Shortcuts: region capture has one, the rest start unset.
+            hotkey_modifiers: capture.modifiers.bits(),
+            hotkey_virtual_key: capture.virtual_key,
+            fullscreen_hotkey_modifiers: 0,
             fullscreen_hotkey_virtual_key: 0,
-            record_hotkey_modifiers:       0,
-            record_hotkey_virtual_key:     0,
-            start_with_windows:  false,
-            palette_index:       0,
-            theme:               default_theme(),
-            marker_opacity:      default_marker_opacity(),
-            record_sound:        default_record_sound(),
-            file_name_pattern:   default_file_name_pattern(),
-            file_name_custom:    String::new(),
-            record_format:       default_record_format(),
-            output_frame:        default_output_frame(),
-            last_region_hotkey_modifiers:   0,
+            record_hotkey_modifiers: 0,
+            record_hotkey_virtual_key: 0,
+            last_region_hotkey_modifiers: 0,
             last_region_hotkey_virtual_key: 0,
-            text_hotkey_modifiers:          0,
-            text_hotkey_virtual_key:        0,
-            qr_hotkey_modifiers:            0,
-            qr_hotkey_virtual_key:          0,
-            scroll_hotkey_modifiers:        0,
-            scroll_hotkey_virtual_key:      0,
-            magnify_zoom:        default_magnify_zoom(),
-            open_qr_links:       false,
-            qr_switch_key:       default_qr_switch_key(),
-            scroll_switch_key:   default_scroll_switch_key(),
-            step_look:           None,
-            highlight_style:     Default::default(),
-            keep_recent:         true,
+            text_hotkey_modifiers: 0,
+            text_hotkey_virtual_key: 0,
+            qr_hotkey_modifiers: 0,
+            qr_hotkey_virtual_key: 0,
+            scroll_hotkey_modifiers: 0,
+            scroll_hotkey_virtual_key: 0,
+
+            // The rest.
+            start_with_windows: false,
+            theme: "Pink".to_owned(),
         }
     }
 }
-
-fn default_true()        -> bool    { true }
-fn default_capture_mode() -> String { "Auto".to_owned() }
-fn default_switch_key()  -> String  { SwitchKey::Shift.name() }
 
 /// A key held as a capture is let go to do the other thing: the capture
 /// switch key (editor or just copy) and QR's key (open a link or copy it).
@@ -576,9 +592,6 @@ impl SwitchKey {
     }
 }
 
-fn default_qr_switch_key() -> String { SwitchKey::Ctrl.name() }
-fn default_scroll_switch_key() -> String { SwitchKey::Shift.name() }
-
 impl AppSettings {
     pub fn switch_key(&self) -> SwitchKey { SwitchKey::parse(&self.switch_key) }
 
@@ -602,9 +615,9 @@ impl AppSettings {
         self.qr_switch_key = self.qr_switch_key().name();
         self.scroll_switch_key = self.scroll_switch_key().name();
         self.scroll_after_capture = self.scroll_after().name().to_owned();
-        if !self.last_thickness.is_finite() || self.last_thickness <= 0.0 { self.last_thickness = default_thickness(); }
-        if !self.last_text_size.is_finite() || self.last_text_size <= 0.0 { self.last_text_size = default_text_size(); }
-        if self.pixelate_block < 2 { self.pixelate_block = default_pixelate_block(); }
+        if !self.last_thickness.is_finite() || self.last_thickness <= 0.0 { self.last_thickness = FACTORY_THICKNESS; }
+        if !self.last_text_size.is_finite() || self.last_text_size <= 0.0 { self.last_text_size = crate::text::DEFAULT_PX; }
+        if self.pixelate_block < 2 { self.pixelate_block = FACTORY_PIXELATE_BLOCK; }
         self.magnify_zoom = self.magnify_zoom.clamp(2, 4);
         // Copy only copies everything (full-screen shots, and a capture
         // flipped into the editor), as Settings shows it.
@@ -688,40 +701,6 @@ impl AfterCapture {
     }
 }
 
-fn default_scroll_after_capture() -> String { AfterCapture::CopyAndEdit.name().to_owned() }
-
-fn default_tool()        -> String  { "Pen".to_owned() }
-fn default_color_argb()  -> i32     { 0xFFFF_0000_u32 as i32 }
-fn default_thickness()   -> f32     { 3.0 }
-fn default_text_size()   -> f32     { crate::text::DEFAULT_PX }
-fn default_pixelate_block() -> u32  { 10 }
-/// Default capture key, as a Win32 VK.
-///
-/// Windows and Linux use Print Screen. Apple keyboards have no such key, and
-/// `global-hotkey` would translate `0x2C` to Carbon keycode `0x46`, which no
-/// Mac keyboard can produce -- so a Print Screen default there is a hotkey
-/// that can never fire. macOS uses `7` instead, with Cmd+Shift as modifiers
-/// (Cmd+Shift+5 already belongs to the system Screenshot app).
-#[cfg(not(target_os = "macos"))]
-fn default_vk()          -> u32     { 0x2C }
-#[cfg(target_os = "macos")]
-fn default_vk()          -> u32     { 0x37 }
-
-/// Modifiers paired with [`default_vk`], as a Win32 `MOD_*` mask.
-#[cfg(not(target_os = "macos"))]
-fn default_hotkey_modifiers() -> u32 { Modifiers::empty().bits() }
-#[cfg(target_os = "macos")]
-fn default_hotkey_modifiers() -> u32 { (Modifiers::SUPER | Modifiers::SHIFT).bits() }
-
-fn default_hotkey_modifiers_flags() -> Modifiers {
-    Modifiers::from_bits_truncate(default_hotkey_modifiers())
-}
-
-/// The dialogs' color scheme by name (Pink, Green, Cyan, Yellow, Orange). Older
-/// files hold "Light" or "Dark", which the app reads as Pink.
-fn default_theme()       -> String  { "Pink".to_owned() }
-fn default_marker_opacity() -> u8 { 0xC8 }
-
 /// One tool's own color and stroke width, so changing one tool never changes
 /// another: a yellow highlighter and a red arrow stay that way.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -749,11 +728,23 @@ impl ToolStyle {
                 color_argb: crate::mark::MarkLook::default().color.to_argb(), thickness: s.last_thickness,
             },
             _ => ToolStyle {
-                color_argb: if s.last_color_argb == default_color_argb() { vivid[0].to_argb() } else { s.last_color_argb },
+                color_argb: if s.last_color_argb == FACTORY_COLOR_ARGB { vivid[0].to_argb() } else { s.last_color_argb },
                 thickness: s.last_thickness,
             },
         }
     }
+}
+
+/// The note shown when settings.json is there but can't be understood.
+/// `kept` says whether the copy to settings.broken.json worked.
+fn unreadable_note(why: &str, kept: bool) -> String {
+    let mut note = format!(
+        "Frame Fang couldn't make sense of settings.json ({why}), so it is running on the default settings."
+    );
+    if kept {
+        note.push_str(" Your file was saved as settings.broken.json.");
+    }
+    note
 }
 
 impl AppSettings {
@@ -767,54 +758,40 @@ impl AppSettings {
         self.tool_styles.insert(tool.name().to_owned(), style);
     }
 
-    /// `~/.../Framefang/`, created if it doesn't exist.
+    /// Frame Fang's per-user config folder. This only finds it; [`Self::save`]
+    /// creates it the first time something is written there.
     pub fn config_dir() -> Option<PathBuf> {
-        let dirs = directories::ProjectDirs::from("org", "framefang", "Framefang")?;
-        Some(dirs.config_dir().to_path_buf())
+        directories::ProjectDirs::from("org", "framefang", "Framefang")
+            .map(|dirs| dirs.config_dir().to_owned())
     }
 
+    /// Where settings.json is, or `None` when the system offers no config
+    /// folder.
     pub fn settings_path() -> Option<PathBuf> {
-        Self::config_dir().map(|d| d.join("settings.json"))
+        Self::config_dir().map(|dir| dir.join(SETTINGS_FILE))
     }
 
-    /// Load settings; a missing file gives `Default`. See [`Self::load_reporting`]
-    /// for a file that doesn't parse.
+    /// The saved settings, or the defaults when there are none. See
+    /// [`Self::load_reporting`] for what happens to a file that won't parse.
     pub fn load() -> AppSettings {
         Self::load_reporting().0
     }
 
-    /// Load settings, and say what went wrong when `settings.json` exists
-    /// but doesn't parse (a hand edit with a typo). Such a file is copied to
-    /// `settings.broken.json` first, so the next save can't overwrite the
-    /// only copy of the user's text, and the app runs on defaults.
-    ///
-    /// The first run after the rename finds no file here; it reads the one
-    /// the app kept under its old name instead (`org/kashot/Kashot`) and
-    /// saves a copy here, so hotkeys, folders and tool styles carry over.
-    /// The old file is left in place.
+    /// The saved settings, plus a note for the user when settings.json is
+    /// there but won't parse (usually a slip in a hand edit). The app then
+    /// runs on the defaults, and the bad file is first copied to
+    /// settings.broken.json so the next save can't destroy the only copy of
+    /// what the user typed. No file at all is a normal first run and gets no
+    /// note.
     pub fn load_reporting() -> (AppSettings, Option<String>) {
-        let Some(path) = Self::settings_path() else { return (AppSettings::default(), None); };
-        match fs::read_to_string(&path) {
-            Ok(s) => match Self::parse(&s) {
-                Ok(settings) => (settings, None),
-                Err(e) => {
-                    let kept = path.with_file_name("settings.broken.json");
-                    let note = match fs::copy(&path, &kept) {
-                        Ok(_) => format!("settings.json couldn't be read ({e}). Frame Fang started with \
-                                          the defaults and kept your file as settings.broken.json."),
-                        Err(_) => format!("settings.json couldn't be read ({e}). Frame Fang started with \
-                                           the defaults."),
-                    };
-                    (AppSettings::default(), Some(note))
-                }
-            },
-            Err(_) => match Self::pre_rename_settings() {
-                Some(s) => {
-                    let _ = s.save();
-                    (s, None)
-                }
-                None => (AppSettings::default(), None),
-            },
+        let Some(path) = Self::settings_path() else { return (AppSettings::default(), None) };
+        let Ok(text) = fs::read_to_string(&path) else { return (AppSettings::default(), None) };
+        match Self::parse(&text) {
+            Ok(settings) => (settings, None),
+            Err(why) => {
+                let kept = fs::copy(&path, path.with_file_name("settings.broken.json")).is_ok();
+                (AppSettings::default(), Some(unreadable_note(&why, kept)))
+            }
         }
     }
 
@@ -841,47 +818,37 @@ impl AppSettings {
         crate::atomic_file::write_atomic(path, json.as_bytes())
     }
 
-    /// The settings file from before the app was renamed, if one exists and
-    /// parses.
-    fn pre_rename_settings() -> Option<AppSettings> {
-        let dirs = directories::ProjectDirs::from("org", "kashot", "Kashot")?;
-        let text = fs::read_to_string(dirs.config_dir().join("settings.json")).ok()?;
-        serde_json::from_str(&text).ok()
-    }
-
-    /// Persist settings to `settings.json`.
+    /// Write these settings to settings.json, creating the config folder if
+    /// it is missing.
     ///
-    /// The write is atomic (see [`crate::atomic_file::write_atomic`]): the
-    /// JSON goes to a temp file alongside the destination and is renamed over
-    /// it. A crash mid-write therefore leaves the *previous* settings intact
-    /// instead of a truncated document that `load` can only answer with
-    /// `Default` — which reads to the user as "it forgot my save folder,
-    /// my hotkey and my tools".
-    ///
-    /// Errors are returned rather than swallowed so the caller can tell the
-    /// user their change won't survive a restart.
+    /// The file is replaced in one step (see
+    /// [`crate::atomic_file::write_atomic`]), so a crash part way through
+    /// leaves the last good settings rather than a cut-off file that would
+    /// load as the defaults and lose the user's folders, shortcuts and tool
+    /// styles. A failure comes back to the caller so the user can be told the
+    /// change will not outlast a restart.
     pub fn save(&self) -> io::Result<()> {
-        let dir  = Self::config_dir().ok_or_else(|| io::Error::other("no config dir"))?;
+        let dir = Self::config_dir()
+            .ok_or_else(|| io::Error::other("there is no config folder for this user"))?;
         fs::create_dir_all(&dir)?;
-        let path = dir.join("settings.json");
-        let json = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
-        crate::atomic_file::write_atomic(&path, json.as_bytes())
+        self.write_to(&dir.join(SETTINGS_FILE))
     }
 
+    /// The dialog colour scheme the `Theme` field names.
     pub fn theme(&self) -> ThemeName {
-        ThemeName::parse(&self.theme)
+        ThemeName::parse(self.theme.as_str())
     }
 
+    /// Region capture's shortcut exactly as stored, set or not (see
+    /// [`Self::hotkey_for`] for the version that tells them apart).
     pub fn hotkey(&self) -> Hotkey {
-        Hotkey {
-            modifiers:   Modifiers::from_bits_truncate(self.hotkey_modifiers),
-            virtual_key: self.hotkey_virtual_key,
-        }
+        let modifiers = Modifiers::from_bits_truncate(self.hotkey_modifiers);
+        Hotkey { modifiers, virtual_key: self.hotkey_virtual_key }
     }
 
+    /// Store `hk` as region capture's shortcut.
     pub fn set_hotkey(&mut self, hk: Hotkey) {
-        self.hotkey_modifiers   = hk.modifiers.bits();
-        self.hotkey_virtual_key = hk.virtual_key;
+        (self.hotkey_modifiers, self.hotkey_virtual_key) = (hk.modifiers.bits(), hk.virtual_key);
     }
 }
 
@@ -889,15 +856,106 @@ impl AppSettings {
 mod tests {
     use super::*;
 
+    /// Settings as Frame Fang 1.6.2 wrote them with every field changed from
+    /// its default, so a field read under the wrong name can't pass by
+    /// falling back to the same default.
+    const CUSTOM_1_6_2: &str = include_str!("../testdata/settings-1.6.2-custom.json");
+    /// A fresh 1.6.2 install's settings.json on Windows and Linux.
+    const DEFAULT_1_6_2: &str = include_str!("../testdata/settings-1.6.2-default.json");
+
+    fn unix_lines(text: &str) -> String { text.replace("\r\n", "\n").trim_end().to_owned() }
+
+    fn reload(s: &AppSettings) -> AppSettings {
+        serde_json::from_str(&serde_json::to_string_pretty(s).unwrap()).unwrap()
+    }
+
+    fn chord(modifiers: Modifiers, virtual_key: u32) -> Hotkey { Hotkey { modifiers, virtual_key } }
+
     #[test]
-    fn default_round_trips_through_json() {
-        let s = AppSettings::default();
-        let txt = serde_json::to_string_pretty(&s).unwrap();
-        let s2: AppSettings = serde_json::from_str(&txt).unwrap();
-        assert_eq!(s.last_tool, s2.last_tool);
-        assert_eq!(s.last_color_argb, s2.last_color_argb);
-        assert_eq!(s.hotkey_virtual_key, s2.hotkey_virtual_key);
-        assert_eq!(s, s2, "every field survives the trip");
+    fn a_1_6_2_file_with_every_field_set_loads_to_the_same_values() {
+        let s: AppSettings = serde_json::from_str(CUSTOM_1_6_2).unwrap();
+        let mut expected = AppSettings {
+            last_tool: "Arrow".into(),
+            last_color_argb: 0x7F00FF00,
+            last_thickness: 5.5,
+            last_text_size: 31.0,
+            pixelate_block: 14,
+            auto_copy: true,
+            close_after_copy: true,
+            open_editor: false,
+            scroll_after_capture: "Edit".into(),
+            switch_key: "Alt".into(),
+            capture_cursor: true,
+            capture_mode: "Screen".into(),
+            save_directory: "D:\\Shots".into(),
+            recordings_directory: "D:\\Clips".into(),
+            ffmpeg_path: "C:\\Tools\\ffmpeg.exe".into(),
+            hotkey_modifiers: 6,
+            hotkey_virtual_key: 0x50,
+            fullscreen_hotkey_modifiers: 2,
+            fullscreen_hotkey_virtual_key: 0x46,
+            record_hotkey_modifiers: 1,
+            record_hotkey_virtual_key: 0x52,
+            start_with_windows: true,
+            palette_index: 2,
+            theme: "Cyan".into(),
+            marker_opacity: 99,
+            record_sound: "Both".into(),
+            file_name_pattern: "{yyyy}-{app}".into(),
+            file_name_custom: "{date}_x".into(),
+            record_format: "GIF".into(),
+            output_frame: "Shadow".into(),
+            last_region_hotkey_modifiers: 3,
+            last_region_hotkey_virtual_key: 0x4C,
+            text_hotkey_modifiers: 6,
+            text_hotkey_virtual_key: 0x54,
+            qr_hotkey_modifiers: 10,
+            qr_hotkey_virtual_key: 0x51,
+            scroll_hotkey_modifiers: 12,
+            scroll_hotkey_virtual_key: 0x53,
+            magnify_zoom: 3,
+            open_qr_links: true,
+            qr_switch_key: "Shift".into(),
+            scroll_switch_key: "Key:0x20".into(),
+            step_look: Some(crate::step::StepLook {
+                shape: crate::step::StepShape::ALL[8],
+                shadow: false,
+                ..Default::default()
+            }),
+            highlight_style: crate::mark::MarkStyle::Glow,
+            keep_recent: false,
+            ..AppSettings::default()
+        };
+        expected.tool_styles.insert("Arrow".into(), ToolStyle { color_argb: -16776961, thickness: 7.0 });
+        assert_eq!(s, expected);
+        // Written back out, it is the same file: same names, order and values.
+        assert_eq!(serde_json::to_string_pretty(&s).unwrap(), unix_lines(CUSTOM_1_6_2));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_fresh_install_writes_exactly_what_1_6_2_wrote() {
+        assert_eq!(serde_json::to_string_pretty(&AppSettings::default()).unwrap(), unix_lines(DEFAULT_1_6_2));
+        let s: AppSettings = serde_json::from_str(DEFAULT_1_6_2).unwrap();
+        assert_eq!(s, AppSettings::default());
+    }
+
+    /// Every key a 1.6.2 file holds is still a key this version writes, on
+    /// every platform (the Mac's default shortcut differs, its names don't).
+    #[test]
+    fn every_1_6_2_key_is_still_written() {
+        let now = serde_json::to_value(AppSettings::default()).unwrap();
+        let then: serde_json::Value = serde_json::from_str(DEFAULT_1_6_2).unwrap();
+        for key in then.as_object().unwrap().keys() {
+            assert!(now.get(key).is_some(), "{key} is no longer written");
+        }
+        assert_eq!(now.as_object().unwrap().len(), then.as_object().unwrap().len());
+    }
+
+    #[test]
+    fn defaults_come_back_unchanged_from_json() {
+        let factory = AppSettings::default();
+        assert_eq!(reload(&factory), factory);
     }
 
     #[test]
@@ -913,6 +971,15 @@ mod tests {
         let s = AppSettings::parse("{ \"Theme\": \"Orange\" }").unwrap();
         assert_eq!(s.theme, "Orange");
         assert_eq!(AppSettings { theme: "Pink".into(), ..s }, AppSettings::default());
+    }
+
+    #[test]
+    fn the_unreadable_file_note_names_the_reason_and_the_backup() {
+        let kept = unreadable_note("expected value at line 3 column 15", true);
+        assert!(kept.contains("line 3 column 15") && kept.contains("settings.broken.json"), "{kept}");
+        let lost = unreadable_note("expected value", false);
+        assert!(!lost.contains("settings.broken.json"), "{lost}");
+        assert!(lost.contains("default settings"), "{lost}");
     }
 
     #[test]
@@ -959,103 +1026,101 @@ mod tests {
     }
 
     #[test]
-    fn missing_keys_are_filled_with_defaults() {
+    fn an_empty_object_reads_as_a_fresh_install() {
         let s: AppSettings = serde_json::from_str("{}").unwrap();
-        assert_eq!(s.last_tool, "Pen");
-        assert_eq!(s.theme, "Pink");
-        assert_eq!(s.hotkey_virtual_key, default_vk());
+        assert_eq!(s, AppSettings::default());
+        assert_eq!((s.last_tool.as_str(), s.theme.as_str()), ("Pen", "Pink"));
         assert_eq!(s.hotkey(), Hotkey::default());
     }
 
     #[test]
-    fn modifiers_serialize_as_u32() {
-        let m = Modifiers::CONTROL | Modifiers::SHIFT;
-        let bits: u32 = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
-        assert_eq!(bits, 0x0002 | 0x0004);
+    fn a_modifier_mask_is_written_as_its_number() {
+        let text = serde_json::to_string(&(Modifiers::CONTROL | Modifiers::SHIFT)).unwrap();
+        assert_eq!(text, "6");
+        let back: Modifiers = serde_json::from_str("6").unwrap();
+        assert_eq!(back, Modifiers::CONTROL | Modifiers::SHIFT);
+        let unknown_bits: Modifiers = serde_json::from_str("4096").unwrap();
+        assert_eq!(unknown_bits, Modifiers::empty(), "bits Frame Fang doesn't know are dropped");
     }
 
     #[test]
-    fn hotkey_ctrl_shift_p_round_trips() {
-        let hk = Hotkey {
-            modifiers:   Modifiers::CONTROL | Modifiers::SHIFT,
-            virtual_key: 0x50,
-        };
+    fn a_ctrl_shift_p_capture_shortcut_survives_reload() {
         let mut s = AppSettings::default();
-        s.set_hotkey(hk);
-        let txt = serde_json::to_string_pretty(&s).unwrap();
-        let s2: AppSettings = serde_json::from_str(&txt).unwrap();
-        let hk2 = s2.hotkey();
-        assert_eq!(hk, hk2);
-        assert_eq!(hk2.modifiers.bits(), 0x0002 | 0x0004);
-        assert_eq!(hk2.virtual_key, 0x50);
-        assert_eq!(hk2.describe(), "Ctrl + Shift + P");
+        s.set_hotkey(chord(Modifiers::CONTROL | Modifiers::SHIFT, 0x50));
+        assert_eq!((s.hotkey_modifiers, s.hotkey_virtual_key), (6, 0x50));
+        let back = reload(&s).hotkey();
+        assert_eq!(back, chord(Modifiers::CONTROL | Modifiers::SHIFT, 0x50));
+        assert_eq!(back.describe(), "Ctrl + Shift + P");
     }
 
     #[cfg(not(target_os = "macos"))]
     #[test]
-    fn default_hotkey_is_printscreen() {
-        let s = AppSettings::default();
-        let hk = s.hotkey();
-        assert_eq!(hk.modifiers, Modifiers::empty());
-        assert_eq!(hk.virtual_key, 0x2C);
+    fn print_screen_alone_is_the_first_capture_shortcut() {
+        let hk = AppSettings::default().hotkey();
+        assert_eq!(hk, chord(Modifiers::empty(), 0x2C));
+        assert_eq!(hk, Hotkey::default());
         assert_eq!(hk.describe(), "Print Screen");
-        assert_eq!(Hotkey::default(), hk);
     }
 
-    /// Apple keyboards have no Print Screen key, so the macOS default is
-    /// Cmd+Shift+7 (Cmd+Shift+5 is the system Screenshot app's).
+    /// No Print Screen on a Mac keyboard, and Cmd+Shift+5 is the system's,
+    /// so the Mac starts on Cmd+Shift+7.
     #[cfg(target_os = "macos")]
     #[test]
-    fn default_hotkey_is_cmd_shift_7() {
-        let s = AppSettings::default();
-        let hk = s.hotkey();
-        assert_eq!(hk.modifiers, Modifiers::SUPER | Modifiers::SHIFT);
-        assert_eq!(hk.virtual_key, 0x37);
+    fn cmd_shift_7_is_the_first_capture_shortcut_on_a_mac() {
+        let hk = AppSettings::default().hotkey();
+        assert_eq!(hk, chord(Modifiers::SUPER | Modifiers::SHIFT, 0x37));
+        assert_eq!(hk, Hotkey::default());
         assert_eq!(hk.describe(), "Cmd + Shift + 7");
-        assert_eq!(Hotkey::default(), hk);
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_modifier_labels_are_ascii_mac_names() {
-        let all = Modifiers::SUPER | Modifiers::CONTROL | Modifiers::ALT | Modifiers::SHIFT;
-        assert_eq!(all.describe(), "Cmd + Ctrl + Opt + Shift");
-        assert!(all.describe().is_ascii());
+    fn mac_modifier_names_are_spelled_out_in_mac_order() {
+        let every = Modifiers::SUPER | Modifiers::CONTROL | Modifiers::ALT | Modifiers::SHIFT;
+        assert_eq!(every.describe(), "Cmd + Ctrl + Opt + Shift");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn modifier_names_read_ctrl_shift_alt_win() {
+        assert_eq!(Modifiers::all().describe(), "Ctrl + Shift + Alt + Win");
+        assert_eq!(Modifiers::empty().describe(), "");
     }
 
     #[test]
-    fn default_hotkey_label_is_ascii() {
-        assert!(Hotkey::default().describe().is_ascii());
+    fn the_first_capture_shortcut_has_a_name_in_plain_ascii() {
+        assert!(vk_label(FIRST_CAPTURE.virtual_key).is_some());
+        for text in [FIRST_CAPTURE.describe(), Modifiers::all().describe()] {
+            assert!(text.is_ascii(), "{text}");
+        }
     }
 
     #[test]
-    fn default_vk_has_a_label() {
-        assert!(vk_label(default_vk()).is_some());
+    fn a_key_without_a_name_shows_its_code() {
+        assert_eq!(chord(Modifiers::empty(), 0xE8).describe(), "(0xE8)");
+        assert_eq!(chord(Modifiers::CONTROL, 0x7).describe(), "Ctrl + (0x07)");
     }
 
     #[test]
-    fn vk_label_covers_common_keys() {
-        assert_eq!(vk_label(0x2C), Some("Print Screen"));
-        assert_eq!(vk_label(0x50), Some("P"));
-        assert_eq!(vk_label(0x70), Some("F1"));
-        assert_eq!(vk_label(0x7B), Some("F12"));
-        assert_eq!(vk_label(0x25), Some("Left"));
-        assert_eq!(vk_label(0xABCD), None);
+    fn common_keys_have_their_usual_names() {
+        let expect = [(0x2C, "Print Screen"), (0x50, "P"), (0x70, "F1"), (0x7B, "F12"), (0x25, "Left")];
+        for (vk, name) in expect {
+            assert_eq!(vk_label(vk), Some(name), "0x{vk:02X}");
+        }
+        assert!(vk_label(0xABCD).is_none(), "far outside the key range");
     }
 
     #[test]
-    fn marker_opacity_default_preserves_legacy_alpha() {
-        assert_eq!(AppSettings::default().marker_opacity, 0xC8);
+    fn the_marker_starts_at_alpha_200() {
+        assert_eq!(200, AppSettings::default().marker_opacity);
     }
 
     #[test]
-    fn marker_opacity_round_trips_through_json() {
-        let mut s = AppSettings::default();
-        s.marker_opacity = 0x40;
-        let txt = serde_json::to_string(&s).unwrap();
-        assert!(txt.contains("\"MarkerOpacity\""), "JSON key should be MarkerOpacity: {txt}");
-        let s2: AppSettings = serde_json::from_str(&txt).unwrap();
-        assert_eq!(s2.marker_opacity, 0x40);
+    fn marker_opacity_is_written_as_marker_opacity_and_read_back() {
+        let faint = AppSettings { marker_opacity: 51, ..AppSettings::default() };
+        let text = serde_json::to_string(&faint).unwrap();
+        assert!(text.contains("\"MarkerOpacity\":51"), "{text}");
+        assert_eq!(reload(&faint).marker_opacity, 51);
     }
 
     #[test]
@@ -1191,8 +1256,8 @@ mod tests {
     }
 
     #[test]
-    fn marker_opacity_missing_key_falls_back_to_default() {
-        let s: AppSettings = serde_json::from_str("{}").unwrap();
-        assert_eq!(s.marker_opacity, 0xC8);
+    fn a_file_without_marker_opacity_gets_200() {
+        let green: AppSettings = serde_json::from_str("{ \"Theme\": \"Green\" }").unwrap();
+        assert_eq!(green.marker_opacity, 200);
     }
 }

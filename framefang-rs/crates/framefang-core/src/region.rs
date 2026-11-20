@@ -1,433 +1,488 @@
-//! Screen-region geometry for recording.
+//! The rectangle a screen recording covers, and where the REC indicator goes
+//! so it stays out of that rectangle.
 //!
-//! Pure math, shared by the region-selection overlay and by every recorder
-//! backend, so a rectangle the user drags means exactly the same thing under
-//! X11 `x11grab`, Windows `gdigrab` and macOS `screencapture` — and so the
-//! encoder never sees a size it can't accept.
+//! This is plain arithmetic shared by the region picker and every recorder
+//! backend, so one dragged rectangle means the same pixels to X11
+//! `x11grab`, Windows `gdigrab` and macOS `screencapture`, and so no encoder
+//! is ever handed a size it rejects.
 //!
-//! **Coordinates are virtual-desktop pixels**: the space the capture stitches
-//! its monitors into. `DesktopBounds` names the origin of that space, which is
-//! not necessarily `(0, 0)` — a monitor placed left of the primary one gives it
-//! a negative `x` on Windows and macOS.
+//! **Units are virtual-desktop pixels**, the space the monitors are stitched
+//! into. Its corner ([`DesktopBounds`]'s `x`, `y`) is often not `(0, 0)`: on
+//! Windows and macOS a monitor to the left of the primary one has a negative
+//! `x`.
 //!
-//! The backends disagree about where they measure a capture rectangle from, so
-//! `CaptureRect` offers both readings of the same rectangle:
+//! The backends measure from different corners, so [`CaptureRect`] gives
+//! both readings:
 //!
-//! * **absolute** (`x` / `y`) — macOS `screencapture -R`, whose origin is the
-//!   main display's top-left corner;
-//! * **desktop-relative** (`offset_x()` / `offset_y()`) — X11 `x11grab`, whose
-//!   `:0.0+X,Y` is measured from the root window's corner, and Windows
-//!   `gdigrab`, whose `-offset_x` is added to `SM_XVIRTUALSCREEN`.
+//! * absolute, the `x` and `y` fields, measured from the main display's
+//!   top-left. macOS `screencapture -R` wants this.
+//! * relative to the desktop's corner, [`CaptureRect::offset_x`] and
+//!   [`CaptureRect::offset_y`]. X11 `x11grab` (`:0.0+X,Y` from the root
+//!   window) and Windows `gdigrab` (`-offset_x` added to
+//!   `SM_XVIRTUALSCREEN`) want this.
 //!
-//! **Even dimensions are not optional.** Every backend encodes H.264 with
-//! `yuv420p`, whose chroma planes are half-resolution: an odd width or height
-//! either fails outright or silently costs a column of pixels. `even_dimension`
-//! is the one place that rounding happens, and `record_rect_from_selection`
-//! applies it after clamping so a rectangle can never leave here odd.
+//! **Width and height are always even.** Every backend encodes H.264 as
+//! `yuv420p`, which stores color at half resolution in both directions, so
+//! an odd side either fails or silently drops a column. [`even_dimension`]
+//! does that rounding, and [`record_rect_from_selection`] applies it after
+//! clamping, so no odd rectangle can leave this module.
 
-/// Smallest side, in pixels, we'll hand an encoder. Below this a "region" is a
-/// mis-click rather than an intent, and libx264 output at 8×8 is useless to
-/// whoever ends up watching it.
+/// The shortest side we will record, in pixels. Anything smaller is a slipped
+/// click rather than a region, and a video that small is no use to anyone.
 pub const MIN_RECORD_SIDE: u32 = 16;
 
-/// Bounding box of every monitor, in virtual-desktop coordinates.
+/// The box around all monitors, in virtual-desktop pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DesktopBounds {
-    pub x:      i32,
-    pub y:      i32,
-    pub width:  u32,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
     pub height: u32,
-    /// Device pixels per logical point for the desktop these coordinates
-    /// were measured on — `1.0` unless the capture was stitched at a higher
-    /// density. Backends that address the screen in points rather than
-    /// pixels (macOS `screencapture -R`) divide by this.
-    pub scale:  f32,
+    /// Device pixels per logical point on the desktop these numbers came
+    /// from. It is `1.0` unless the capture was stitched at a higher
+    /// density. Backends that take points instead of pixels (macOS
+    /// `screencapture -R`) divide by it.
+    pub scale: f32,
 }
 
 impl DesktopBounds {
+    /// Bounds at 1x.
     pub fn new(x: i32, y: i32, width: u32, height: u32) -> Self {
-        Self { x, y, width, height, scale: 1.0 }
+        DesktopBounds { x, y, width, height, scale: 1.0 }
     }
 
-    /// Same bounds, measured on a desktop with `scale` device pixels per
-    /// point. Non-finite or non-positive scales are treated as `1.0`.
-    pub fn with_scale(mut self, scale: f32) -> Self {
-        self.scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
-        self
+    /// The same bounds on a desktop with `scale` pixels per point. A scale
+    /// that is zero, negative or not finite is stored as `1.0`.
+    pub fn with_scale(self, scale: f32) -> Self {
+        let usable = scale.is_finite() && scale > 0.0;
+        DesktopBounds { scale: if usable { scale } else { 1.0 }, ..self }
     }
 
-    /// One past the right-most pixel column.
-    pub fn right(&self) -> i32 { self.x.saturating_add(self.width as i32) }
+    /// The column just past the right edge.
+    pub fn right(&self) -> i32 {
+        far_edge(self.x, self.width)
+    }
 
-    /// One past the bottom-most pixel row.
-    pub fn bottom(&self) -> i32 { self.y.saturating_add(self.height as i32) }
+    /// The row just past the bottom edge.
+    pub fn bottom(&self) -> i32 {
+        far_edge(self.y, self.height)
+    }
 }
 
-/// A rectangle to record, already clamped to the desktop and already sized to
-/// even dimensions. Construct it through [`record_rect_from_selection`] rather
-/// than by hand — the invariants above are the whole point of the type.
+/// `start + len`, pinned at `i32::MAX` instead of wrapping.
+fn far_edge(start: i32, len: u32) -> i32 {
+    start.saturating_add(len as i32)
+}
+
+/// A rectangle ready to record: inside the desktop, even on both sides and
+/// at least [`MIN_RECORD_SIDE`] each way. Only
+/// [`record_rect_from_selection`] should build one, since those guarantees
+/// are what the type is for.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CaptureRect {
-    /// Left edge in absolute virtual-desktop coordinates.
+    /// Left edge, absolute virtual-desktop pixels.
     pub x: i32,
-    /// Top edge in absolute virtual-desktop coordinates.
+    /// Top edge, absolute virtual-desktop pixels.
     pub y: i32,
-    /// Always even, always ≥ [`MIN_RECORD_SIDE`].
+    /// Even, and never below [`MIN_RECORD_SIDE`].
     pub width: u32,
-    /// Always even, always ≥ [`MIN_RECORD_SIDE`].
+    /// Even, and never below [`MIN_RECORD_SIDE`].
     pub height: u32,
-    /// Top-left corner of the virtual desktop, carried along so a backend that
-    /// addresses its capture region relative to that corner can translate
-    /// without querying the monitor layout a second time (and getting a
-    /// different answer if the user re-arranged displays in between).
+    /// The desktop's top-left corner when the rectangle was picked. Kept
+    /// here so a backend that measures from that corner does not have to
+    /// ask for the monitor layout again, and cannot get a different answer
+    /// if the user moved a display in the meantime.
     pub desktop_origin: (i32, i32),
-    /// Device pixels per point on the desktop this rectangle was picked on
-    /// (see [`DesktopBounds::scale`]).
+    /// Pixels per point on the desktop it was picked on (see
+    /// [`DesktopBounds::scale`]).
     pub scale: f32,
 }
 
 impl CaptureRect {
-    /// The same rectangle in logical points: `(x, y, width, height)` divided
-    /// by `scale` and rounded to the nearest whole point. At 1x this is the
-    /// pixel rectangle unchanged. For a backend whose capture API speaks
-    /// points (macOS `screencapture -R`); the pixel fields stay authoritative
-    /// everywhere else.
+    /// `(x, y, width, height)` in logical points: each value divided by the
+    /// scale and rounded to the nearest point, with width and height kept at
+    /// one point or more. At 1x this is the pixel rectangle itself. Only for
+    /// backends that take points (macOS `screencapture -R`); the pixel
+    /// fields are the truth everywhere else.
     pub fn points(&self) -> (i32, i32, u32, u32) {
-        let s = self.scale;
-        (
-            (self.x as f32 / s).round() as i32,
-            (self.y as f32 / s).round() as i32,
-            (self.width as f32 / s).round().max(1.0) as u32,
-            (self.height as f32 / s).round().max(1.0) as u32,
-        )
+        let to_points = |v: f32| (v / self.scale).round();
+        let edge = |v: i32| to_points(v as f32) as i32;
+        let side = |v: u32| to_points(v as f32).max(1.0) as u32;
+        (edge(self.x), edge(self.y), side(self.width), side(self.height))
     }
 
-    /// One past the right-most pixel column, absolute.
-    pub fn right(&self) -> i32 { self.x.saturating_add(self.width as i32) }
+    /// The column just past the right edge, absolute.
+    pub fn right(&self) -> i32 {
+        far_edge(self.x, self.width)
+    }
 
-    /// One past the bottom-most pixel row, absolute.
-    pub fn bottom(&self) -> i32 { self.y.saturating_add(self.height as i32) }
+    /// The row just past the bottom edge, absolute.
+    pub fn bottom(&self) -> i32 {
+        far_edge(self.y, self.height)
+    }
 
-    /// Left edge measured from the desktop's top-left corner — what
-    /// `x11grab`'s `+X,Y` and `gdigrab`'s `-offset_x` expect.
-    pub fn offset_x(&self) -> i32 { self.x.saturating_sub(self.desktop_origin.0) }
+    /// Left edge counted from the desktop's corner, the number `x11grab`'s
+    /// `+X,Y` and `gdigrab`'s `-offset_x` take.
+    pub fn offset_x(&self) -> i32 {
+        self.x.saturating_sub(self.desktop_origin.0)
+    }
 
-    /// Top edge measured from the desktop's top-left corner.
-    pub fn offset_y(&self) -> i32 { self.y.saturating_sub(self.desktop_origin.1) }
+    /// Top edge counted from the desktop's corner.
+    pub fn offset_y(&self) -> i32 {
+        self.y.saturating_sub(self.desktop_origin.1)
+    }
 
-    /// `"WxH"` — the spelling ffmpeg's `-video_size` wants.
-    pub fn video_size(&self) -> String { format!("{}x{}", self.width, self.height) }
+    /// The size as ffmpeg's `-video_size` spells it, `WIDTHxHEIGHT`.
+    pub fn video_size(&self) -> String {
+        format!("{}x{}", self.width, self.height)
+    }
 
-    /// Does this rectangle share any pixel with `(x, y, w, h)`?
+    /// True when the rectangle `(x, y, w, h)` covers at least one pixel of
+    /// this one. Rectangles that only touch along an edge do not overlap.
     pub fn overlaps(&self, x: i32, y: i32, w: u32, h: u32) -> bool {
-        let ox1 = x.saturating_add(w as i32);
-        let oy1 = y.saturating_add(h as i32);
-        x < self.right() && ox1 > self.x && y < self.bottom() && oy1 > self.y
+        let across = x < self.right() && far_edge(x, w) > self.x;
+        let down = y < self.bottom() && far_edge(y, h) > self.y;
+        across && down
     }
 }
 
-/// Round a pixel dimension **down** to the nearest even number.
+/// Round a side length down to an even number of pixels.
 ///
-/// Down rather than up: growing the rectangle would either push it past the
-/// edge of the desktop or start capturing a pixel column the user didn't
-/// select, and one lost column is the cheaper mistake.
-pub fn even_dimension(v: u32) -> u32 { v & !1 }
-
-/// Turn a raw overlay selection into something every backend can record.
-///
-/// `selection` is `(x, y, w, h)` in virtual-desktop coordinates and may carry
-/// negative width/height (a right-to-left drag). The result is clamped to
-/// `bounds`, rounded to even dimensions, and rejected outright — `None` — when
-/// what's left is smaller than [`MIN_RECORD_SIDE`] on either axis or falls
-/// entirely off the desktop.
-pub fn record_rect_from_selection(
-    selection: (i32, i32, i32, i32),
-    bounds:    DesktopBounds,
-) -> Option<CaptureRect> {
-    let (sx, sy, sw, sh) = selection;
-    let (mut x0, mut x1) = if sw >= 0 {
-        (sx, sx.saturating_add(sw))
-    } else {
-        (sx.saturating_add(sw), sx)
-    };
-    let (mut y0, mut y1) = if sh >= 0 {
-        (sy, sy.saturating_add(sh))
-    } else {
-        (sy.saturating_add(sh), sy)
-    };
-
-    x0 = x0.max(bounds.x);
-    y0 = y0.max(bounds.y);
-    x1 = x1.min(bounds.right());
-    y1 = y1.min(bounds.bottom());
-    if x1 <= x0 || y1 <= y0 { return None; }
-
-    let width  = even_dimension((x1 - x0) as u32);
-    let height = even_dimension((y1 - y0) as u32);
-    if width < MIN_RECORD_SIDE || height < MIN_RECORD_SIDE { return None; }
-
-    Some(CaptureRect {
-        x: x0,
-        y: y0,
-        width,
-        height,
-        desktop_origin: (bounds.x, bounds.y),
-        scale: bounds.scale,
-    })
+/// Down, not up: rounding up would either reach past the desktop's edge or
+/// record a column the user did not pick. Losing one column is the smaller
+/// harm.
+pub fn even_dimension(v: u32) -> u32 {
+    v - v % 2
 }
 
-/// Where to park the floating REC indicator.
+/// Order the two ends of a span given as a start and a signed length, so a
+/// drag in either direction gives `(low, high)`.
+fn ordered_span(start: i32, len: i32) -> (i32, i32) {
+    let end = start.saturating_add(len);
+    (start.min(end), start.max(end))
+}
+
+/// Turn the rectangle the user dragged into one every backend can record.
+///
+/// `selection` is `(x, y, w, h)` in virtual-desktop pixels; `w` and `h` are
+/// negative when the drag went left or up. The result is cut to `bounds` and
+/// rounded down to even sides. `None` means nothing usable is left: the
+/// selection lies off the desktop, or a side ends up under
+/// [`MIN_RECORD_SIDE`].
+pub fn record_rect_from_selection(selection: (i32, i32, i32, i32), bounds: DesktopBounds) -> Option<CaptureRect> {
+    let (left, right) = ordered_span(selection.0, selection.2);
+    let (top, bottom) = ordered_span(selection.1, selection.3);
+
+    let left = left.max(bounds.x);
+    let top = top.max(bounds.y);
+    let right = right.min(bounds.right());
+    let bottom = bottom.min(bounds.bottom());
+    if right <= left || bottom <= top {
+        return None;
+    }
+
+    let width = even_dimension(right.abs_diff(left));
+    let height = even_dimension(bottom.abs_diff(top));
+    if width.min(height) < MIN_RECORD_SIDE {
+        return None;
+    }
+
+    let desktop_origin = (bounds.x, bounds.y);
+    Some(CaptureRect { x: left, y: top, width, height, desktop_origin, scale: bounds.scale })
+}
+
+/// Where the floating REC indicator should sit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndicatorPlacement {
     pub x: i32,
     pub y: i32,
-    /// True when the panel lands entirely outside the recorded region. On a
-    /// backend with no capture-exclusion API (X11) this is the difference
-    /// between showing the panel and burning it into the user's video, so the
-    /// caller must check it rather than assume.
+    /// True when the panel is completely outside the recorded rectangle.
+    /// Where the OS cannot hide a window from the capture (X11), false means
+    /// the panel would be burned into the video, so callers have to check
+    /// this rather than assume it.
     pub clear_of_region: bool,
 }
 
-/// Pick a spot for the REC indicator that keeps it out of the recorded region.
+/// Find a spot for the REC indicator, of `size`, that keeps it out of the
+/// recording.
 ///
-/// Tries, in order: below the region, above it, to its right, to its left, then
-/// the desktop's top-right corner — taking the first that fits on the desktop
-/// *and* misses the region. A full-desktop recording has no such spot, so the
-/// top-right corner is returned with `clear_of_region: false` and the caller
-/// decides whether a visible panel or an unobstructed video matters more.
+/// Spots are tried in this order: under the region, over it, right of it,
+/// left of it, and finally the desktop's top-right corner. The first one
+/// that is fully on the desktop and does not touch the region wins.
+/// Recording the whole desktop leaves no such spot; then the corner comes
+/// back with `clear_of_region: false` and the caller chooses between a
+/// visible panel and a clean video. Without a region the corner is used and
+/// counts as clear.
 ///
-/// `margin` is the gap left between the panel and whatever it is dodging.
-pub fn indicator_placement(
-    bounds: DesktopBounds,
-    region: Option<CaptureRect>,
-    size:   (u32, u32),
-    margin: i32,
-) -> IndicatorPlacement {
-    let (w, h)   = size;
-    let (iw, ih) = (w as i32, h as i32);
+/// `margin` is the gap kept between the panel and what it avoids.
+pub fn indicator_placement(bounds: DesktopBounds, region: Option<CaptureRect>, size: (u32, u32), margin: i32) -> IndicatorPlacement {
+    let (panel_w, panel_h) = (size.0 as i32, size.1 as i32);
 
-    // Desktop top-right, one margin in from both edges — where the panel has
-    // always lived, and the fallback when nothing better fits.
-    let corner = (
-        (bounds.right() - iw - margin).max(bounds.x + margin),
-        bounds.y + margin,
-    );
+    // One margin in from the desktop's top-right corner (never past its left
+    // edge on a desktop narrower than the panel). The indicator's usual home.
+    let corner_x = (bounds.right() - panel_w - margin).max(bounds.x + margin);
+    let corner = (corner_x, margin + bounds.y);
+    let at = |(x, y): (i32, i32), clear_of_region: bool| IndicatorPlacement { x, y, clear_of_region };
 
-    let Some(r) = region else {
-        return IndicatorPlacement { x: corner.0, y: corner.1, clear_of_region: true };
+    let Some(rec) = region else {
+        return at(corner, true);
     };
 
-    let candidates = [
-        (r.right() - iw,      r.bottom() + margin),   // below, right-aligned
-        (r.right() - iw,      r.y - margin - ih),     // above, right-aligned
-        (r.right() + margin,  r.y),                   // to the right
-        (r.x - margin - iw,   r.y),                   // to the left
-        corner,
-    ];
+    let on_desktop = |(x, y): (i32, i32)| {
+        x >= bounds.x
+            && y >= bounds.y
+            && x.saturating_add(panel_w) <= bounds.right()
+            && y.saturating_add(panel_h) <= bounds.bottom()
+    };
+    let clear = |(x, y): (i32, i32)| !rec.overlaps(x, y, size.0, size.1);
 
-    for (cx, cy) in candidates {
-        let fits = cx >= bounds.x
-            && cy >= bounds.y
-            && cx.saturating_add(iw) <= bounds.right()
-            && cy.saturating_add(ih) <= bounds.bottom();
-        if fits && !r.overlaps(cx, cy, w, h) {
-            return IndicatorPlacement { x: cx, y: cy, clear_of_region: true };
-        }
-    }
+    let under = (rec.right() - panel_w, rec.bottom() + margin);
+    let over = (rec.right() - panel_w, rec.y - margin - panel_h);
+    let beside_right = (rec.right() + margin, rec.y);
+    let beside_left = (rec.x - margin - panel_w, rec.y);
 
-    IndicatorPlacement { x: corner.0, y: corner.1, clear_of_region: false }
+    [under, over, beside_right, beside_left, corner]
+        .into_iter()
+        .find(|&spot| on_desktop(spot) && clear(spot))
+        .map_or_else(|| at(corner, false), |spot| at(spot, true))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn desktop() -> DesktopBounds { DesktopBounds::new(0, 0, 1920, 1080) }
+    /// A single 1080p monitor at the origin.
+    fn hd() -> DesktopBounds {
+        DesktopBounds::new(0, 0, 1920, 1080)
+    }
 
-    // ── even dimensions ────────────────────────────────────────────────────
+    fn pick(sel: (i32, i32, i32, i32), bounds: DesktopBounds) -> CaptureRect {
+        record_rect_from_selection(sel, bounds).expect("selection should be recordable")
+    }
+
+    fn xywh(r: &CaptureRect) -> (i32, i32, u32, u32) {
+        (r.x, r.y, r.width, r.height)
+    }
+
+    // Scale and points.
 
     #[test]
-    fn points_divide_by_scale() {
-        let bounds = DesktopBounds::new(0, 0, 2880, 1800).with_scale(2.0);
-        let r = record_rect_from_selection((200, 100, 800, 600), bounds).unwrap();
-        assert_eq!((r.x, r.y, r.width, r.height), (200, 100, 800, 600));
-        assert_eq!(r.points(), (100, 50, 400, 300));
+    fn points_halve_everything_on_a_2x_desktop() {
+        let retina = DesktopBounds::new(0, 0, 2880, 1800).with_scale(2.0);
+        let r = pick((300, 160, 640, 480), retina);
+        assert_eq!(xywh(&r), (300, 160, 640, 480), "pixel fields stay in pixels");
+        assert_eq!(r.points(), (150, 80, 320, 240));
     }
 
     #[test]
-    fn points_are_pixels_at_one_x() {
-        let r = record_rect_from_selection((200, 100, 800, 600), desktop()).unwrap();
-        assert_eq!(r.scale, 1.0);
-        assert_eq!(r.points(), (200, 100, 800, 600));
+    fn points_equal_pixels_at_1x() {
+        let r = pick((124, 46, 678, 90), hd());
+        assert_eq!((r.scale, r.points()), (1.0, (124, 46, 678, 90)));
     }
 
     #[test]
-    fn with_scale_rejects_nonsense() {
-        assert_eq!(DesktopBounds::new(0, 0, 10, 10).with_scale(0.0).scale, 1.0);
-        assert_eq!(DesktopBounds::new(0, 0, 10, 10).with_scale(f32::NAN).scale, 1.0);
-        assert_eq!(DesktopBounds::new(0, 0, 10, 10).with_scale(1.5).scale, 1.5);
+    fn points_round_to_nearest_and_keep_at_least_one() {
+        let r = CaptureRect { x: 3, y: -3, width: 16, height: 16, desktop_origin: (0, 0), scale: 2.0 };
+        // 1.5 and -1.5 round away from zero.
+        assert_eq!(r.points(), (2, -2, 8, 8));
+        let dense = CaptureRect { scale: 40.0, ..r };
+        assert_eq!(dense.points().2, 1, "a side never collapses to zero points");
+        assert_eq!(dense.points().3, 1);
     }
 
     #[test]
-    fn even_dimension_rounds_down_and_leaves_even_alone() {
-        assert_eq!(even_dimension(0), 0);
-        assert_eq!(even_dimension(1), 0);
-        assert_eq!(even_dimension(2), 2);
-        assert_eq!(even_dimension(1919), 1918);
-        assert_eq!(even_dimension(1920), 1920);
+    fn with_scale_ignores_unusable_values() {
+        let base = DesktopBounds::new(0, 0, 10, 10);
+        assert_eq!(base.with_scale(0.0).scale, 1.0);
+        assert_eq!(base.with_scale(-2.0).scale, 1.0);
+        assert_eq!(base.with_scale(f32::NAN).scale, 1.0);
+        assert_eq!(base.with_scale(f32::INFINITY).scale, 1.0);
+        assert_eq!(base.with_scale(1.5).scale, 1.5);
+        assert_eq!(base.with_scale(1.5).width, 10, "only the scale changes");
+    }
+
+    // Even sides.
+
+    #[test]
+    fn even_dimension_only_ever_rounds_down() {
+        let cases = [(0, 0), (1, 0), (2, 2), (3, 2), (1919, 1918), (1920, 1920), (u32::MAX, u32::MAX - 1)];
+        for (input, want) in cases {
+            assert_eq!(even_dimension(input), want, "{input}");
+        }
     }
 
     #[test]
-    fn selection_dimensions_are_always_even() {
-        // 401×303 is the shape of a real drag; libx264 + yuv420p can't take it.
-        let r = record_rect_from_selection((10, 20, 401, 303), desktop()).unwrap();
-        assert_eq!((r.width, r.height), (400, 302));
-        assert_eq!((r.x, r.y), (10, 20));
-        assert_eq!(r.width % 2, 0);
-        assert_eq!(r.height % 2, 0);
+    fn an_odd_drag_records_even_sides() {
+        // A typical hand-drawn 401 x 303 drag, which yuv420p cannot encode.
+        let r = pick((10, 20, 401, 303), hd());
+        assert_eq!(xywh(&r), (10, 20, 400, 302));
     }
 
-    // ── clamping ───────────────────────────────────────────────────────────
+    // Clamping.
 
     #[test]
-    fn selection_is_clamped_to_the_desktop() {
-        // Dragged off the right/bottom edges: the rect stops at the edge
-        // rather than asking the encoder for pixels that don't exist.
-        let r = record_rect_from_selection((1800, 1000, 500, 500), desktop()).unwrap();
-        assert_eq!(r.x, 1800);
-        assert_eq!(r.y, 1000);
-        assert_eq!(r.right(), 1920);
-        assert_eq!(r.bottom(), 1080);
+    fn a_drag_past_the_right_and_bottom_stops_at_the_edge() {
+        let r = pick((1800, 1000, 500, 500), hd());
+        assert_eq!((r.x, r.y), (1800, 1000));
+        assert_eq!((r.right(), r.bottom()), (1920, 1080));
     }
 
     #[test]
-    fn selection_starting_off_screen_is_pulled_back_in() {
-        let r = record_rect_from_selection((-200, -100, 600, 400), desktop()).unwrap();
-        assert_eq!((r.x, r.y), (0, 0));
-        assert_eq!((r.width, r.height), (400, 300));
+    fn a_drag_starting_off_screen_is_cut_back_in() {
+        let r = pick((-200, -100, 600, 400), hd());
+        assert_eq!(xywh(&r), (0, 0, 400, 300));
     }
 
     #[test]
-    fn negative_drag_is_normalized() {
-        // Dragged up-and-left from (500, 400).
-        let r = record_rect_from_selection((500, 400, -300, -200), desktop()).unwrap();
-        assert_eq!((r.x, r.y), (200, 200));
-        assert_eq!((r.width, r.height), (300, 200));
+    fn dragging_up_and_left_gives_the_same_rectangle() {
+        let backwards = pick((500, 400, -300, -200), hd());
+        let forwards = pick((200, 200, 300, 200), hd());
+        assert_eq!(backwards, forwards);
+        assert_eq!(xywh(&backwards), (200, 200, 300, 200));
     }
 
     #[test]
-    fn selection_entirely_off_desktop_is_rejected() {
-        assert!(record_rect_from_selection((3000, 3000, 100, 100), desktop()).is_none());
+    fn a_selection_off_the_desktop_is_refused() {
+        assert!(record_rect_from_selection((3000, 3000, 100, 100), hd()).is_none());
+        assert!(record_rect_from_selection((-500, 10, 100, 100), hd()).is_none());
+        // Touching the edge from outside is still nothing.
+        assert!(record_rect_from_selection((1920, 0, 100, 100), hd()).is_none());
     }
 
     #[test]
-    fn tiny_selection_is_rejected() {
-        // A click with a twitch, not a region.
-        assert!(record_rect_from_selection((10, 10, 6, 6), desktop()).is_none());
-        // Just under the limit on one axis only still fails — an encoder
-        // handed a 200×14 strip produces something nobody can watch.
-        assert!(record_rect_from_selection((10, 10, 200, 14), desktop()).is_none());
+    fn slivers_are_refused() {
+        // A twitch during a click.
+        assert!(record_rect_from_selection((10, 10, 6, 6), hd()).is_none());
+        // Wide enough but one side short is still refused: a 200 x 14
+        // strip is not a watchable video.
+        assert!(record_rect_from_selection((10, 10, 200, 14), hd()).is_none());
+        assert!(record_rect_from_selection((10, 10, 0, 200), hd()).is_none());
     }
 
     #[test]
-    fn odd_rounding_cannot_sneak_a_rect_under_the_minimum() {
-        // 17 rounds down to 16, which is exactly the floor and stays.
-        let r = record_rect_from_selection((0, 0, 17, 17), desktop()).unwrap();
-        assert_eq!((r.width, r.height), (16, 16));
-        // 15 has nowhere to go.
-        assert!(record_rect_from_selection((0, 0, 15, 200), desktop()).is_none());
-    }
-
-    // ── coordinate conventions ─────────────────────────────────────────────
-
-    #[test]
-    fn offsets_are_relative_to_a_negative_desktop_origin() {
-        // A second monitor to the left of the primary one puts the virtual
-        // desktop's corner at a negative x — the case that separates
-        // gdigrab's -offset_x from screencapture's -R.
-        let bounds = DesktopBounds::new(-1920, 0, 3840, 1080);
-        let r = record_rect_from_selection((-1000, 100, 640, 480), bounds).unwrap();
-        assert_eq!((r.x, r.y), (-1000, 100), "absolute coords stay absolute");
-        assert_eq!(r.offset_x(), 920, "offset is measured from the desktop corner");
-        assert_eq!(r.offset_y(), 100);
-        assert_eq!(r.video_size(), "640x480");
+    fn rounding_down_never_dips_below_the_minimum() {
+        // 17 becomes 16, exactly the minimum, which is allowed.
+        assert_eq!(xywh(&pick((0, 0, 17, 17), hd())), (0, 0, 16, 16));
+        // 15 would become 14, which is not.
+        assert!(record_rect_from_selection((0, 0, 15, 200), hd()).is_none());
     }
 
     #[test]
-    fn offsets_equal_absolute_coords_when_the_desktop_starts_at_origin() {
-        let r = record_rect_from_selection((320, 240, 800, 600), desktop()).unwrap();
-        assert_eq!(r.offset_x(), r.x);
-        assert_eq!(r.offset_y(), r.y);
+    fn extreme_selections_saturate_instead_of_wrapping() {
+        // Both the selection's far edge and the desktop's right edge would
+        // pass i32::MAX; they stop there instead.
+        let near_max = DesktopBounds::new(i32::MAX - 100, 0, 1000, 100);
+        assert_eq!(near_max.right(), i32::MAX);
+        let r = pick((i32::MAX - 51, 0, i32::MAX, 100), near_max);
+        assert_eq!(xywh(&r), (i32::MAX - 51, 0, 50, 100));
+        assert_eq!(r.right(), i32::MAX - 1);
     }
 
-    // ── overlap ────────────────────────────────────────────────────────────
+    // Absolute versus desktop-relative.
 
     #[test]
-    fn overlap_is_exclusive_at_the_edges() {
-        let r = record_rect_from_selection((100, 100, 200, 200), desktop()).unwrap();
-        assert!(r.overlaps(150, 150, 10, 10), "inside");
-        assert!(r.overlaps(90, 90, 20, 20), "corner bite");
-        assert!(!r.overlaps(300, 100, 50, 50), "flush against the right edge");
-        assert!(!r.overlaps(100, 300, 50, 50), "flush against the bottom edge");
-        assert!(!r.overlaps(0, 0, 100, 100), "flush against the top-left corner");
-    }
-
-    // ── indicator placement ────────────────────────────────────────────────
-
-    const PANEL: (u32, u32) = (220, 56);
-
-    #[test]
-    fn indicator_without_a_region_sits_in_the_desktop_corner() {
-        let p = indicator_placement(desktop(), None, PANEL, 24);
-        assert_eq!((p.x, p.y), (1920 - 220 - 24, 24));
-        assert!(p.clear_of_region);
+    fn offsets_count_from_a_negative_desktop_corner() {
+        // A monitor left of the primary puts the corner at x = -1920. This is
+        // the layout where gdigrab's -offset_x and screencapture's -R part
+        // ways.
+        let wide = DesktopBounds::new(-1920, 0, 3840, 1080);
+        let r = pick((-1000, 100, 800, 600), wide);
+        assert_eq!((r.x, r.y), (-1000, 100));
+        assert_eq!((r.offset_x(), r.offset_y()), (920, 100));
+        assert_eq!(r.desktop_origin, (-1920, 0));
+        assert_eq!(r.video_size(), "800x600");
     }
 
     #[test]
-    fn indicator_drops_below_a_region_with_room_under_it() {
-        let r = record_rect_from_selection((200, 100, 800, 600), desktop()).unwrap();
-        let p = indicator_placement(desktop(), Some(r), PANEL, 24);
-        assert!(p.clear_of_region);
-        assert!(!r.overlaps(p.x, p.y, PANEL.0, PANEL.1));
-        assert_eq!(p.y, r.bottom() + 24);
+    fn offsets_and_absolute_agree_when_the_corner_is_the_origin() {
+        let r = pick((320, 240, 800, 600), hd());
+        assert_eq!((r.offset_x(), r.offset_y()), (r.x, r.y));
+    }
+
+    // Overlap.
+
+    #[test]
+    fn overlap_needs_a_shared_pixel() {
+        let r = pick((100, 100, 200, 200), hd());
+        assert!(r.overlaps(150, 150, 10, 10), "fully inside");
+        assert!(r.overlaps(90, 90, 20, 20), "over the top-left corner");
+        assert!(r.overlaps(0, 0, 1000, 1000), "covering it entirely");
+        assert!(!r.overlaps(300, 100, 50, 50), "touching the right side");
+        assert!(!r.overlaps(100, 300, 50, 50), "touching the bottom");
+        assert!(!r.overlaps(0, 0, 100, 100), "touching the top-left corner");
+    }
+
+    // REC indicator.
+
+    const PANEL_W: i32 = 240;
+    const PANEL_H: i32 = 60;
+    const PANEL: (u32, u32) = (PANEL_W as u32, PANEL_H as u32);
+    const GAP: i32 = 24;
+    /// Where the panel sits in [`hd`]'s top-right corner.
+    const HD_CORNER: (i32, i32) = (1920 - PANEL_W - GAP, GAP);
+
+    fn assert_clear_and_on_screen(p: IndicatorPlacement, r: &CaptureRect, bounds: DesktopBounds) {
+        assert!(p.clear_of_region, "no clear spot was found");
+        assert!(!r.overlaps(p.x, p.y, PANEL.0, PANEL.1), "panel covers the recording");
+        let panel_box = (p.x, p.y, p.x + PANEL_W, p.y + PANEL_H);
+        assert!(panel_box.0 >= bounds.x && panel_box.1 >= bounds.y, "{panel_box:?} starts off the desktop");
+        assert!(panel_box.2 <= bounds.right() && panel_box.3 <= bounds.bottom(), "{panel_box:?} ends off it");
     }
 
     #[test]
-    fn indicator_moves_above_a_region_that_reaches_the_bottom_edge() {
-        let r = record_rect_from_selection((200, 300, 800, 780), desktop()).unwrap();
-        assert_eq!(r.bottom(), 1080);
-        let p = indicator_placement(desktop(), Some(r), PANEL, 24);
-        assert!(p.clear_of_region);
-        assert!(!r.overlaps(p.x, p.y, PANEL.0, PANEL.1));
-        assert!(p.y + PANEL.1 as i32 <= r.y);
+    fn with_no_region_the_indicator_uses_the_corner() {
+        let p = indicator_placement(hd(), None, PANEL, GAP);
+        assert_eq!(p, IndicatorPlacement { x: HD_CORNER.0, y: HD_CORNER.1, clear_of_region: true });
     }
 
     #[test]
-    fn indicator_goes_beside_a_full_height_region() {
-        // Nothing above or below; there's room to the right.
-        let r = record_rect_from_selection((0, 0, 1000, 1080), desktop()).unwrap();
-        let p = indicator_placement(desktop(), Some(r), PANEL, 24);
-        assert!(p.clear_of_region);
-        assert!(p.x >= r.right());
+    fn the_indicator_goes_under_a_region_first() {
+        let r = pick((200, 100, 800, 600), hd());
+        let p = indicator_placement(hd(), Some(r), PANEL, GAP);
+        assert_clear_and_on_screen(p, &r, hd());
+        assert_eq!((p.x, p.y), (r.right() - PANEL_W, r.bottom() + GAP), "right-aligned under it");
     }
 
     #[test]
-    fn indicator_reports_no_clear_spot_for_a_full_desktop_region() {
-        let r = record_rect_from_selection((0, 0, 1920, 1080), desktop()).unwrap();
-        let p = indicator_placement(desktop(), Some(r), PANEL, 24);
-        assert!(!p.clear_of_region, "nowhere on this desktop is outside the region");
-        // Still a usable on-screen position — the caller decides whether to
-        // show the panel at all.
-        assert!(p.x >= 0 && p.y >= 0);
+    fn a_region_on_the_bottom_edge_pushes_it_above() {
+        let r = pick((200, 300, 800, 780), hd());
+        assert_eq!(r.bottom(), hd().bottom());
+        let p = indicator_placement(hd(), Some(r), PANEL, GAP);
+        assert_clear_and_on_screen(p, &r, hd());
+        assert_eq!(p.y, r.y - GAP - PANEL_H);
     }
 
     #[test]
-    fn indicator_stays_on_a_desktop_whose_origin_is_negative() {
-        let bounds = DesktopBounds::new(-1920, -200, 3840, 1280);
-        let r = record_rect_from_selection((-1800, -100, 600, 400), bounds).unwrap();
-        let p = indicator_placement(bounds, Some(r), PANEL, 24);
-        assert!(p.x >= bounds.x && p.y >= bounds.y);
-        assert!(p.x + PANEL.0 as i32 <= bounds.right());
-        assert!(p.y + PANEL.1 as i32 <= bounds.bottom());
+    fn a_full_height_region_puts_it_alongside() {
+        let r = pick((0, 0, 1000, 1080), hd());
+        let p = indicator_placement(hd(), Some(r), PANEL, GAP);
+        assert_clear_and_on_screen(p, &r, hd());
+        assert_eq!((p.x, p.y), (r.right() + GAP, r.y));
+    }
+
+    #[test]
+    fn a_full_height_region_on_the_right_puts_it_to_the_left() {
+        let r = pick((900, 0, 1020, 1080), hd());
+        let p = indicator_placement(hd(), Some(r), PANEL, GAP);
+        assert_clear_and_on_screen(p, &r, hd());
+        assert_eq!((p.x, p.y), (900 - GAP - PANEL_W, 0));
+    }
+
+    #[test]
+    fn recording_the_whole_desktop_leaves_no_clear_spot() {
+        let r = pick((0, 0, 1920, 1080), hd());
+        let p = indicator_placement(hd(), Some(r), PANEL, GAP);
+        assert!(!p.clear_of_region, "every spot on this desktop is recorded");
+        // The corner is still a real on-screen position, for callers that
+        // choose to show the panel anyway.
+        assert_eq!((p.x, p.y), HD_CORNER);
+    }
+
+    #[test]
+    fn the_indicator_stays_on_a_desktop_with_a_negative_corner() {
+        let tall_left = DesktopBounds::new(-2560, -300, 4480, 1440);
+        let r = pick((-2400, -200, 600, 400), tall_left);
+        let p = indicator_placement(tall_left, Some(r), PANEL, GAP);
+        assert_clear_and_on_screen(p, &r, tall_left);
     }
 }

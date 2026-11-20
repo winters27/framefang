@@ -1,96 +1,101 @@
 [package]
-name        = "framefang-app"
-version     = { workspace = true }
-edition     = { workspace = true }
-authors     = { workspace = true }
-license     = { workspace = true }
-repository  = { workspace = true }
-description = "Framefang — native cross-platform screenshot tool"
-# Build-time hook that copies an ffmpeg next to the framefang binary for local
-# builds (`FRAMEFANG_FFMPEG=/path/to/ffmpeg`, else the one on PATH). Official
-# releases do not ship it: the app uses the ffmpeg on PATH.
-build       = "build.rs"
+name = "framefang-app"
+description = "Frame Fang: screenshots, annotation and screen recording for Windows, macOS and Linux"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+# build.rs puts an ffmpeg beside the binary in local builds, taken from
+# FRAMEFANG_FFMPEG when it is set and from PATH otherwise. Release builds
+# leave it out and the app finds ffmpeg on PATH at run time.
+build = "build.rs"
 
+# The executable is plain `framefang`, not the crate name.
 [[bin]]
 name = "framefang"
 path = "src/main.rs"
 
-# cargo-wix metadata. Drives `cargo wix` to produce Framefang.msi for the
-# GitHub Release on tag pushes (see .github/workflows/release.yml).
+# Settings for `cargo wix`, which builds the Windows installer attached to
+# each tagged GitHub release (.github/workflows/release.yml).
 #
-# The WiX source itself lives at the workspace root in `framefang-rs/wix/`
-# (one shared dir, not buried inside this crate) so that the WiX file +
-# License.rtf + Framefang.ico are easy to find. CI passes `--include` to
-# `cargo wix` to point at `wix/main.wxs` explicitly.
+# The .wxs file, License.rtf and the icon sit together in framefang-rs/wix/
+# at the workspace root rather than inside this crate; CI hands
+# wix/main.wxs to `cargo wix` with `--include`.
 #
-# `name = "Framefang"` (capitalised) forces cargo-wix to emit `Framefang.msi`
-# instead of `framefang-app-<version>-x86_64.msi`, the asset name the in-app
-# updater looks for (updates_form.rs `pick_asset_url`).
+# The installer must come out as Framefang.msi, because that is the asset
+# name the in-app updater downloads (`pick_asset_url` in updates_form.rs).
+# The capitalised `name` below is what makes cargo-wix use it instead of
+# its default framefang-app-<version>-x86_64.msi.
 [package.metadata.wix]
-name      = "Framefang"
-no-build  = false
-output    = "Framefang.msi"
-# Skip cargo-wix's auto-license / auto-EULA — we provide our own
-# License.rtf and the WixUI License page wires it up via WixVariable.
-license   = false
-eula      = false
-# Note: cargo-wix 0.3.x loads WixUIExtension and WixUtilExtension into
-# both candle and light by default, so main.wxs's WixUI_InstallDir
-# reference and the "Launch Framefang" CustomAction (which uses WixCA from
-# WixUtilExtension) link without an explicit -ext declaration. Adding
-# `compiler-args = ["-ext", "WixUtilExtension"]` here causes a
-# duplicate-load error (CNDL0125) — don't do it.
+name = "Framefang"
+no-build = false
+output = "Framefang.msi"
+# Our own License.rtf is wired to the installer's licence page through a
+# WixVariable, so cargo-wix should not generate a licence or EULA.
+license = false
+eula = false
+# cargo-wix 0.3 already passes WixUIExtension and WixUtilExtension to both
+# candle and light. That is what lets main.wxs use WixUI_InstallDir and the
+# WixCA-based "launch after install" action. Listing WixUtilExtension again
+# through compiler-args makes candle fail with CNDL0125 (loaded twice).
 
 [dependencies]
-framefang-core     = { path = "../framefang-core" }
+framefang-core = { path = "../framefang-core" }
 framefang-platform = { path = "../framefang-platform" }
 
-# Iced / imageproc / tokio land with the full editor port (PLAN.md § R7).
-# `rfd` is in early — Settings and About use it for native dialogs today, the
-# editor will keep using it for the Save / Open file pickers.
-image       = { workspace = true }
-arboard     = { workspace = true }
-chrono      = { workspace = true }
-serde       = { workspace = true }
-serde_json  = { workspace = true }
-anyhow      = { workspace = true }
-thiserror   = { workspace = true }
+# Versions live in the workspace manifest. rfd gives Settings, About and the
+# editor their native file and folder pickers.
+image = { workspace = true }
+arboard = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
 directories = { workspace = true }
-rfd         = { workspace = true }
-softbuffer  = { workspace = true }
-tiny-skia   = { workspace = true }
-sha2        = { workspace = true }
-winit       = "0.30"
-# QR codes read from the screen (QR mode). Pure Rust; (MIT OR Apache-2.0) AND ISC.
-rqrr        = "0.11"
+rfd = { workspace = true }
+softbuffer = { workspace = true }
+tiny-skia = { workspace = true }
+sha2 = { workspace = true }
+winit = "0.30"
+# Reads QR codes off the screen for QR mode. Pure Rust, licensed
+# (MIT OR Apache-2.0) AND ISC.
+rqrr = "0.11"
 
 [dev-dependencies]
-# Makes the QR codes the QR tests read back.
-qrcode      = { version = "0.14", default-features = false, features = ["image"] }
+# Draws the QR codes that the QR tests then decode.
+qrcode = { version = "0.14", default-features = false, features = ["image"] }
 
-# X11 keyboard focus + grab — winit's `focus_window()` sends
-# `_NET_ACTIVE_WINDOW` which Cinnamon ignores fast enough that the overlay
-# never receives KeyPress events. We force focus via XSetInputFocus +
-# XGrabKeyboard right after the window is mapped. The Shape extension cuts
-# the editor window to what it draws and rounds the dialogs' corners on X11
-# (window_shape.rs).
+# x11rb, Linux only. Asking winit for focus goes through _NET_ACTIVE_WINDOW,
+# which some window managers (Cinnamon among them) drop, leaving the capture
+# window deaf to the keyboard; we call XSetInputFocus and XGrabKeyboard once
+# it is mapped instead. The "shape" feature trims the editor window to what
+# it draws and gives the dialogs round corners on X11 (window_shape.rs).
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", features = ["shape"] }
 
-# NSWindow.sharingType = NSWindowSharingNone — keeps the floating REC
-# indicator out of `screencapture -v` recordings (recording_indicator.rs).
+# objc2, macOS only: sets the REC indicator's NSWindow sharingType to none so
+# `screencapture -v` does not film it (recording_indicator.rs).
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 
+# The Win32 API areas the app calls into directly.
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
     "Win32_Foundation",
-    "Win32_Graphics_Dwm",       # rounded corners + border color for the frameless dialogs
-    "Win32_Graphics_Gdi",       # SetWindowRgn: the editor window cut to the picture and its panels
-    "Win32_Storage_FileSystem", # MoveFileExW for the self-updater rename-trick
+    # DWM: round corners and border colour on the frameless dialogs.
+    "Win32_Graphics_Dwm",
+    # GDI: SetWindowRgn trims the editor window to the picture and panels.
+    "Win32_Graphics_Gdi",
+    # MoveFileExW, used by the self-updater to swap the running .exe.
+    "Win32_Storage_FileSystem",
     "Win32_System_Registry",
-    "Win32_System_Threading",   # AttachThreadInput: the capture window takes the keyboard reliably
-    "Win32_UI_Input_KeyboardAndMouse", # MapVirtualKeyW: rebind any key, even ones winit can't name
+    # AttachThreadInput, so the capture window reliably gets the keyboard.
+    "Win32_System_Threading",
+    # MapVirtualKeyW, so any key can be bound, even ones winit has no name for.
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
-    "Win32_UI_WindowsAndMessaging", # EndMenu + FindWindow/ShowWindow to dismiss the tray flyout before capture
+    # EndMenu, FindWindow and ShowWindow close the tray menu before a capture.
+    "Win32_UI_WindowsAndMessaging",
 ] }

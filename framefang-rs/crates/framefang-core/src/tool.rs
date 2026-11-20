@@ -1,135 +1,113 @@
-//! Tools the user can pick on the overlay toolbar.
+//! The drawing tools on the overlay and editor toolbars.
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// A drawing tool. The variant names are what settings.json stores, so they
+/// never change; the order of [`Tool::ALL`] is the toolbar order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Tool {
+    #[default]
     Pen,
     Line,
     Arrow,
     Rectangle,
     Ellipse,
     Marker,
-    /// Highlight words the picture's text reading found, snapped to them.
+    /// Marks words found by reading the picture's text, snapping to them.
     Highlight,
     Text,
     Step,
     Pixelate,
-    /// Dim everything outside a rectangle.
+    /// Darkens the picture outside a chosen rectangle.
     Spotlight,
-    /// A round lens showing what is under it, larger.
+    /// A round loupe that enlarges what sits under it.
     Magnify,
-    /// Trim the picture (the editor window only).
+    /// Cuts the picture down (only offered in the editor window).
     Crop,
 }
 
-impl Default for Tool {
-    fn default() -> Self {
-        Tool::Pen
-    }
-}
-
 impl Tool {
-    /// Single-letter keyboard shortcut.
-    pub fn shortcut(self) -> char {
-        match self {
-            Tool::Pen       => 'p',
-            Tool::Line      => 'l',
-            Tool::Arrow     => 'a',
-            Tool::Rectangle => 'r',
-            Tool::Ellipse   => 'e',
-            Tool::Marker    => 'm',
-            Tool::Highlight => 'h',
-            Tool::Text      => 't',
-            Tool::Step      => 'n',
-            Tool::Pixelate  => 'b',
-            Tool::Spotlight => 'f',
-            Tool::Magnify   => 'z',
-            Tool::Crop      => 'c',
-        }
-    }
-
-    /// Tooltip + accelerator text, for UI rendering.
-    pub fn label(self) -> &'static str {
-        match self {
-            Tool::Pen       => "Pen (P)",
-            Tool::Line      => "Line (L)",
-            Tool::Arrow     => "Arrow (A)",
-            Tool::Rectangle => "Rectangle (R)",
-            Tool::Ellipse   => "Ellipse (E)",
-            Tool::Marker    => "Marker (M)",
-            Tool::Highlight => "Highlight text (H)",
-            Tool::Text      => "Text (T)",
-            Tool::Step      => "Numbered step (N)",
-            Tool::Pixelate  => "Pixelate / blur (B)",
-            Tool::Spotlight => "Spotlight (F)",
-            Tool::Magnify   => "Magnify (Z)",
-            Tool::Crop      => "Crop (C)",
-        }
-    }
-
-    /// Stable name, the key a tool's saved style is stored under.
-    pub fn name(self) -> &'static str {
-        match self {
-            Tool::Pen       => "Pen",
-            Tool::Line      => "Line",
-            Tool::Arrow     => "Arrow",
-            Tool::Rectangle => "Rectangle",
-            Tool::Ellipse   => "Ellipse",
-            Tool::Marker    => "Marker",
-            Tool::Highlight => "Highlight",
-            Tool::Text      => "Text",
-            Tool::Step      => "Step",
-            Tool::Pixelate  => "Pixelate",
-            Tool::Spotlight => "Spotlight",
-            Tool::Magnify   => "Magnify",
-            Tool::Crop      => "Crop",
-        }
-    }
-
-    /// All tools in toolbar order.
+    /// Every tool, left to right as the toolbar shows them.
     pub const ALL: [Tool; 13] = [
-        Tool::Pen,
-        Tool::Line,
-        Tool::Arrow,
-        Tool::Rectangle,
-        Tool::Ellipse,
-        Tool::Marker,
-        Tool::Highlight,
-        Tool::Text,
-        Tool::Step,
-        Tool::Pixelate,
-        Tool::Spotlight,
-        Tool::Magnify,
-        Tool::Crop,
+        Tool::Pen, Tool::Line, Tool::Arrow, Tool::Rectangle, Tool::Ellipse,
+        Tool::Marker, Tool::Highlight, Tool::Text, Tool::Step, Tool::Pixelate,
+        Tool::Spotlight, Tool::Magnify, Tool::Crop,
     ];
 
-    /// Whether a session may open with this tool in hand. Crop changes the
-    /// picture, not the marks on it, so it is never the tool a session
-    /// starts with.
+    /// The fixed facts about a tool, kept together so a new tool is one
+    /// line here: (stored name, key letter, tooltip).
+    fn facts(self) -> (&'static str, char, &'static str) {
+        match self {
+            Tool::Pen => ("Pen", 'p', "Pen (P)"),
+            Tool::Line => ("Line", 'l', "Line (L)"),
+            Tool::Arrow => ("Arrow", 'a', "Arrow (A)"),
+            Tool::Rectangle => ("Rectangle", 'r', "Rectangle (R)"),
+            Tool::Ellipse => ("Ellipse", 'e', "Ellipse (E)"),
+            Tool::Marker => ("Marker", 'm', "Marker (M)"),
+            Tool::Highlight => ("Highlight", 'h', "Highlight text (H)"),
+            Tool::Text => ("Text", 't', "Text (T)"),
+            Tool::Step => ("Step", 'n', "Numbered step (N)"),
+            Tool::Pixelate => ("Pixelate", 'b', "Pixelate / blur (B)"),
+            Tool::Spotlight => ("Spotlight", 'f', "Spotlight (F)"),
+            Tool::Magnify => ("Magnify", 'z', "Magnify (Z)"),
+            Tool::Crop => ("Crop", 'c', "Crop (C)"),
+        }
+    }
+
+    /// The lowercase letter that picks this tool from the keyboard.
+    pub fn shortcut(self) -> char { self.facts().1 }
+
+    /// The tooltip text, ending with the key letter in brackets.
+    pub fn label(self) -> &'static str { self.facts().2 }
+
+    /// A name that never changes, used as the key for the tool's saved style.
+    pub fn name(self) -> &'static str { self.facts().0 }
+
+    /// Whether a capture may start with this tool selected. Crop reshapes
+    /// the picture itself rather than drawing on it, so it never is.
     pub fn can_open_with(self) -> bool { self != Tool::Crop }
 
+    /// The tool a key press picks, ignoring case.
     pub fn from_key(c: char) -> Option<Tool> {
-        let c = c.to_ascii_lowercase();
-        Tool::ALL.iter().copied().find(|t| t.shortcut() == c)
+        let wanted = c.to_ascii_lowercase();
+        Self::ALL.into_iter().find(|tool| tool.shortcut() == wanted)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
-    fn every_tool_has_its_own_key_and_name() {
-        let mut keys = std::collections::HashSet::new();
-        let mut names = std::collections::HashSet::new();
-        for t in Tool::ALL {
-            assert!(keys.insert(t.shortcut()), "{t:?} shares its key");
-            assert!(names.insert(t.name()), "{t:?} shares its name");
-            assert_eq!(Tool::from_key(t.shortcut()), Some(t));
-            // S is Select; Ctrl+C, Ctrl+Z stay copy and undo (the editor reads
-            // those with Ctrl before tool keys).
-            assert_ne!(t.shortcut(), 's');
+    fn keys_and_names_are_unique_and_round_trip() {
+        let mut seen_keys = HashSet::new();
+        let mut seen_names = HashSet::new();
+        for tool in Tool::ALL {
+            assert!(seen_keys.insert(tool.shortcut()), "{tool:?} reuses a key");
+            assert!(seen_names.insert(tool.name()), "{tool:?} reuses a name");
+            assert_eq!(Tool::from_key(tool.shortcut()), Some(tool));
+            // S belongs to Select, and the editor checks Ctrl+C and Ctrl+Z
+            // before tool letters, so C and Z can still be tools.
+            assert_ne!(tool.shortcut(), 's', "{tool:?} took Select's key");
         }
+    }
+
+    #[test]
+    fn upper_case_keys_pick_the_same_tool_and_tooltips_show_the_key() {
+        for tool in Tool::ALL {
+            let upper = tool.shortcut().to_ascii_uppercase();
+            assert_eq!(Tool::from_key(upper), Some(tool));
+            assert!(tool.label().ends_with(&format!("({upper})")), "{}", tool.label());
+        }
+        assert_eq!(Tool::from_key('s'), None);
+        assert_eq!(Tool::from_key('1'), None);
+    }
+
+    #[test]
+    fn pen_is_the_default_and_crop_is_never_a_starting_tool() {
+        assert_eq!(Tool::default(), Tool::Pen);
+        assert!(!Tool::Crop.can_open_with());
+        assert_eq!(Tool::ALL.iter().filter(|t| !t.can_open_with()).count(), 1);
     }
 }

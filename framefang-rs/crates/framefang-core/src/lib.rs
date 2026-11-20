@@ -1,43 +1,56 @@
-//! framefang-core
+//! The part of Frame Fang that needs no window system.
 //!
-//! Platform-agnostic Framefang logic: tools, annotations, app settings,
-//! theme palette, and the overlay state machine. Mirrors the C# types
-//! one-for-one so the two implementations stay legible side-by-side.
+//! Everything here is plain data and logic: the drawing tools and the marks
+//! they make, editing and undo, settings and where they live on disk,
+//! geometry for monitors and capture regions, colours and themes, and the
+//! wording of user-facing messages. Keeping it free of any OS or GUI crate
+//! means it builds and tests the same way on every platform.
 
+// Marks on a picture, and editing them.
 pub mod annotation;
+pub mod edit;
+pub mod history;
+pub mod mark;
+pub mod step;
+pub mod text;
+pub mod tool;
+
+// Settings, saved state and files on disk.
 pub mod app_state;
 pub mod atomic_file;
 pub mod file_name;
+pub mod settings;
+pub mod settings_store;
+
+// Keyboard shortcuts.
+pub mod hotkeys;
+pub mod shortcut;
+
+// Screens, regions and the capture state machine.
+pub mod dpi;
+pub mod region;
+pub mod state;
+pub mod virtual_desktop;
+
+// Look, install channel and messages.
 pub mod color;
 pub mod failure;
 pub mod install_channel;
-pub mod hotkeys;
-pub mod mark;
-pub mod dpi;
-pub mod edit;
-pub mod history;
-pub mod region;
-pub mod settings;
-pub mod settings_store;
-pub mod shortcut;
-pub mod state;
-pub mod step;
-pub mod text;
 pub mod theme;
-pub mod tool;
-pub mod virtual_desktop;
 
-pub use annotation::{Annotation, AnnotationKind, ColorPalette, Palettes};
-pub use color::Rgba;
-pub use install_channel::{detect_action, HostOs, InstallChannel, InstallProbe, UpdateAction};
-pub use hotkeys::HotkeyAction;
-pub use dpi::{DisplayMap, GrabRegion, LogicalRect, MonitorGeometry, MonitorPlacement, PhysicalRect};
-pub use history::{EditOp, History};
-pub use region::{CaptureRect, DesktopBounds};
-pub use settings::{AppSettings, Hotkey, Modifiers};
-pub use shortcut::portal_trigger;
-pub use state::{Edge, State};
-pub use text::{PlacedGlyph, TextBlock, TextRect};
-pub use theme::{ThemeColors, ThemeName};
-pub use tool::Tool;
-pub use virtual_desktop::{DesktopGeometry, MonitorRect};
+pub use crate::{
+    annotation::{Annotation, AnnotationKind, ColorPalette, Palettes},
+    color::Rgba,
+    dpi::{DisplayMap, GrabRegion, LogicalRect, MonitorGeometry, MonitorPlacement, PhysicalRect},
+    history::{EditOp, History},
+    hotkeys::HotkeyAction,
+    install_channel::{detect_action, HostOs, InstallChannel, InstallProbe, UpdateAction},
+    region::{CaptureRect, DesktopBounds},
+    settings::{AppSettings, Hotkey, Modifiers},
+    shortcut::portal_trigger,
+    state::{Edge, State},
+    text::{PlacedGlyph, TextBlock, TextRect},
+    theme::{ThemeColors, ThemeName},
+    tool::Tool,
+    virtual_desktop::{DesktopGeometry, MonitorRect},
+};

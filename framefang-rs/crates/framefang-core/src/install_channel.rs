@@ -1,639 +1,701 @@
-//! Which channel this copy of Framefang was installed from, and what the
-//! updater is allowed to do about a newer release.
-//!
-//! Framefang ships through a dozen channels: GitHub tarballs / zips, the MSI,
-//! the macOS `.dmg`, an AppImage, Snap, Flatpak, Homebrew, deb / rpm / AUR,
-//! Scoop. Only some of them are ours to replace. Overwriting the binary of a
-//! package-managed install is at best pointless (the package manager reverts
-//! it on the next upgrade) and at worst breaks the install — a Snap's
-//! read-only squashfs can't be written at all, and a swapped-out `/usr/bin`
-//! binary makes dpkg / rpm checksums disagree with reality.
-//!
-//! So the dialog asks this module first. Detection is a pure function of
-//! three observable things — a few environment variables, the path of the
-//! running executable, and whether a couple of marker files exist — which
-//! keeps it unit-testable for every channel on every host. The caller
-//! ([`InstallProbe`] construction) is the only part that touches the OS.
+/*!
+Working out where this copy of Frame Fang came from, and therefore what the
+Updates dialog may do once a newer release shows up.
 
-/// The three platforms Framefang ships on. Carried in the probe rather than
-/// read from `cfg!` inside the detection so a Linux test run can exercise
-/// the Windows and macOS branches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+Frame Fang reaches people through many routes: the release tarballs and
+portable exe, the MSI (also used by winget and Chocolatey), the macOS `.dmg`,
+an AppImage, Snap, Flatpak, Homebrew, distro packages (deb, rpm, AUR) and
+Scoop. Some of those installs belong to us and can be replaced in place. The
+rest belong to a package manager: swapping their files would be undone at the
+next upgrade, would leave dpkg or rpm checksums lying, or would simply fail (a
+Snap lives on a read-only squashfs). For those we tell the user which command
+to run instead.
+
+The classification only looks at what an [`InstallProbe`] carries (a few
+environment variables, the running executable's path, two marker files and
+`/etc/os-release`). Gathering the probe is the caller's job; everything in
+here is pure, so every channel on every OS can be tested from any host.
+*/
+
+/// The operating systems Frame Fang is built for. It travels inside the probe
+/// instead of being read with `cfg!` during detection, so a test on one OS can
+/// walk the rules of the others.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum HostOs {
-    #[default]
-    Linux,
     Windows,
     MacOs,
+    #[default]
+    Linux,
 }
 
 impl HostOs {
-    /// The OS this binary was compiled for.
+    /// The OS this binary targets.
     pub fn host() -> Self {
-        if cfg!(target_os = "windows") {
-            HostOs::Windows
-        } else if cfg!(target_os = "macos") {
-            HostOs::MacOs
-        } else {
-            HostOs::Linux
+        match () {
+            _ if cfg!(windows) => Self::Windows,
+            _ if cfg!(target_os = "macos") => Self::MacOs,
+            _ => Self::Linux,
         }
     }
 }
 
-/// Everything the detection is allowed to look at. Fill it from the real
-/// environment at the edge of the app; construct it by hand in tests.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// The observations detection works from. The app fills one from the real
+/// machine; tests build them by hand.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct InstallProbe {
     pub os: HostOs,
-    /// `std::env::current_exe()`, lossily stringified. Inside an AppImage
-    /// this points into the mounted squashfs, not at the `.AppImage` file.
+    /// The running executable (`std::env::current_exe()`, lossy). For an
+    /// AppImage this is a path inside the FUSE mount, not the image file.
     pub exe_path: String,
-    /// `$SNAP` — the snap's read-only mount root, e.g. `/snap/framefang/42`.
+    /// `$SNAP`: root of the snap's read-only mount, such as
+    /// `/snap/framefang/42`.
     pub snap_dir: Option<String>,
-    /// `$FLATPAK_ID`.
-    pub flatpak_id: Option<String>,
-    /// Does `/.flatpak-info` exist? Present inside every Flatpak sandbox.
-    pub flatpak_info_exists: bool,
-    /// `$APPIMAGE` — absolute path of the running `.AppImage` file. This is
-    /// the file the updater replaces, not `exe_path`.
+    /// `$APPIMAGE`: the `.AppImage` file itself, which is what an update
+    /// replaces (not `exe_path`).
     pub appimage_path: Option<String>,
-    /// Does a Homebrew Caskroom entry for framefang exist? The cask drops
-    /// `Framefang.app` into `/Applications`, so the app bundle itself carries
-    /// no trace of brew — the Caskroom directory is the only marker.
+    /// The `$FLATPAK_ID` environment variable.
+    pub flatpak_id: Option<String>,
+    /// Whether `/.flatpak-info` exists; every Flatpak sandbox has one.
+    pub flatpak_info_exists: bool,
+    /// Whether Homebrew's Caskroom has a framefang entry. The cask copies a
+    /// normal `Framefang.app` into `/Applications`, so this directory is the
+    /// only sign that brew manages it.
     pub homebrew_cask_marker: bool,
-    /// Contents of `/etc/os-release`, used only to name the right distro
-    /// package-manager command. `None` degrades to a generic hint.
+    /// The text of `/etc/os-release`, used only to pick the distro's package
+    /// manager command. Without it the hint stays generic.
     pub os_release: Option<String>,
 }
 
-/// How this copy of Framefang got onto the machine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The route by which this copy was installed, grouped by platform.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InstallChannel {
+    /// Installed from `Framefang.msi`, whether run by hand, by winget or by
+    /// Chocolatey.
+    WindowsMsi,
+    /// `Framefang-portable.exe` running from wherever it was saved (releases
+    /// up to 1.3.0 shipped it inside `framefang-windows-x86_64.zip`).
+    WindowsPortable,
+    Scoop,
+    /// A `Framefang.app` that no package manager claims, as from the `.dmg`.
+    MacAppBundle,
+    /// A macOS app bundle installed with `brew install --cask framefang`.
+    HomebrewCask,
+    /// A Homebrew formula: the binary sits under a `Cellar/` directory.
+    HomebrewFormula,
+    AppImage,
     Snap,
     Flatpak,
-    AppImage,
-    /// `brew install --cask framefang` (macOS app bundle managed by brew).
-    HomebrewCask,
-    /// A Homebrew formula install — the binary lives under `Cellar/`.
-    HomebrewFormula,
-    /// deb / rpm / AUR: a distro package that owns `/usr/bin/framefang`.
+    /// A distro package (deb, rpm, AUR) that owns `/usr/bin/framefang`.
     LinuxSystemPackage,
-    Scoop,
-    /// Installed by `Framefang.msi` (directly, via winget, or via Chocolatey).
-    WindowsMsi,
-    /// `Framefang-portable.exe` run where it was saved (or, up to 1.3.0,
-    /// unpacked from `framefang-windows-x86_64.zip`).
-    WindowsPortable,
-    /// A `Framefang.app` bundle that no package manager claims (the `.dmg`).
-    MacAppBundle,
-    /// A loose binary from the release tarball / `install.sh`.
+    /// A loose binary from a release tarball or `install.sh`.
     Portable,
 }
 
 impl InstallChannel {
-    /// Short human-readable name for the dialog.
+    /// A short name the Updates dialog can show.
     pub fn label(self) -> &'static str {
         match self {
-            InstallChannel::Snap => "Snap",
-            InstallChannel::Flatpak => "Flatpak",
-            InstallChannel::AppImage => "AppImage",
-            InstallChannel::HomebrewCask => "Homebrew cask",
-            InstallChannel::HomebrewFormula => "Homebrew",
-            InstallChannel::LinuxSystemPackage => "system package",
-            InstallChannel::Scoop => "Scoop",
-            InstallChannel::WindowsMsi => "Windows installer",
-            InstallChannel::WindowsPortable => "portable build",
-            InstallChannel::MacAppBundle => "app bundle",
-            InstallChannel::Portable => "portable build",
+            Self::WindowsMsi => "Windows installer",
+            Self::WindowsPortable | Self::Portable => "portable build",
+            Self::Scoop => "Scoop",
+            Self::MacAppBundle => "app bundle",
+            Self::HomebrewCask => "Homebrew cask",
+            Self::HomebrewFormula => "Homebrew",
+            Self::AppImage => "AppImage",
+            Self::Snap => "Snap",
+            Self::Flatpak => "Flatpak",
+            Self::LinuxSystemPackage => "system package",
         }
     }
 
-    /// True when some package manager owns these files and the in-app
-    /// updater must keep its hands off them.
+    /// True when a package manager owns the installed files, so the in-app
+    /// updater must not replace them.
     pub fn is_package_managed(self) -> bool {
-        matches!(
-            self,
-            InstallChannel::Snap
-                | InstallChannel::Flatpak
-                | InstallChannel::HomebrewCask
-                | InstallChannel::HomebrewFormula
-                | InstallChannel::LinuxSystemPackage
-                | InstallChannel::Scoop
-        )
+        package_manager_steps(self, None).is_some()
     }
 }
 
-/// What the Updates dialog offers once it knows a newer release exists.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The choice the Updates dialog gets to offer for a newer release.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UpdateAction {
-    /// Download the asset, verify it, swap it in, relaunch.
+    /// Fetch the asset, check it, put it in place and restart.
     SelfInstall,
-    /// Hand the asset URL to the browser and let the user run the
-    /// installer themselves.
+    /// Open the asset URL in the browser and let the user install it.
     BrowserDownload,
-    /// Someone else owns this install. Show `hint`, plus `command` when we
-    /// can name the exact one-liner.
+    /// A package manager owns this install. Show `hint`, and `command` too
+    /// when there is one exact command to suggest.
     Managed {
         hint: &'static str,
         command: Option<String>,
     },
 }
 
-/// Classify the running install. Pure — every input arrives in `probe`.
+/// Decide which channel the probed install belongs to. No I/O happens here.
 pub fn detect(probe: &InstallProbe) -> InstallChannel {
-    match probe.os {
-        HostOs::Linux => detect_linux(probe),
-        HostOs::MacOs => detect_macos(probe),
-        HostOs::Windows => detect_windows(probe),
-    }
-}
-
-/// What the updater may do for `channel` on this host.
-pub fn update_action(channel: InstallChannel, probe: &InstallProbe) -> UpdateAction {
-    match channel {
-        // The AppImage is a single file we own outright: download the new
-        // one next to it and rename over the old one. Self-contained, no
-        // package database to desynchronise.
-        InstallChannel::AppImage => UpdateAction::SelfInstall,
-
-        // MSI upgrades hand off to msiexec, which keeps Add/Remove Programs
-        // honest; the plain Linux tarball layout is a straight binary swap.
-        InstallChannel::WindowsMsi => UpdateAction::SelfInstall,
-        InstallChannel::Portable if probe.os == HostOs::Linux => UpdateAction::SelfInstall,
-        // The Windows portable zip holds just `framefang.exe`: the running
-        // one is renamed aside and the new one moved in, then relaunched.
-        InstallChannel::WindowsPortable => UpdateAction::SelfInstall,
-
-        // macOS app bundles are unpacked by hand, so we hand the download
-        // back to the user rather than guessing at their layout and their
-        // code-signing state.
-        InstallChannel::Portable
-        | InstallChannel::MacAppBundle => UpdateAction::BrowserDownload,
-
-        InstallChannel::Snap => UpdateAction::Managed {
-            hint: "Installed from the Snap Store - update with:",
-            command: Some("sudo snap refresh framefang".to_owned()),
-        },
-        InstallChannel::Flatpak => UpdateAction::Managed {
-            hint: "Installed as a Flatpak - update with:",
-            command: Some("flatpak update org.framefang.Framefang".to_owned()),
-        },
-        InstallChannel::HomebrewCask => UpdateAction::Managed {
-            hint: "Installed with Homebrew - update with:",
-            command: Some("brew upgrade --cask framefang".to_owned()),
-        },
-        InstallChannel::HomebrewFormula => UpdateAction::Managed {
-            hint: "Installed with Homebrew - update with:",
-            command: Some("brew upgrade framefang".to_owned()),
-        },
-        InstallChannel::Scoop => UpdateAction::Managed {
-            hint: "Installed with Scoop - update with:",
-            command: Some("scoop update framefang".to_owned()),
-        },
-        InstallChannel::LinuxSystemPackage => match distro_family(probe.os_release.as_deref()) {
-            DistroFamily::Debian => UpdateAction::Managed {
-                hint: "Installed from a system package - update with:",
-                command: Some(
-                    "sudo apt update && sudo apt install --only-upgrade framefang".to_owned(),
-                ),
-            },
-            DistroFamily::Fedora => UpdateAction::Managed {
-                hint: "Installed from a system package - update with:",
-                command: Some("sudo dnf upgrade framefang".to_owned()),
-            },
-            DistroFamily::Arch => UpdateAction::Managed {
-                hint: "Installed from the AUR - update with your AUR helper:",
-                command: Some("yay -Syu framefang-bin".to_owned()),
-            },
-            DistroFamily::Suse => UpdateAction::Managed {
-                hint: "Installed from a system package - update with:",
-                command: Some("sudo zypper update framefang".to_owned()),
-            },
-            DistroFamily::Unknown => UpdateAction::Managed {
-                hint: "Installed from a system package - update it with your package manager.",
-                command: None,
-            },
-        },
-    }
-}
-
-/// Convenience: classify and resolve the action in one call.
-pub fn detect_action(probe: &InstallProbe) -> (InstallChannel, UpdateAction) {
-    let channel = detect(probe);
-    let action = update_action(channel, probe);
-    (channel, action)
-}
-
-// ── per-OS detection ────────────────────────────────────────────────────────
-
-fn detect_linux(p: &InstallProbe) -> InstallChannel {
-    if is_snap(p) {
-        return InstallChannel::Snap;
-    }
-    if is_flatpak(p) {
-        return InstallChannel::Flatpak;
-    }
-    if is_appimage(p) {
-        return InstallChannel::AppImage;
-    }
-    // Linuxbrew keeps its binaries under <prefix>/Cellar/<formula>/<version>.
-    if p.exe_path.contains("/Cellar/") {
-        return InstallChannel::HomebrewFormula;
-    }
-    if is_system_path(&p.exe_path) {
-        return InstallChannel::LinuxSystemPackage;
-    }
-    InstallChannel::Portable
-}
-
-fn detect_macos(p: &InstallProbe) -> InstallChannel {
-    if p.exe_path.contains("/Cellar/") {
-        return InstallChannel::HomebrewFormula;
-    }
-    if in_app_bundle(&p.exe_path) {
-        // The cask stages Framefang.app into /Applications, so the bundle looks
-        // exactly like a hand-installed one — only the Caskroom entry tells
-        // us brew is tracking it.
-        return if p.homebrew_cask_marker {
-            InstallChannel::HomebrewCask
-        } else {
-            InstallChannel::MacAppBundle
-        };
-    }
-    InstallChannel::Portable
-}
-
-fn detect_windows(p: &InstallProbe) -> InstallChannel {
-    let path = p.exe_path.to_ascii_lowercase().replace('/', "\\");
-    // Scoop first: it unpacks the portable zip under <scoop>\apps\framefang\,
-    // which is never inside Program Files, but checking it first keeps the
-    // rule order obvious.
-    if path.contains("\\scoop\\apps\\") {
-        return InstallChannel::Scoop;
-    }
-    // Same heuristic the MSI handoff has always used: `perMachine` scope
-    // puts framefang.exe in one of the two Program Files trees, and nothing
-    // else does. winget and Chocolatey both install that same MSI.
-    if path.contains("\\program files\\") || path.contains("\\program files (x86)\\") {
-        return InstallChannel::WindowsMsi;
-    }
-    InstallChannel::WindowsPortable
-}
-
-fn is_snap(p: &InstallProbe) -> bool {
-    // The snap's own binary always lives under the read-only /snap mount.
-    if p.exe_path.starts_with("/snap/") {
-        return true;
-    }
-    // $SNAP is inherited by every child process of a snap, so on its own it
-    // proves nothing — a terminal snap launching a tarball build of Framefang
-    // would set it too. Only trust it when the running binary is actually
-    // inside that snap's tree.
-    match p.snap_dir.as_deref() {
-        Some(dir) if !dir.is_empty() => p.exe_path.starts_with(dir),
-        _ => false,
-    }
-}
-
-fn is_flatpak(p: &InstallProbe) -> bool {
-    if p.flatpak_info_exists {
-        return true;
-    }
-    matches!(p.flatpak_id.as_deref(), Some(id) if !id.is_empty())
-}
-
-fn is_appimage(p: &InstallProbe) -> bool {
-    matches!(p.appimage_path.as_deref(), Some(path) if !path.is_empty())
-}
-
-/// A distro package owns `/usr/bin` and `/usr/lib`. `/usr/local` is
-/// deliberately excluded — that tree is for hand-installed software, which
-/// is exactly what `install.sh` produces when run as root.
-fn is_system_path(exe: &str) -> bool {
-    exe.starts_with("/usr/bin/")
-        || exe.starts_with("/usr/lib/")
-        || exe.starts_with("/usr/libexec/")
-        || exe.starts_with("/usr/sbin/")
-}
-
-fn in_app_bundle(exe: &str) -> bool {
-    exe.contains(".app/Contents/MacOS/")
-}
-
-// ── /etc/os-release ─────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DistroFamily {
-    Debian,
-    Fedora,
-    Arch,
-    Suse,
-    Unknown,
-}
-
-/// Map `ID` / `ID_LIKE` from `/etc/os-release` onto a package manager. Both
-/// keys are checked because derivatives (Mint, Pop!_OS, EndeavourOS, Rocky…)
-/// carry their own `ID` and name the parent in `ID_LIKE`.
-fn distro_family(os_release: Option<&str>) -> DistroFamily {
-    let Some(text) = os_release else {
-        return DistroFamily::Unknown;
+    let rules: fn(&InstallProbe) -> InstallChannel = match probe.os {
+        HostOs::Windows => windows_channel,
+        HostOs::MacOs => macos_channel,
+        HostOs::Linux => linux_channel,
     };
-    let mut ids: Vec<String> = Vec::new();
-    for raw in text.lines() {
-        let line = raw.trim();
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        if key != "ID" && key != "ID_LIKE" {
-            continue;
-        }
-        let value = value.trim().trim_matches('"').trim_matches('\'');
-        for word in value.split_whitespace() {
-            ids.push(word.to_ascii_lowercase());
-        }
+    rules(probe)
+}
+
+/// What the updater is allowed to do for `channel` on the probed host.
+pub fn update_action(channel: InstallChannel, probe: &InstallProbe) -> UpdateAction {
+    if let Some((hint, command)) = package_manager_steps(channel, probe.os_release.as_deref()) {
+        return UpdateAction::Managed { hint, command: command.map(str::to_owned) };
     }
-    for id in &ids {
-        let family = match id.as_str() {
-            "debian" | "ubuntu" | "linuxmint" | "pop" | "raspbian" => DistroFamily::Debian,
-            "fedora" | "rhel" | "centos" | "rocky" | "almalinux" => DistroFamily::Fedora,
-            "arch" | "archlinux" | "manjaro" | "endeavouros" => DistroFamily::Arch,
-            "opensuse" | "opensuse-tumbleweed" | "opensuse-leap" | "suse" | "sles" => {
-                DistroFamily::Suse
+    // Files we own outright can be replaced in place. The AppImage is one
+    // file renamed over the old one; the MSI path hands off to msiexec so
+    // Add/Remove Programs stays accurate; the portable exe moves the running
+    // copy aside and drops the new one in its place; a Linux tarball install
+    // is a plain binary swap. A loose binary anywhere else, like a
+    // hand-unpacked macOS app, has a layout and a signing state we would only
+    // be guessing at, so the user downloads the new release themselves.
+    let in_place = match channel {
+        InstallChannel::AppImage | InstallChannel::WindowsMsi | InstallChannel::WindowsPortable => true,
+        InstallChannel::Portable => probe.os == HostOs::Linux,
+        _ => false,
+    };
+    if in_place { UpdateAction::SelfInstall } else { UpdateAction::BrowserDownload }
+}
+
+/// Shorthand for [`detect`] followed by [`update_action`].
+pub fn detect_action(probe: &InstallProbe) -> (InstallChannel, UpdateAction) {
+    let found = detect(probe);
+    (found, update_action(found, probe))
+}
+
+/// The hint and (when we can name it) command for a package-managed
+/// channel, or `None` for a channel the updater owns. `os_release` only
+/// matters for distro packages.
+fn package_manager_steps(
+    channel: InstallChannel,
+    os_release: Option<&str>,
+) -> Option<(&'static str, Option<&'static str>)> {
+    const BREW: &str = "Installed with Homebrew - update with:";
+    const DISTRO: &str = "Installed from a system package - update with:";
+
+    let steps = match channel {
+        InstallChannel::Snap => (
+            "Installed from the Snap Store - update with:",
+            Some("sudo snap refresh framefang"),
+        ),
+        InstallChannel::Flatpak => (
+            "Installed as a Flatpak - update with:",
+            Some("flatpak update org.framefang.Framefang"),
+        ),
+        InstallChannel::HomebrewCask => (BREW, Some("brew upgrade --cask framefang")),
+        InstallChannel::HomebrewFormula => (BREW, Some("brew upgrade framefang")),
+        InstallChannel::Scoop => {
+            ("Installed with Scoop - update with:", Some("scoop update framefang"))
+        }
+        InstallChannel::LinuxSystemPackage => match package_tool(os_release) {
+            Some(PackageTool::Apt) => {
+                (DISTRO, Some("sudo apt update && sudo apt install --only-upgrade framefang"))
             }
-            _ => continue,
-        };
-        return family;
+            Some(PackageTool::Dnf) => (DISTRO, Some("sudo dnf upgrade framefang")),
+            Some(PackageTool::Zypper) => (DISTRO, Some("sudo zypper update framefang")),
+            Some(PackageTool::AurHelper) => (
+                "Installed from the AUR - update with your AUR helper:",
+                Some("yay -Syu framefang-bin"),
+            ),
+            None => (
+                "Installed from a system package - update it with your package manager.",
+                None,
+            ),
+        },
+        InstallChannel::AppImage
+        | InstallChannel::WindowsMsi
+        | InstallChannel::WindowsPortable
+        | InstallChannel::MacAppBundle
+        | InstallChannel::Portable => return None,
+    };
+    Some(steps)
+}
+
+// Detection rules, one function per OS. Each list runs from the most
+// specific sign to the least, and the first match wins.
+
+fn linux_channel(p: &InstallProbe) -> InstallChannel {
+    if runs_from_snap(p) {
+        InstallChannel::Snap
+    } else if p.flatpak_info_exists || filled(&p.flatpak_id) {
+        InstallChannel::Flatpak
+    } else if filled(&p.appimage_path) {
+        InstallChannel::AppImage
+    } else if in_brew_cellar(&p.exe_path) {
+        // Linuxbrew uses the same <prefix>/Cellar/<formula>/<version> layout.
+        InstallChannel::HomebrewFormula
+    } else if under_distro_tree(&p.exe_path) {
+        InstallChannel::LinuxSystemPackage
+    } else {
+        InstallChannel::Portable
     }
-    DistroFamily::Unknown
+}
+
+fn macos_channel(p: &InstallProbe) -> InstallChannel {
+    if in_brew_cellar(&p.exe_path) {
+        InstallChannel::HomebrewFormula
+    } else if !p.exe_path.contains(".app/Contents/MacOS/") {
+        InstallChannel::Portable
+    } else if p.homebrew_cask_marker {
+        // A cask-installed bundle is byte for byte a hand-installed one; the
+        // Caskroom entry is the only difference.
+        InstallChannel::HomebrewCask
+    } else {
+        InstallChannel::MacAppBundle
+    }
+}
+
+fn windows_channel(p: &InstallProbe) -> InstallChannel {
+    // Compare in one spelling: lowercase with backslashes.
+    let exe = p.exe_path.to_ascii_lowercase().replace('/', "\\");
+    let under = |tree: &str| exe.contains(tree);
+    // Scoop unpacks into <scoop>\apps\framefang\<version>\. That is never
+    // under Program Files, but testing it first keeps the order readable.
+    // The MSI is per-machine, so it always lands in one of the Program Files
+    // trees and nothing else of ours does; winget and Chocolatey run that
+    // same MSI.
+    if under("\\scoop\\apps\\") {
+        InstallChannel::Scoop
+    } else if under("\\program files\\") || under("\\program files (x86)\\") {
+        InstallChannel::WindowsMsi
+    } else {
+        InstallChannel::WindowsPortable
+    }
+}
+
+/// `Some` and non-empty. An empty environment variable counts as unset.
+fn filled(value: &Option<String>) -> bool {
+    value.as_deref().is_some_and(|s| !s.is_empty())
+}
+
+/// A snap's own binary is always under the /snap mount. `$SNAP` on its own
+/// proves nothing, because every child of a snapped program inherits it (a
+/// snapped terminal starting a tarball Frame Fang, say), so it only counts
+/// when the executable sits inside that snap's root.
+fn runs_from_snap(p: &InstallProbe) -> bool {
+    let inside_snap_root = p
+        .snap_dir
+        .as_deref()
+        .is_some_and(|root| !root.is_empty() && p.exe_path.starts_with(root));
+    p.exe_path.starts_with("/snap/") || inside_snap_root
+}
+
+fn in_brew_cellar(exe: &str) -> bool {
+    exe.contains("/Cellar/")
+}
+
+/// Trees a distro package owns. `/usr/local` is left out on purpose: it is
+/// for software installed by hand, which is what `install.sh` produces when
+/// run as root, and that binary is still ours to update.
+fn under_distro_tree(exe: &str) -> bool {
+    ["/usr/bin/", "/usr/sbin/", "/usr/lib/", "/usr/libexec/"]
+        .iter()
+        .any(|tree| exe.starts_with(tree))
+}
+
+// Reading /etc/os-release.
+
+/// Which package manager a distro family upgrades with.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PackageTool {
+    Apt,
+    Dnf,
+    AurHelper,
+    Zypper,
+}
+
+/// Find the package manager from the `ID` and `ID_LIKE` keys of
+/// `/etc/os-release`. Derivatives (Mint, Pop!_OS, Rocky, EndeavourOS and so
+/// on) have their own `ID` and name their parent in `ID_LIKE`, so every word
+/// of both keys is tried, in file order, until one is recognised.
+fn package_tool(os_release: Option<&str>) -> Option<PackageTool> {
+    os_release?
+        .lines()
+        .filter_map(|line| line.trim().split_once('='))
+        .filter(|(key, _)| matches!(*key, "ID" | "ID_LIKE"))
+        .flat_map(|(_, value)| value.trim().trim_matches('"').trim_matches('\'').split_whitespace())
+        .find_map(|word| tool_for(&word.to_ascii_lowercase()))
+}
+
+fn tool_for(distro_id: &str) -> Option<PackageTool> {
+    Some(match distro_id {
+        "debian" | "ubuntu" | "linuxmint" | "pop" | "raspbian" => PackageTool::Apt,
+        "fedora" | "rhel" | "centos" | "rocky" | "almalinux" => PackageTool::Dnf,
+        "arch" | "archlinux" | "manjaro" | "endeavouros" => PackageTool::AurHelper,
+        "opensuse" | "opensuse-tumbleweed" | "opensuse-leap" | "suse" | "sles" => PackageTool::Zypper,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod checks {
+    use super::{
+        detect, detect_action, package_tool, update_action, HostOs, InstallChannel as Ch,
+        InstallProbe, PackageTool, UpdateAction as Act,
+    };
 
-    fn linux(exe: &str) -> InstallProbe {
-        InstallProbe {
-            os: HostOs::Linux,
-            exe_path: exe.to_owned(),
-            ..Default::default()
+    const EVERY_CHANNEL: [Ch; 11] = [
+        Ch::WindowsMsi,
+        Ch::WindowsPortable,
+        Ch::Scoop,
+        Ch::MacAppBundle,
+        Ch::HomebrewCask,
+        Ch::HomebrewFormula,
+        Ch::AppImage,
+        Ch::Snap,
+        Ch::Flatpak,
+        Ch::LinuxSystemPackage,
+        Ch::Portable,
+    ];
+
+    fn probe(os: HostOs, exe: &str) -> InstallProbe {
+        InstallProbe { os, exe_path: exe.into(), ..InstallProbe::default() }
+    }
+
+    fn on_linux(exe: &str) -> InstallProbe {
+        probe(HostOs::Linux, exe)
+    }
+
+    fn on_windows(exe: &str) -> InstallProbe {
+        probe(HostOs::Windows, exe)
+    }
+
+    fn on_mac(exe: &str) -> InstallProbe {
+        probe(HostOs::MacOs, exe)
+    }
+
+    /// Run detection on a probe after letting `tweak` adjust it.
+    fn channel_with(mut base: InstallProbe, tweak: impl FnOnce(&mut InstallProbe)) -> Ch {
+        tweak(&mut base);
+        detect(&base)
+    }
+
+    fn managed_command(p: &InstallProbe) -> Option<String> {
+        match detect_action(p).1 {
+            Act::Managed { command, .. } => command,
+            other => panic!("expected a managed action, got {other:?}"),
         }
     }
 
-    fn windows(exe: &str) -> InstallProbe {
-        InstallProbe {
-            os: HostOs::Windows,
-            exe_path: exe.to_owned(),
-            ..Default::default()
+    fn managed_hint(p: &InstallProbe) -> &'static str {
+        match detect_action(p).1 {
+            Act::Managed { hint, .. } => hint,
+            other => panic!("expected a managed action, got {other:?}"),
         }
     }
 
-    fn macos(exe: &str) -> InstallProbe {
-        InstallProbe {
-            os: HostOs::MacOs,
-            exe_path: exe.to_owned(),
-            ..Default::default()
-        }
-    }
-
-    // ── channel detection, one test per channel ─────────────────────────
+    // Linux
 
     #[test]
-    fn detects_snap_from_env_and_path() {
-        let mut p = linux("/snap/framefang/42/framefang");
-        p.snap_dir = Some("/snap/framefang/42".to_owned());
-        assert_eq!(detect(&p), InstallChannel::Snap);
-
-        // $SNAP absent (e.g. launched by an odd wrapper) but the binary is
-        // still inside the read-only snap mount.
-        let bare = linux("/snap/framefang/current/framefang");
-        assert_eq!(detect(&bare), InstallChannel::Snap);
+    fn snap_is_found_by_its_mount_with_or_without_the_env_var() {
+        let with_env = channel_with(on_linux("/snap/framefang/88/framefang"), |p| {
+            p.snap_dir = Some("/snap/framefang/88".into());
+        });
+        assert_eq!(with_env, Ch::Snap);
+        // Some wrappers drop $SNAP, but the binary is still on the snap mount.
+        assert_eq!(detect(&on_linux("/snap/framefang/x1/framefang")), Ch::Snap);
     }
 
     #[test]
-    fn snap_env_inherited_by_a_child_process_is_not_a_snap_install() {
-        // A terminal snap launching the tarball build inherits $SNAP. The
-        // exe path is the tiebreaker.
-        let mut p = linux("/tmp/u/.local/bin/framefang");
-        p.snap_dir = Some("/snap/some-terminal/17".to_owned());
-        assert_eq!(detect(&p), InstallChannel::Portable);
+    fn snap_env_var_matches_an_exe_inside_that_snap_root() {
+        // A snap mounted somewhere other than /snap still counts when the
+        // binary lives under $SNAP.
+        let found = channel_with(on_linux("/var/lib/snapd/snap/framefang/9/framefang"), |p| {
+            p.snap_dir = Some("/var/lib/snapd/snap/framefang/9".into());
+        });
+        assert_eq!(found, Ch::Snap);
     }
 
     #[test]
-    fn detects_flatpak_from_marker_file() {
-        let mut p = linux("/app/bin/framefang");
-        p.flatpak_info_exists = true;
-        assert_eq!(detect(&p), InstallChannel::Flatpak);
+    fn inherited_snap_env_var_does_not_make_a_tarball_a_snap() {
+        let found = channel_with(on_linux("/home/ana/bin/framefang"), |p| {
+            p.snap_dir = Some("/snap/alacritty/31".into());
+        });
+        assert_eq!(found, Ch::Portable);
     }
 
     #[test]
-    fn detects_flatpak_from_app_id() {
-        let mut p = linux("/app/bin/framefang");
-        p.flatpak_id = Some("org.framefang.Framefang".to_owned());
-        assert_eq!(detect(&p), InstallChannel::Flatpak);
+    fn empty_snap_env_var_is_ignored() {
+        // An empty prefix would match every path, so it must count as unset.
+        let found = channel_with(on_linux("/home/ana/bin/framefang"), |p| p.snap_dir = Some(String::new()));
+        assert_eq!(found, Ch::Portable);
     }
 
     #[test]
-    fn detects_appimage_from_env() {
-        // Inside an AppImage, current_exe() points into the FUSE mount —
-        // note it contains "/usr/bin/" but doesn't start with it, so the
-        // system-package rule must not fire.
-        let mut p = linux("/tmp/.mount_framefangAbCdEf/usr/bin/framefang");
-        p.appimage_path = Some("/tmp/u/Apps/framefang-x86_64.AppImage".to_owned());
-        assert_eq!(detect(&p), InstallChannel::AppImage);
+    fn flatpak_info_file_means_flatpak() {
+        let found = channel_with(on_linux("/app/bin/framefang"), |p| p.flatpak_info_exists = true);
+        assert_eq!(found, Ch::Flatpak);
     }
 
     #[test]
-    fn detects_deb_rpm_aur_from_usr_bin() {
-        assert_eq!(detect(&linux("/usr/bin/framefang")), InstallChannel::LinuxSystemPackage);
-        assert_eq!(
-            detect(&linux("/usr/lib/framefang/framefang")),
-            InstallChannel::LinuxSystemPackage
-        );
+    fn flatpak_id_means_flatpak_unless_empty() {
+        let with_id = |id: &str| {
+            let id = id.to_owned();
+            channel_with(on_linux("/app/bin/framefang"), move |p| p.flatpak_id = Some(id))
+        };
+        assert_eq!(with_id("org.framefang.Framefang"), Ch::Flatpak);
+        assert_eq!(with_id(""), Ch::Portable);
     }
 
     #[test]
-    fn usr_local_is_not_a_system_package() {
-        // install.sh run as root lands here; we still own that binary.
-        assert_eq!(detect(&linux("/usr/local/bin/framefang")), InstallChannel::Portable);
+    fn appimage_env_var_wins_over_the_usr_bin_inside_its_mount() {
+        // The mounted image has usr/bin in its path, but not at the start, so
+        // the distro-package rule must not claim it.
+        let mounted = "/tmp/.mount_Frame9QxZ/usr/bin/framefang";
+        let with_image = |image: &str| {
+            let image = image.to_owned();
+            channel_with(on_linux(mounted), move |p| p.appimage_path = Some(image))
+        };
+        assert_eq!(with_image("/home/ana/Applications/Framefang.AppImage"), Ch::AppImage);
+        assert_eq!(with_image(""), Ch::Portable);
     }
 
     #[test]
-    fn detects_linuxbrew_formula() {
-        assert_eq!(
-            detect(&linux("/opt/linuxbrew/.linuxbrew/Cellar/framefang/0.6.0/bin/framefang")),
-            InstallChannel::HomebrewFormula
-        );
+    fn snap_outranks_flatpak_and_appimage_signs() {
+        let found = channel_with(on_linux("/snap/framefang/7/framefang"), |p| {
+            p.flatpak_info_exists = true;
+            p.appimage_path = Some("/x.AppImage".into());
+        });
+        assert_eq!(found, Ch::Snap);
     }
 
     #[test]
-    fn detects_portable_tarball_install() {
-        assert_eq!(detect(&linux("/tmp/u/.local/bin/framefang")), InstallChannel::Portable);
-    }
-
-    #[test]
-    fn detects_homebrew_cask_only_with_the_caskroom_marker() {
-        let exe = "/Applications/Framefang.app/Contents/MacOS/framefang";
-        assert_eq!(detect(&macos(exe)), InstallChannel::MacAppBundle);
-
-        let mut brewed = macos(exe);
-        brewed.homebrew_cask_marker = true;
-        assert_eq!(detect(&brewed), InstallChannel::HomebrewCask);
-    }
-
-    #[test]
-    fn detects_macos_bare_binary_as_portable() {
-        assert_eq!(detect(&macos("/Users/u/bin/framefang")), InstallChannel::Portable);
-    }
-
-    #[test]
-    fn detects_windows_msi_install() {
-        assert_eq!(
-            detect(&windows("C:\\Program Files\\Framefang\\framefang.exe")),
-            InstallChannel::WindowsMsi
-        );
-        assert_eq!(
-            detect(&windows("C:\\Program Files (x86)\\Framefang\\framefang.exe")),
-            InstallChannel::WindowsMsi
-        );
-    }
-
-    #[test]
-    fn detects_windows_portable_zip() {
-        assert_eq!(
-            detect(&windows("D:\\tools\\framefang\\framefang.exe")),
-            InstallChannel::WindowsPortable
-        );
-    }
-
-    #[test]
-    fn detects_scoop_install() {
-        assert_eq!(
-            detect(&windows("C:\\Users\\u\\scoop\\apps\\framefang\\0.6.0\\framefang.exe")),
-            InstallChannel::Scoop
-        );
-    }
-
-    // ── actions ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn package_managed_channels_never_self_install() {
-        for channel in [
-            InstallChannel::Snap,
-            InstallChannel::Flatpak,
-            InstallChannel::HomebrewCask,
-            InstallChannel::HomebrewFormula,
-            InstallChannel::LinuxSystemPackage,
-            InstallChannel::Scoop,
+    fn distro_owned_trees_mean_a_system_package() {
+        for exe in [
+            "/usr/bin/framefang",
+            "/usr/sbin/framefang",
+            "/usr/lib/framefang/framefang",
+            "/usr/libexec/framefang/framefang",
         ] {
-            assert!(channel.is_package_managed(), "{channel:?}");
-            let action = update_action(channel, &linux("/usr/bin/framefang"));
-            assert!(
-                matches!(action, UpdateAction::Managed { .. }),
-                "{channel:?} produced {action:?}"
-            );
+            assert_eq!(detect(&on_linux(exe)), Ch::LinuxSystemPackage, "{exe}");
         }
     }
 
     #[test]
-    fn snap_and_flatpak_name_their_own_commands() {
-        let mut p = linux("/snap/framefang/42/framefang");
-        p.snap_dir = Some("/snap/framefang/42".to_owned());
-        let (channel, action) = detect_action(&p);
-        assert_eq!(channel, InstallChannel::Snap);
-        assert_eq!(
-            action,
-            UpdateAction::Managed {
-                hint: "Installed from the Snap Store - update with:",
-                command: Some("sudo snap refresh framefang".to_owned()),
-            }
-        );
+    fn usr_local_stays_ours() {
+        // Where install.sh puts the binary when run as root.
+        assert_eq!(detect(&on_linux("/usr/local/bin/framefang")), Ch::Portable);
+    }
 
-        let mut f = linux("/app/bin/framefang");
-        f.flatpak_info_exists = true;
-        let (_, action) = detect_action(&f);
-        let UpdateAction::Managed { command, .. } = action else {
-            panic!("flatpak must be package-managed");
+    #[test]
+    fn linuxbrew_cellar_is_a_formula() {
+        let exe = "/home/linuxbrew/.linuxbrew/Cellar/framefang/1.6.2/bin/framefang";
+        assert_eq!(detect(&on_linux(exe)), Ch::HomebrewFormula);
+    }
+
+    #[test]
+    fn home_directory_binary_is_portable() {
+        assert_eq!(detect(&on_linux("/home/ana/.local/bin/framefang")), Ch::Portable);
+    }
+
+    // macOS
+
+    #[test]
+    fn caskroom_marker_decides_cask_versus_plain_bundle() {
+        let bundle = "/Applications/Frame Fang.app/Contents/MacOS/framefang";
+        assert_eq!(detect(&on_mac(bundle)), Ch::MacAppBundle);
+        assert_eq!(channel_with(on_mac(bundle), |p| p.homebrew_cask_marker = true), Ch::HomebrewCask);
+    }
+
+    #[test]
+    fn mac_binary_outside_a_bundle_is_portable() {
+        let loose = "/Users/ana/tools/framefang";
+        assert_eq!(detect(&on_mac(loose)), Ch::Portable);
+        // The cask marker alone does not turn a loose binary into a cask.
+        assert_eq!(channel_with(on_mac(loose), |p| p.homebrew_cask_marker = true), Ch::Portable);
+    }
+
+    #[test]
+    fn mac_cellar_is_a_formula() {
+        let exe = "/usr/local/Cellar/framefang/1.5.0/bin/framefang";
+        assert_eq!(detect(&on_mac(exe)), Ch::HomebrewFormula);
+    }
+
+    // Windows
+
+    #[test]
+    fn either_program_files_tree_means_the_msi() {
+        for exe in [
+            r"D:\Program Files\Frame Fang\framefang.exe",
+            r"C:\Program Files (x86)\Frame Fang\framefang.exe",
+        ] {
+            assert_eq!(detect(&on_windows(exe)), Ch::WindowsMsi, "{exe}");
+        }
+    }
+
+    #[test]
+    fn windows_paths_are_compared_ignoring_case_and_slash_style() {
+        assert_eq!(detect(&on_windows("c:/PROGRAM FILES/Framefang/framefang.exe")), Ch::WindowsMsi);
+        assert_eq!(detect(&on_windows("C:/Users/ana/Scoop/Apps/framefang/1.0/framefang.exe")), Ch::Scoop);
+    }
+
+    #[test]
+    fn windows_exe_anywhere_else_is_portable() {
+        assert_eq!(detect(&on_windows(r"E:\portable\Framefang-portable.exe")), Ch::WindowsPortable);
+    }
+
+    #[test]
+    fn scoop_apps_folder_means_scoop() {
+        let exe = r"C:\Users\ana\scoop\apps\framefang\current\framefang.exe";
+        assert_eq!(detect(&on_windows(exe)), Ch::Scoop);
+    }
+
+    // What the updater may do
+
+    #[test]
+    fn package_managed_channels_get_a_managed_action() {
+        for channel in EVERY_CHANNEL {
+            let action = update_action(channel, &on_linux("/usr/bin/framefang"));
+            let is_managed = matches!(&action, Act::Managed { .. });
+            assert_eq!(channel.is_package_managed(), is_managed, "{channel:?} gave {action:?}");
+        }
+        let managed = EVERY_CHANNEL.iter().filter(|c| c.is_package_managed()).count();
+        assert_eq!(managed, 6);
+    }
+
+    #[test]
+    fn snap_and_flatpak_suggest_their_own_commands() {
+        let snap = InstallProbe { snap_dir: Some("/snap/framefang/5".into()), ..on_linux("/snap/framefang/5/framefang") };
+        let want = Act::Managed {
+            hint: "Installed from the Snap Store - update with:",
+            command: Some("sudo snap refresh framefang".into()),
         };
-        assert_eq!(command.as_deref(), Some("flatpak update org.framefang.Framefang"));
+        assert_eq!(detect_action(&snap), (Ch::Snap, want));
+
+        let flatpak = InstallProbe { flatpak_info_exists: true, ..on_linux("/app/bin/framefang") };
+        assert_eq!(managed_command(&flatpak).as_deref(), Some("flatpak update org.framefang.Framefang"));
     }
 
     #[test]
-    fn appimage_and_msi_self_install() {
-        let mut p = linux("/tmp/.mount_framefangXy/usr/bin/framefang");
-        p.appimage_path = Some("/opt/apps/framefang-x86_64.AppImage".to_owned());
-        assert_eq!(detect_action(&p).1, UpdateAction::SelfInstall);
-
-        let w = windows("C:\\Program Files\\Framefang\\framefang.exe");
-        assert_eq!(detect_action(&w).1, UpdateAction::SelfInstall);
+    fn brew_and_scoop_suggest_their_own_commands() {
+        let cases = [
+            (Ch::HomebrewCask, "Installed with Homebrew - update with:", "brew upgrade --cask framefang"),
+            (Ch::HomebrewFormula, "Installed with Homebrew - update with:", "brew upgrade framefang"),
+            (Ch::Scoop, "Installed with Scoop - update with:", "scoop update framefang"),
+        ];
+        for (channel, hint, command) in cases {
+            let action = update_action(channel, &InstallProbe::default());
+            assert_eq!(action, Act::Managed { hint, command: Some(command.into()) }, "{channel:?}");
+        }
     }
 
     #[test]
-    fn portable_linux_and_windows_self_install_but_macos_uses_the_browser() {
-        assert_eq!(
-            detect_action(&linux("/tmp/u/.local/bin/framefang")).1,
-            UpdateAction::SelfInstall
-        );
-        // The Windows portable zip updates in place (2026-11-19).
-        assert_eq!(
-            detect_action(&windows("D:\\tools\\framefang\\framefang.exe")).1,
-            UpdateAction::SelfInstall
-        );
-        assert_eq!(
-            detect_action(&macos("/Applications/Framefang.app/Contents/MacOS/framefang")).1,
-            UpdateAction::BrowserDownload
-        );
+    fn appimage_and_msi_update_themselves() {
+        let image = InstallProbe {
+            appimage_path: Some("/opt/Framefang.AppImage".into()),
+            ..on_linux("/tmp/.mount_FrameQ2/usr/bin/framefang")
+        };
+        assert_eq!(detect_action(&image).1, Act::SelfInstall);
+        let msi = on_windows(r"C:\Program Files\Framefang\framefang.exe");
+        assert_eq!(detect_action(&msi).1, Act::SelfInstall);
     }
 
     #[test]
-    fn system_package_command_follows_the_distro() {
-        let cmd_for = |os_release: Option<&str>| {
-            let mut p = linux("/usr/bin/framefang");
-            p.os_release = os_release.map(str::to_owned);
-            match detect_action(&p).1 {
-                UpdateAction::Managed { command, .. } => command,
-                other => panic!("expected Managed, got {other:?}"),
-            }
+    fn portable_builds_update_themselves_except_on_macos() {
+        let outcomes = [
+            (on_linux("/home/ana/.local/bin/framefang"), Act::SelfInstall),
+            // The portable exe has updated in place since 2026-11-19.
+            (on_windows(r"E:\portable\Framefang-portable.exe"), Act::SelfInstall),
+            (on_mac("/Applications/Frame Fang.app/Contents/MacOS/framefang"), Act::BrowserDownload),
+            (on_mac("/Users/ana/tools/framefang"), Act::BrowserDownload),
+        ];
+        for (p, want) in outcomes {
+            assert_eq!(detect_action(&p).1, want, "{}", p.exe_path);
+        }
+    }
+
+    #[test]
+    fn tarball_channel_on_windows_falls_back_to_the_browser() {
+        // Windows detection never yields Portable, but if it is ever asked
+        // for, only Linux may swap the binary itself.
+        let action = update_action(Ch::Portable, &on_windows(r"C:\x\framefang.exe"));
+        assert_eq!(action, Act::BrowserDownload);
+    }
+
+    #[test]
+    fn distro_package_command_follows_os_release() {
+        let command_for = |os_release: Option<&str>| {
+            let p = InstallProbe { os_release: os_release.map(Into::into), ..on_linux("/usr/bin/framefang") };
+            managed_command(&p)
         };
 
-        assert_eq!(
-            cmd_for(Some("ID=ubuntu\nID_LIKE=debian\n")).as_deref(),
-            Some("sudo apt update && sudo apt install --only-upgrade framefang")
-        );
-        assert_eq!(
-            cmd_for(Some("ID=\"rocky\"\nID_LIKE=\"rhel centos fedora\"\n")).as_deref(),
-            Some("sudo dnf upgrade framefang")
-        );
-        assert_eq!(
-            cmd_for(Some("ID=endeavouros\nID_LIKE=arch\n")).as_deref(),
-            Some("yay -Syu framefang-bin")
-        );
-        assert_eq!(
-            cmd_for(Some("ID=opensuse-tumbleweed\nID_LIKE=\"opensuse suse\"\n")).as_deref(),
-            Some("sudo zypper update framefang")
-        );
-        // Unknown distro: no command, but still no self-install.
-        assert_eq!(cmd_for(Some("ID=voidlinux\n")), None);
-        assert_eq!(cmd_for(None), None);
+        let cases = [
+            ("ID=pop\nID_LIKE=\"ubuntu debian\"\n", "sudo apt update && sudo apt install --only-upgrade framefang"),
+            ("ID=\"almalinux\"\nID_LIKE=\"rhel centos fedora\"\n", "sudo dnf upgrade framefang"),
+            ("ID=manjaro\nID_LIKE=arch\n", "yay -Syu framefang-bin"),
+            ("ID=opensuse-leap\nID_LIKE=\"suse opensuse\"\n", "sudo zypper update framefang"),
+            ("ID='Debian'\n", "sudo apt update && sudo apt install --only-upgrade framefang"),
+        ];
+        for (os_release, expected) in cases {
+            assert_eq!(command_for(Some(os_release)).as_deref(), Some(expected), "{os_release:?}");
+        }
+
+        // An unrecognised or missing os-release still refuses to self-install,
+        // it just cannot name the command.
+        assert_eq!(command_for(Some("ID=gentoo\n")), None);
+        assert_eq!(command_for(None), None);
     }
 
     #[test]
-    fn os_release_id_wins_over_id_like_ordering() {
-        // Mint declares ID=linuxmint before ID_LIKE=ubuntu; both map to apt,
-        // but the parse must not choke on the quoted multi-word ID_LIKE.
+    fn unknown_distro_gets_the_generic_hint() {
+        let p = on_linux("/usr/lib/framefang/framefang");
+        assert_eq!(managed_hint(&p), "Installed from a system package - update it with your package manager.");
+        assert_eq!(managed_command(&p), None);
+    }
+
+    #[test]
+    fn aur_installs_get_the_aur_hint() {
+        let p = InstallProbe { os_release: Some("ID=endeavouros\n".into()), ..on_linux("/usr/bin/framefang") };
+        assert_eq!(managed_hint(&p), "Installed from the AUR - update with your AUR helper:");
+    }
+
+    #[test]
+    fn os_release_reads_quoted_multi_word_id_like() {
+        let text = "NAME=\"Pop!_OS\"\nID=pop\nID_LIKE=\"ubuntu debian\"\nVERSION_ID=\"22.04\"\n";
+        assert_eq!(package_tool(Some(text)), Some(PackageTool::Apt));
+    }
+
+    #[test]
+    fn os_release_skips_unknown_ids_and_other_keys() {
+        // NAME and VERSION_ID are not consulted; the unknown ID falls through
+        // to the parent named in ID_LIKE.
+        let text = "NAME=fedora\nVERSION_ID=arch\nID=zorin\nID_LIKE=\"Ubuntu\"\n";
+        assert_eq!(package_tool(Some(text)), Some(PackageTool::Apt));
+        assert_eq!(package_tool(Some("PRETTY_NAME=ubuntu\n")), None);
+    }
+
+    #[test]
+    fn labels_are_stable() {
+        let labels: Vec<_> = EVERY_CHANNEL.iter().map(|c| c.label()).collect();
         assert_eq!(
-            distro_family(Some("NAME=\"Linux Mint\"\nID=linuxmint\nID_LIKE=\"ubuntu debian\"\n")),
-            DistroFamily::Debian
+            labels,
+            [
+                "Windows installer",
+                "portable build",
+                "Scoop",
+                "app bundle",
+                "Homebrew cask",
+                "Homebrew",
+                "AppImage",
+                "Snap",
+                "Flatpak",
+                "system package",
+                "portable build",
+            ]
         );
     }
 
     #[test]
-    fn host_os_matches_the_build_target() {
-        let expected = if cfg!(target_os = "windows") {
-            HostOs::Windows
-        } else if cfg!(target_os = "macos") {
-            HostOs::MacOs
-        } else {
-            HostOs::Linux
+    fn host_os_follows_the_compile_target() {
+        // Checked against the standard library's own idea of the target.
+        let built_for = match std::env::consts::OS {
+            "windows" => HostOs::Windows,
+            "macos" => HostOs::MacOs,
+            _ => HostOs::Linux,
         };
-        assert_eq!(HostOs::host(), expected);
+        assert_eq!([HostOs::host(), HostOs::default()], [built_for, HostOs::Linux]);
     }
 }

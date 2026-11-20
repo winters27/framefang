@@ -1,366 +1,546 @@
-//! Global hotkey registration.
+//! System-wide hotkeys.
 //!
-//! Two backends behind one type, chosen at runtime by session:
+//! [`HotkeyManager`] picks one of two backends when it is created:
 //!
-//! * **Grab** — the `global-hotkey` crate, which wraps `RegisterHotKey`
-//!   (Win32), X11 `XGrabKey` (Linux/X11) and `RegisterEventHotKey` (macOS).
-//!   Used everywhere except a Linux Wayland session.
-//! * **Portal** — `org.freedesktop.portal.GlobalShortcuts` via
-//!   [`crate::hotkey_portal`]. Used on Linux Wayland only.
+//! * **Grab**: the `global-hotkey` crate, which asks the window system for a
+//!   key grab (`RegisterHotKey` on Windows, `XGrabKey` on X11,
+//!   `RegisterEventHotKey` on macOS). On Windows the same keys are also heard
+//!   through raw keyboard input (the `raw_keys` module), for apps that eat
+//!   key presses before the hotkey sees them.
+//! * **Portal**: `org.freedesktop.portal.GlobalShortcuts`, through
+//!   [`crate::hotkey_portal`]. Linux Wayland sessions only.
 //!
-//! The split exists because `global-hotkey` 0.7 has no Wayland implementation
-//! and the X11 one is *worse than nothing* there: XWayland answers the grab,
-//! so registration reports success, and then the key is never delivered.
-//! A hotkey that silently cannot fire is indistinguishable from a broken app,
-//! so on Wayland we never fall back to the grab — if the portal isn't
-//! available the error says so, and the tray menu remains the way to capture.
+//! Wayland never falls back to the grab. `global-hotkey` 0.7 has no Wayland
+//! support, and its X11 grab is answered by XWayland: registration succeeds
+//! and the key then never arrives. A hotkey that quietly never fires looks
+//! like a broken app, so on Wayland the portal error is reported as is and the
+//! tray menu stays the way in.
 //!
-//! Callers see one API either way: construct,
-//! [`register_all`](HotkeyManager::register_all) the per-action [`Hotkey`]
-//! set, re-register to rebind, and poll
+//! The API is the same for both: create the manager, hand
+//! [`register_all`](HotkeyManager::register_all) the full set of bindings
+//! (again whenever they change), and call
 //! [`drain_pressed`](HotkeyManager::drain_pressed) from the event loop.
 
-use crate::{Error, Result};
-use global_hotkey::{
-    hotkey::{Code, HotKey, Modifiers as GhMods},
-    GlobalHotKeyEvent, GlobalHotKeyManager,
-};
-use framefang_core::hotkeys::HotkeyAction;
-use framefang_core::settings::{Hotkey, Modifiers};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
-/// Which mechanism is delivering presses. Surfaced so the app can say the
-/// right thing about a hotkey that isn't firing — the two backends fail for
-/// completely different reasons and have completely different fixes.
+use framefang_core::{hotkeys::HotkeyAction, settings::{Hotkey, Modifiers}};
+use global_hotkey::hotkey::{Code, HotKey, Modifiers as GrabModifiers};
+#[cfg(target_os = "linux")]
+use crate::hotkey_portal::PortalHotkeys;
+use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
+
+use crate::{Error, Result};
+
+/// The mechanism delivering presses. The app shows it because the two fail
+/// for unrelated reasons and are fixed in unrelated places.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotkeyBackend {
-    /// A window-system key grab: what we asked for is what fires.
+    /// A key grab from the window system: the chord we register is the chord
+    /// that fires.
     Grab,
-    /// An xdg-desktop-portal request: the compositor decides the real binding
-    /// and can show it to the user under its own keyboard settings.
+    /// A desktop portal request: the compositor chooses the final binding and
+    /// may show it in its own keyboard settings.
     Portal,
 }
 
 impl HotkeyBackend {
-    pub fn is_portal(self) -> bool { matches!(self, HotkeyBackend::Portal) }
+    pub fn is_portal(self) -> bool {
+        self == HotkeyBackend::Portal
+    }
 }
+
+/// Two presses of the same action closer together than this count as one.
+/// It covers a held key repeating and, on Windows, one press arriving through
+/// both the hotkey and raw input.
+const ONE_PRESS: Duration = Duration::from_millis(400);
 
 pub struct HotkeyManager {
-    backend: Backend,
-    /// When each action last reported a press, from either path. One press
-    /// can arrive twice on Windows (the hotkey and raw input both hear it),
-    /// and holding a key repeats; both are one capture.
-    last_press: std::sync::Mutex<Vec<(HotkeyAction, std::time::Instant)>>,
+    engine: Engine,
+    /// Shared by every path a press can come in on.
+    presses: Mutex<PressGate>,
 }
 
-/// Presses of one action closer together than this are one press.
-const ONE_PRESS: std::time::Duration = std::time::Duration::from_millis(400);
-
-enum Backend {
-    Grab {
-        inner:   GlobalHotKeyManager,
-        /// Every binding currently held with the OS, paired with the action
-        /// it fires. A flat vec rather than a map: it holds at most three
-        /// entries, so a linear scan per delivered event beats hashing.
-        current: Vec<(HotkeyAction, HotKey)>,
-        /// Windows only: the same bindings heard through raw keyboard input,
-        /// for apps that swallow keys before `RegisterHotKey` sees them.
-        /// `None` when raw input could not be set up.
-        #[cfg(target_os = "windows")]
-        raw: Option<(crate::raw_keys::Bindings, std::sync::mpsc::Receiver<HotkeyAction>)>,
-    },
+/// The backend actually in use.
+enum Engine {
+    Grab(Grab),
     #[cfg(target_os = "linux")]
-    Portal(crate::hotkey_portal::PortalHotkeys),
+    Portal(PortalHotkeys),
+}
+
+impl Engine {
+    /// The portal on a Linux Wayland session, the key grab everywhere else.
+    fn for_this_session() -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        if crate::is_wayland() {
+            return PortalHotkeys::new().map(Engine::Portal);
+        }
+        Grab::start().map(Engine::Grab)
+    }
 }
 
 impl HotkeyManager {
     pub fn new() -> Result<Self> {
-        let last_press = std::sync::Mutex::new(Vec::new());
-        #[cfg(target_os = "linux")]
-        if crate::session::is_wayland() {
-            let portal = crate::hotkey_portal::PortalHotkeys::new()?;
-            return Ok(HotkeyManager { backend: Backend::Portal(portal), last_press });
-        }
-
-        let inner = GlobalHotKeyManager::new()
-            .map_err(|e| Error::Hotkey(e.to_string()))?;
-        Ok(HotkeyManager {
-            backend: Backend::Grab {
-                inner,
-                current: Vec::new(),
-                #[cfg(target_os = "windows")]
-                raw: crate::raw_keys::start(),
-            },
-            last_press,
-        })
+        let engine = Engine::for_this_session()?;
+        Ok(HotkeyManager { engine, presses: Mutex::new(PressGate::default()) })
     }
 
-    /// Stop hearing `action` through raw input, keeping its hotkey. For a
-    /// key the system itself takes first (Windows' Print Screen going to the
-    /// Snipping Tool): raw input would still hear it, and both would open.
-    pub fn without_second_path(&mut self, action: HotkeyAction) {
-        #[cfg(target_os = "windows")]
-        if let Backend::Grab { raw: Some((bindings, _)), .. } = &mut self.backend {
-            if let Ok(mut b) = bindings.lock() { b.retain(|(a, _)| *a != action); }
+    /// Which backend this manager is using.
+    pub fn backend(&self) -> HotkeyBackend {
+        match self.engine {
+            Engine::Grab(_) => HotkeyBackend::Grab,
+            #[cfg(target_os = "linux")]
+            Engine::Portal(_) => HotkeyBackend::Portal,
         }
+    }
+
+    /// Keep `action`'s hotkey but stop listening for it through raw input.
+    ///
+    /// For keys Windows hands to something else first (Print Screen goes to
+    /// the Snipping Tool): raw input would still hear the press and both
+    /// would open. Does nothing where there is no raw input.
+    pub fn without_second_path(&mut self, action: HotkeyAction) {
+        // Windows has only the grab backend, so this match has one arm.
+        #[cfg(target_os = "windows")]
+        match &self.engine {
+            Engine::Grab(grab) => grab.stop_raw_for(action),
+        }
+        #[cfg(not(target_os = "windows"))]
         let _ = action;
     }
 
-    /// Whether this press of `action` at `now` is a new one, recording it
-    /// either way so a held key keeps counting as the same press.
-    fn is_new_press(&self, action: HotkeyAction, now: std::time::Instant) -> bool {
-        let Ok(mut last) = self.last_press.lock() else { return true };
-        match last.iter_mut().find(|(a, _)| *a == action) {
-            Some(entry) => {
-                let new = now.duration_since(entry.1) >= ONE_PRESS;
-                entry.1 = now;
-                new
-            }
-            None => { last.push((action, now)); true }
-        }
-    }
-
-    /// Which mechanism this manager ended up using.
-    pub fn backend(&self) -> HotkeyBackend {
-        match &self.backend {
-            Backend::Grab { .. } => HotkeyBackend::Grab,
-            #[cfg(target_os = "linux")]
-            Backend::Portal(_)   => HotkeyBackend::Portal,
-        }
-    }
-
-    /// Make `bindings` the complete set of registered hotkeys, replacing
-    /// whatever was registered before.
+    /// Replace the registered hotkeys with exactly `bindings`.
     ///
-    /// Registration is per-binding best-effort: a chord the OS refuses
-    /// (already owned by the desktop environment) or a VK this build cannot
-    /// translate is skipped and reported, while the rest still take effect.
-    /// One unavailable shortcut must not cost the user the other two, so the
-    /// failures come back as a list instead of aborting the whole call --
-    /// the caller logs them and carries on.
+    /// Each binding stands alone: one the OS refuses (the desktop already
+    /// owns it) or whose key cannot be expressed here is left out and
+    /// returned in the list, and the others still work. Losing one shortcut
+    /// must not cost the user the rest, so the caller logs the list and
+    /// carries on.
     ///
-    /// On the portal backend an empty list means the request was accepted,
-    /// not that the keys are live — only the compositor can decide that. See
+    /// For the portal an empty list only means the request was accepted; the
+    /// compositor decides whether the keys go live. See
     /// [`crate::hotkey_portal`].
     pub fn register_all(&mut self, bindings: &[(HotkeyAction, Hotkey)])
         -> Vec<(HotkeyAction, Error)>
     {
-        match &mut self.backend {
-            #[cfg(target_os = "windows")]
-            Backend::Grab { inner, current, raw } => {
-                for (_, prev) in current.drain(..) {
-                    let _ = inner.unregister(prev);
-                }
-                let mut failed = Vec::new();
-                let mut held = Vec::new();
-                for &(action, hk) in bindings {
-                    // A key `global-hotkey` has no name for (the Menu key,
-                    // browser and launch keys) can't be registered, but raw
-                    // input hears any key: it becomes a raw-input-only
-                    // binding rather than a refused one. It does not stop the
-                    // key's own action, since raw input only listens.
-                    if raw.is_some() && vk_to_code(hk.virtual_key).is_none() {
-                        held.push((action, hk));
-                        continue;
-                    }
-                    match grab_one(inner, hk) {
-                        Ok(item) => { current.push((action, item)); held.push((action, hk)); }
-                        Err(e)   => failed.push((action, e)),
-                    }
-                }
-                // Raw input listens for exactly what the OS accepted, so a
-                // chord another program owns stays that program's.
-                if let Some((b, _)) = raw {
-                    if let Ok(mut b) = b.lock() { *b = held; }
-                }
-                failed
-            }
-            #[cfg(not(target_os = "windows"))]
-            Backend::Grab { inner, current } => {
-                for (_, prev) in current.drain(..) {
-                    let _ = inner.unregister(prev);
-                }
-                let mut failed = Vec::new();
-                for &(action, hk) in bindings {
-                    match grab_one(inner, hk) {
-                        Ok(item) => current.push((action, item)),
-                        Err(e)   => failed.push((action, e)),
-                    }
-                }
-                failed
-            }
+        match self.engine {
+            Engine::Grab(ref mut grab) => grab.replace(bindings),
             #[cfg(target_os = "linux")]
-            Backend::Portal(p) => p.register_all(bindings),
+            Engine::Portal(ref mut portal) => portal.register_all(bindings),
         }
     }
 
-    /// Drop every registered binding. Used while the Settings dialog is open
-    /// so the rebind widget can see the keys the user presses instead of
-    /// them firing a capture.
+    /// Release every hotkey. Settings does this while it is open, so that
+    /// the key-capture field receives the keys instead of a capture starting.
     pub fn unregister_all(&mut self) {
-        match &mut self.backend {
-            Backend::Grab { inner, current, .. } => {
-                for (_, prev) in current.drain(..) {
-                    let _ = inner.unregister(prev);
-                }
-                #[cfg(target_os = "windows")]
-                if let Backend::Grab { raw: Some((b, _)), .. } = &self.backend {
-                    if let Ok(mut b) = b.lock() { b.clear(); }
-                }
-            }
+        match self.engine {
+            Engine::Grab(ref mut grab) => grab.release_all(),
             #[cfg(target_os = "linux")]
-            Backend::Portal(p) => p.unregister_all(),
+            Engine::Portal(ref mut portal) => portal.unregister_all(),
         }
     }
 
-    /// Drain pending press events and report which actions they fired, in
-    /// the order the presses arrived.
+    /// Collect the presses that arrived since the last call, as the actions
+    /// they trigger, in arrival order.
     ///
-    /// A given action is reported at most once per drain: holding the key
-    /// down queues several `Pressed` events between two polls of the event
-    /// loop, and one keypress has to mean one capture.
+    /// Each action appears at most once per call, since a held key can queue
+    /// several presses between two event-loop passes and one press must mean
+    /// one capture.
     pub fn drain_pressed(&self) -> Vec<HotkeyAction> {
-        match &self.backend {
-            Backend::Grab { current, .. } => {
-                let now = std::time::Instant::now();
-                let mut fired: Vec<HotkeyAction> = Vec::new();
-                let mut press = |action: HotkeyAction| {
-                    if self.is_new_press(action, now) && !fired.contains(&action) {
-                        fired.push(action);
-                    }
-                };
-                while let Ok(ev) = GlobalHotKeyEvent::receiver().try_recv() {
-                    if ev.state != global_hotkey::HotKeyState::Pressed { continue; }
-                    let Some(&(action, _)) = current.iter().find(|(_, h)| h.id() == ev.id)
-                        else { continue; };
-                    press(action);
-                }
-                #[cfg(target_os = "windows")]
-                if let Backend::Grab { raw: Some((_, rx)), .. } = &self.backend {
-                    while let Ok(action) = rx.try_recv() { press(action); }
-                }
-                fired
-            }
+        let grab = match self.engine {
+            Engine::Grab(ref grab) => grab,
             #[cfg(target_os = "linux")]
-            Backend::Portal(p) => p.drain_pressed(),
+            Engine::Portal(ref portal) => return portal.drain_pressed(),
+        };
+        let now = Instant::now();
+        let mut new_presses = Vec::new();
+        grab.for_each_press(|action| {
+            // Recorded with the gate even when it is a repeat in this batch,
+            // so a held key keeps renewing its timestamp.
+            if self.admit(action, now) && !new_presses.contains(&action) {
+                new_presses.push(action);
+            }
+        });
+        new_presses
+    }
+
+    fn admit(&self, action: HotkeyAction, now: Instant) -> bool {
+        match self.presses.lock() {
+            Ok(mut gate) => gate.admit(action, now),
+            // A poisoned lock should not swallow hotkeys.
+            Err(_) => true,
         }
     }
 }
 
-fn translate_mods(m: Modifiers) -> GhMods {
-    let mut out = GhMods::empty();
-    if m.contains(Modifiers::ALT)     { out |= GhMods::ALT; }
-    if m.contains(Modifiers::CONTROL) { out |= GhMods::CONTROL; }
-    if m.contains(Modifiers::SHIFT)   { out |= GhMods::SHIFT; }
-    if m.contains(Modifiers::SUPER)   { out |= GhMods::SUPER; }
-    out
+/// Remembers when each action last fired, to fold repeats into one press.
+#[derive(Default)]
+struct PressGate {
+    /// At most one entry per action, so a short list beats a map.
+    last_seen: Vec<(HotkeyAction, Instant)>,
 }
 
-/// Map a Win32 virtual-key code to a `global-hotkey` `Code`.
+impl PressGate {
+    /// True if a press of `action` at `now` is a new press. The time is
+    /// stored either way, so a key held down stays one press for as long as
+    /// its repeats keep coming.
+    fn admit(&mut self, action: HotkeyAction, now: Instant) -> bool {
+        let Some(slot) = self.last_seen.iter_mut().find(|(a, _)| *a == action) else {
+            self.last_seen.push((action, now));
+            return true;
+        };
+        let previous = std::mem::replace(&mut slot.1, now);
+        now.duration_since(previous) >= ONE_PRESS
+    }
+}
+
+// ---- the key-grab backend ----
+
+struct Grab {
+    manager: GlobalHotKeyManager,
+    /// Every chord the OS has accepted, with the action it fires. Three
+    /// entries at most, so a linear search per event is the cheap option.
+    held: Vec<(HotkeyAction, HotKey)>,
+    /// Windows: the raw-input listener, or `None` if it could not start.
+    #[cfg(target_os = "windows")]
+    raw: Option<RawInput>,
+}
+
+#[cfg(target_os = "windows")]
+struct RawInput {
+    /// The chords raw input should report. Shared with its thread.
+    listening: crate::raw_keys::Bindings,
+    presses: std::sync::mpsc::Receiver<HotkeyAction>,
+}
+
+impl Grab {
+    fn start() -> Result<Self> {
+        let manager = GlobalHotKeyManager::new().map_err(|e| Error::Hotkey(e.to_string()))?;
+        Ok(Grab {
+            manager,
+            held: Vec::new(),
+            #[cfg(target_os = "windows")]
+            raw: crate::raw_keys::start()
+                .map(|(listening, presses)| RawInput { listening, presses }),
+        })
+    }
+
+    /// Whether a key `global-hotkey` cannot name can still be heard.
+    fn hears_unnamed_keys(&self) -> bool {
+        #[cfg(target_os = "windows")]
+        return self.raw.is_some();
+        #[cfg(not(target_os = "windows"))]
+        return false;
+    }
+
+    fn replace(&mut self, bindings: &[(HotkeyAction, Hotkey)]) -> Vec<(HotkeyAction, Error)> {
+        self.unregister_held();
+
+        let mut refused = Vec::new();
+        // What raw input should listen for: exactly what took effect, so a
+        // chord some other program owns stays theirs.
+        let mut live = Vec::with_capacity(bindings.len());
+        for &(action, hotkey) in bindings {
+            // Keys with no `Code` (Menu, browser and launch keys) cannot be
+            // grabbed, but raw input hears every key, so they become raw-only
+            // bindings instead of failures. Raw input only listens, so the
+            // key still does its usual thing as well.
+            if self.hears_unnamed_keys() && vk_to_code(hotkey.virtual_key).is_none() {
+                live.push((action, hotkey));
+                continue;
+            }
+            match register_chord(&self.manager, hotkey) {
+                Ok(grabbed) => {
+                    self.held.push((action, grabbed));
+                    live.push((action, hotkey));
+                }
+                Err(e) => refused.push((action, e)),
+            }
+        }
+        self.set_raw_listening(live);
+        refused
+    }
+
+    fn release_all(&mut self) {
+        self.unregister_held();
+        self.set_raw_listening(Vec::new());
+    }
+
+    fn unregister_held(&mut self) {
+        for (_, grabbed) in self.held.drain(..) {
+            let _ = self.manager.unregister(grabbed);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn set_raw_listening(&self, chords: Vec<(HotkeyAction, Hotkey)>) {
+        if let Some(raw) = &self.raw {
+            if let Ok(mut listening) = raw.listening.lock() {
+                *listening = chords;
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn set_raw_listening(&self, _chords: Vec<(HotkeyAction, Hotkey)>) {}
+
+    #[cfg(target_os = "windows")]
+    fn stop_raw_for(&self, action: HotkeyAction) {
+        if let Some(raw) = &self.raw {
+            if let Ok(mut listening) = raw.listening.lock() {
+                listening.retain(|(a, _)| *a != action);
+            }
+        }
+    }
+
+    /// Feed `on_press` every press waiting since the last drain: first the
+    /// hotkey events, then (on Windows) what raw input heard.
+    fn for_each_press(&self, mut on_press: impl FnMut(HotkeyAction)) {
+        while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
+            if event.state != HotKeyState::Pressed {
+                continue;
+            }
+            if let Some(&(action, _)) = self.held.iter().find(|(_, h)| h.id() == event.id) {
+                on_press(action);
+            }
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(raw) = &self.raw {
+            while let Ok(action) = raw.presses.try_recv() {
+                on_press(action);
+            }
+        }
+    }
+}
+
+/// Ask the window system for one chord.
+fn register_chord(manager: &GlobalHotKeyManager, hotkey: Hotkey) -> Result<HotKey> {
+    let code = vk_to_code(hotkey.virtual_key)
+        .ok_or_else(|| Error::Hotkey(format!("unknown vk 0x{:X}", hotkey.virtual_key)))?;
+    let chord = HotKey::new(Some(grab_modifiers(hotkey.modifiers)), code);
+    manager.register(chord).map_err(|e| Error::Hotkey(e.to_string()))?;
+    Ok(chord)
+}
+
+fn grab_modifiers(mods: Modifiers) -> GrabModifiers {
+    [
+        (Modifiers::ALT, GrabModifiers::ALT),
+        (Modifiers::CONTROL, GrabModifiers::CONTROL),
+        (Modifiers::SHIFT, GrabModifiers::SHIFT),
+        (Modifiers::SUPER, GrabModifiers::SUPER),
+    ]
+    .into_iter()
+    .filter(|(ours, _)| mods.contains(*ours))
+    .fold(GrabModifiers::empty(), |acc, (_, theirs)| acc | theirs)
+}
+
+// ---- virtual-key table ----
+
+/// F1 through F24, which sit on consecutive codes from `VK_F1` (0x70).
+const FUNCTION_KEYS: [Code; 24] = [
+    Code::F1, Code::F2, Code::F3, Code::F4, Code::F5, Code::F6,
+    Code::F7, Code::F8, Code::F9, Code::F10, Code::F11, Code::F12,
+    Code::F13, Code::F14, Code::F15, Code::F16, Code::F17, Code::F18,
+    Code::F19, Code::F20, Code::F21, Code::F22, Code::F23, Code::F24,
+];
+
+/// The top-row digits, from `'0'` (0x30).
+const DIGIT_KEYS: [Code; 10] = [
+    Code::Digit0, Code::Digit1, Code::Digit2, Code::Digit3, Code::Digit4,
+    Code::Digit5, Code::Digit6, Code::Digit7, Code::Digit8, Code::Digit9,
+];
+
+/// The keypad digits, from `VK_NUMPAD0` (0x60).
+const NUMPAD_DIGIT_KEYS: [Code; 10] = [
+    Code::Numpad0, Code::Numpad1, Code::Numpad2, Code::Numpad3, Code::Numpad4,
+    Code::Numpad5, Code::Numpad6, Code::Numpad7, Code::Numpad8, Code::Numpad9,
+];
+
+/// The letters, from `'A'` (0x41).
+const LETTER_KEYS: [Code; 26] = [
+    Code::KeyA, Code::KeyB, Code::KeyC, Code::KeyD, Code::KeyE, Code::KeyF,
+    Code::KeyG, Code::KeyH, Code::KeyI, Code::KeyJ, Code::KeyK, Code::KeyL,
+    Code::KeyM, Code::KeyN, Code::KeyO, Code::KeyP, Code::KeyQ, Code::KeyR,
+    Code::KeyS, Code::KeyT, Code::KeyU, Code::KeyV, Code::KeyW, Code::KeyX,
+    Code::KeyY, Code::KeyZ,
+];
+
+/// Translate a Windows virtual-key code into the `Code` that `global-hotkey`
+/// registers.
 ///
-/// The Win32 VK space is the canonical wire format we share with the C# version
-/// (settings.json stores `HotkeyVirtualKey` as a Win32 VK). On non-Windows
-/// Register one chord with the window system.
-fn grab_one(inner: &GlobalHotKeyManager, hk: Hotkey) -> Result<HotKey> {
-    let mods = translate_mods(hk.modifiers);
-    let code = vk_to_code(hk.virtual_key)
-        .ok_or_else(|| Error::Hotkey(format!("unknown vk 0x{:X}", hk.virtual_key)))?;
-    let item = HotKey::new(Some(mods), code);
-    inner.register(item).map_err(|e| Error::Hotkey(e.to_string()))?;
-    Ok(item)
+/// Settings store keys as Windows virtual-key codes on every platform, so
+/// the same settings file means the same keys everywhere. Elsewhere
+/// `global-hotkey` maps the `Code` on to the native key code itself, purely
+/// by position. That is why the macOS default is Cmd+Shift+7 (`0x37`) rather
+/// than Print Screen: `0x2C` lands on a Carbon key code no Apple keyboard has.
+///
+/// Keys missing here on purpose, which raw input carries on Windows: Menu
+/// (0x5D), Sleep (0x5F), the browser and launch keys (0xA6 to 0xAC and 0xB4
+/// to 0xB7) and the extra key on European keyboards (0xE2).
+fn vk_to_code(vk: u32) -> Option<Code> {
+    let from = |table: &[Code], first: u32| table.get((vk - first) as usize).copied();
+    match vk {
+        0x30..=0x39 => from(&DIGIT_KEYS, 0x30),
+        0x41..=0x5A => from(&LETTER_KEYS, 0x41),
+        0x60..=0x69 => from(&NUMPAD_DIGIT_KEYS, 0x60),
+        0x70..=0x87 => from(&FUNCTION_KEYS, 0x70),
+        _ => NAMED_KEYS.iter().find(|(code, _)| *code == vk).map(|&(_, key)| key),
+    }
 }
 
-/// platforms `global-hotkey` re-translates these to the OS's native codes
-/// internally. That translation is purely mechanical: `0x2C` becomes Carbon
-/// keycode `0x46` on macOS, which no Apple keyboard can produce, which is why
-/// the default hotkey there is Cmd+Shift+`7` (`0x37`) rather than Print Screen.
-fn vk_to_code(vk: u32) -> Option<Code> {
-    Some(match vk {
-        // F13-F24
-        0x7C => Code::F13, 0x7D => Code::F14, 0x7E => Code::F15, 0x7F => Code::F16,
-        0x80 => Code::F17, 0x81 => Code::F18, 0x82 => Code::F19, 0x83 => Code::F20,
-        0x84 => Code::F21, 0x85 => Code::F22, 0x86 => Code::F23, 0x87 => Code::F24,
-        // Numpad
-        0x60 => Code::Numpad0, 0x61 => Code::Numpad1, 0x62 => Code::Numpad2,
-        0x63 => Code::Numpad3, 0x64 => Code::Numpad4, 0x65 => Code::Numpad5,
-        0x66 => Code::Numpad6, 0x67 => Code::Numpad7, 0x68 => Code::Numpad8,
-        0x69 => Code::Numpad9, 0x6A => Code::NumpadMultiply, 0x6B => Code::NumpadAdd,
-        0x6D => Code::NumpadSubtract, 0x6E => Code::NumpadDecimal, 0x6F => Code::NumpadDivide,
-        0x90 => Code::NumLock,
-        // Punctuation
-        0xBA => Code::Semicolon, 0xBB => Code::Equal, 0xBC => Code::Comma,
-        0xBD => Code::Minus, 0xBE => Code::Period, 0xBF => Code::Slash,
-        0xC0 => Code::Backquote, 0xDB => Code::BracketLeft, 0xDC => Code::Backslash,
-        0xDD => Code::BracketRight, 0xDE => Code::Quote,
-        // Pause, Scroll Lock, media and volume keys
-        0x13 => Code::Pause, 0x91 => Code::ScrollLock,
-        0xAD => Code::AudioVolumeMute, 0xAE => Code::AudioVolumeDown, 0xAF => Code::AudioVolumeUp,
-        0xB0 => Code::MediaTrackNext, 0xB1 => Code::MediaTrackPrevious,
-        0xB2 => Code::MediaStop, 0xB3 => Code::MediaPlayPause,
-        // Not here, so raw input carries them on Windows: Menu (0x5D), Sleep
-        // (0x5F), the browser and launch keys (0xA6-0xAC, 0xB4-0xB7) and the
-        // extra key on European keyboards (0xE2).
-        0x08 => Code::Backspace,
-        0x09 => Code::Tab,
-        0x0D => Code::Enter,
-        0x10 => Code::ShiftLeft,
-        0x11 => Code::ControlLeft,
-        0x12 => Code::AltLeft,
-        0x14 => Code::CapsLock,
-        0x1B => Code::Escape,
-        0x20 => Code::Space,
-        0x21 => Code::PageUp,
-        0x22 => Code::PageDown,
-        0x23 => Code::End,
-        0x24 => Code::Home,
-        0x25 => Code::ArrowLeft,
-        0x26 => Code::ArrowUp,
-        0x27 => Code::ArrowRight,
-        0x28 => Code::ArrowDown,
-        0x2C => Code::PrintScreen,
-        0x2D => Code::Insert,
-        0x2E => Code::Delete,
-        0x30..=0x39 => match vk {
-            0x30 => Code::Digit0, 0x31 => Code::Digit1, 0x32 => Code::Digit2,
-            0x33 => Code::Digit3, 0x34 => Code::Digit4, 0x35 => Code::Digit5,
-            0x36 => Code::Digit6, 0x37 => Code::Digit7, 0x38 => Code::Digit8,
-            0x39 => Code::Digit9, _ => unreachable!(),
-        },
-        0x41..=0x5A => match vk {
-            0x41 => Code::KeyA, 0x42 => Code::KeyB, 0x43 => Code::KeyC,
-            0x44 => Code::KeyD, 0x45 => Code::KeyE, 0x46 => Code::KeyF,
-            0x47 => Code::KeyG, 0x48 => Code::KeyH, 0x49 => Code::KeyI,
-            0x4A => Code::KeyJ, 0x4B => Code::KeyK, 0x4C => Code::KeyL,
-            0x4D => Code::KeyM, 0x4E => Code::KeyN, 0x4F => Code::KeyO,
-            0x50 => Code::KeyP, 0x51 => Code::KeyQ, 0x52 => Code::KeyR,
-            0x53 => Code::KeyS, 0x54 => Code::KeyT, 0x55 => Code::KeyU,
-            0x56 => Code::KeyV, 0x57 => Code::KeyW, 0x58 => Code::KeyX,
-            0x59 => Code::KeyY, 0x5A => Code::KeyZ, _ => unreachable!(),
-        },
-        0x70..=0x7B => match vk {
-            0x70 => Code::F1,  0x71 => Code::F2,  0x72 => Code::F3,
-            0x73 => Code::F4,  0x74 => Code::F5,  0x75 => Code::F6,
-            0x76 => Code::F7,  0x77 => Code::F8,  0x78 => Code::F9,
-            0x79 => Code::F10, 0x7A => Code::F11, 0x7B => Code::F12,
-            _ => unreachable!(),
-        },
-        _ => return None,
-    })
-}
+/// The keys that are not part of a numbered run, as (virtual key, `Code`)
+/// pairs. Looked up only when hotkeys are registered, so a scan is plenty.
+const NAMED_KEYS: [(u32, Code); 46] = [
+    // Editing and navigation.
+    (0x08, Code::Backspace), (0x09, Code::Tab), (0x0D, Code::Enter),
+    (0x1B, Code::Escape), (0x20, Code::Space),
+    (0x21, Code::PageUp), (0x22, Code::PageDown), (0x23, Code::End), (0x24, Code::Home),
+    (0x25, Code::ArrowLeft), (0x26, Code::ArrowUp), (0x27, Code::ArrowRight), (0x28, Code::ArrowDown),
+    (0x2D, Code::Insert), (0x2E, Code::Delete),
+    // Modifiers and locks, as keys in their own right.
+    (0x10, Code::ShiftLeft), (0x11, Code::ControlLeft), (0x12, Code::AltLeft),
+    (0x14, Code::CapsLock), (0x90, Code::NumLock), (0x91, Code::ScrollLock),
+    // System keys.
+    (0x13, Code::Pause), (0x2C, Code::PrintScreen),
+    // Keypad operators.
+    (0x6A, Code::NumpadMultiply), (0x6B, Code::NumpadAdd), (0x6D, Code::NumpadSubtract),
+    (0x6E, Code::NumpadDecimal), (0x6F, Code::NumpadDivide),
+    // Punctuation, at their US layout positions.
+    (0xBA, Code::Semicolon), (0xBB, Code::Equal), (0xBC, Code::Comma), (0xBD, Code::Minus),
+    (0xBE, Code::Period), (0xBF, Code::Slash), (0xC0, Code::Backquote),
+    (0xDB, Code::BracketLeft), (0xDC, Code::Backslash), (0xDD, Code::BracketRight), (0xDE, Code::Quote),
+    // Volume and media.
+    (0xAD, Code::AudioVolumeMute), (0xAE, Code::AudioVolumeDown), (0xAF, Code::AudioVolumeUp),
+    (0xB0, Code::MediaTrackNext), (0xB1, Code::MediaTrackPrevious),
+    (0xB2, Code::MediaStop), (0xB3, Code::MediaPlayPause),
+];
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Keys `global-hotkey` 0.7 has no `Code` for on Windows; raw input
-    /// carries them there instead.
-    const RAW_ONLY: &[u32] = &[0x5D, 0x5F, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xB4, 0xB5, 0xB6, 0xB7, 0xE2];
+    /// Keys `global-hotkey` 0.7 cannot name; on Windows raw input carries
+    /// them instead.
+    const RAW_INPUT_ONLY: [u32; 14] =
+        [0x5D, 0x5F, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xB4, 0xB5, 0xB6, 0xB7, 0xE2];
+
+    /// Every key Settings lets the user pick is either grabbable or one of
+    /// the known raw-input-only keys, never both and never neither.
+    #[test]
+    fn every_settings_key_is_grabbable_or_raw_only() {
+        for key in framefang_core::settings::KEYS {
+            let grabbable = vk_to_code(key.vk).is_some();
+            let raw_only = RAW_INPUT_ONLY.contains(&key.vk);
+            assert!(grabbable != raw_only,
+                "{} (0x{:02X}): grabbable={grabbable}, raw-only={raw_only}", key.label, key.vk);
+        }
+    }
 
     #[test]
-    fn every_key_settings_offers_registers_or_rides_raw_input() {
-        for info in framefang_core::settings::KEYS {
-            let mapped = vk_to_code(info.vk).is_some();
-            assert!(mapped != RAW_ONLY.contains(&info.vk),
-                "{} (0x{:02X}): mapped={mapped}, listed raw-only={}", info.label, info.vk, RAW_ONLY.contains(&info.vk));
+    fn numbered_runs_line_up() {
+        assert_eq!(vk_to_code(0x30), Some(Code::Digit0));
+        assert_eq!(vk_to_code(0x37), Some(Code::Digit7));
+        assert_eq!(vk_to_code(0x39), Some(Code::Digit9));
+        assert_eq!(vk_to_code(0x41), Some(Code::KeyA));
+        assert_eq!(vk_to_code(0x53), Some(Code::KeyS));
+        assert_eq!(vk_to_code(0x5A), Some(Code::KeyZ));
+        assert_eq!(vk_to_code(0x60), Some(Code::Numpad0));
+        assert_eq!(vk_to_code(0x69), Some(Code::Numpad9));
+        assert_eq!(vk_to_code(0x70), Some(Code::F1));
+        assert_eq!(vk_to_code(0x7B), Some(Code::F12));
+        assert_eq!(vk_to_code(0x7C), Some(Code::F13));
+        assert_eq!(vk_to_code(0x87), Some(Code::F24));
+    }
+
+    #[test]
+    fn gaps_between_runs_are_unmapped() {
+        // 0x3A to 0x40 sit between the digits and letters; 0x6C is the
+        // keypad separator; 0x88 is just past F24.
+        for vk in [0x3A, 0x40, 0x5B, 0x6C, 0x88, 0x00, 0xFF, 0x1_0000] {
+            assert_eq!(vk_to_code(vk), None, "0x{vk:X} should be unmapped");
         }
+        for vk in RAW_INPUT_ONLY {
+            assert_eq!(vk_to_code(vk), None, "0x{vk:X} is meant to be raw-only");
+        }
+    }
+
+    #[test]
+    fn print_screen_and_media_keys_map() {
+        assert_eq!(vk_to_code(0x2C), Some(Code::PrintScreen));
+        assert_eq!(vk_to_code(0x13), Some(Code::Pause));
+        assert_eq!(vk_to_code(0xB3), Some(Code::MediaPlayPause));
+        assert_eq!(vk_to_code(0xDE), Some(Code::Quote));
+    }
+
+    #[test]
+    fn named_keys_are_unique_and_outside_the_runs() {
+        let in_a_run = |vk: u32| matches!(vk, 0x30..=0x39 | 0x41..=0x5A | 0x60..=0x69 | 0x70..=0x87);
+        for (i, &(vk, code)) in NAMED_KEYS.iter().enumerate() {
+            assert!(!in_a_run(vk), "0x{vk:X} would be shadowed by a numbered run");
+            assert_eq!(vk_to_code(vk), Some(code), "0x{vk:X}");
+            assert!(NAMED_KEYS[i + 1..].iter().all(|&(other, _)| other != vk), "0x{vk:X} listed twice");
+        }
+    }
+
+    #[test]
+    fn modifiers_carry_over_one_for_one() {
+        assert_eq!(grab_modifiers(Modifiers::empty()), GrabModifiers::empty());
+        assert_eq!(grab_modifiers(Modifiers::ALT), GrabModifiers::ALT);
+        assert_eq!(grab_modifiers(Modifiers::CONTROL | Modifiers::SHIFT),
+            GrabModifiers::CONTROL | GrabModifiers::SHIFT);
+        assert_eq!(grab_modifiers(Modifiers::all()),
+            GrabModifiers::ALT | GrabModifiers::CONTROL | GrabModifiers::SHIFT | GrabModifiers::SUPER);
+    }
+
+    #[test]
+    fn a_first_press_counts() {
+        let mut gate = PressGate::default();
+        assert!(gate.admit(HotkeyAction::Capture, Instant::now()));
+    }
+
+    #[test]
+    fn a_quick_repeat_is_the_same_press() {
+        let mut gate = PressGate::default();
+        let t0 = Instant::now();
+        assert!(gate.admit(HotkeyAction::Capture, t0));
+        assert!(!gate.admit(HotkeyAction::Capture, t0 + Duration::from_millis(50)));
+        assert!(!gate.admit(HotkeyAction::Capture, t0 + Duration::from_millis(399)));
+    }
+
+    #[test]
+    fn a_held_key_stays_one_press() {
+        // Each repeat renews the timestamp, so repeats 300 ms apart never
+        // add up to a new press even long after the first.
+        let mut gate = PressGate::default();
+        let t0 = Instant::now();
+        assert!(gate.admit(HotkeyAction::Capture, t0));
+        for step in 1..10 {
+            let at = t0 + Duration::from_millis(300 * step);
+            assert!(!gate.admit(HotkeyAction::Capture, at), "repeat {step}");
+        }
+    }
+
+    #[test]
+    fn a_press_after_the_window_is_new() {
+        let mut gate = PressGate::default();
+        let t0 = Instant::now();
+        assert!(gate.admit(HotkeyAction::Capture, t0));
+        assert!(gate.admit(HotkeyAction::Capture, t0 + ONE_PRESS));
+    }
+
+    #[test]
+    fn actions_are_gated_separately() {
+        let mut gate = PressGate::default();
+        let t0 = Instant::now();
+        assert!(gate.admit(HotkeyAction::Capture, t0));
+        assert!(gate.admit(HotkeyAction::ToggleRecording, t0));
+        assert!(gate.admit(HotkeyAction::CaptureFullScreen, t0 + Duration::from_millis(10)));
+        assert!(!gate.admit(HotkeyAction::ToggleRecording, t0 + Duration::from_millis(20)));
+    }
+
+    #[test]
+    fn only_the_portal_backend_says_portal() {
+        assert!(HotkeyBackend::Portal.is_portal());
+        assert!(!HotkeyBackend::Grab.is_portal());
     }
 }

@@ -1,323 +1,368 @@
-//! Single-instance guard, and the one message a rejected instance can send.
+//! Keeping Frame Fang to one running copy, and letting a second launch pass
+//! a request to the first.
 //!
-//! Framefang is tray-resident, so a second launch — a double-click on the
-//! desktop icon, a second autostart entry, a `framefang` typed into a terminal —
-//! used to add a *second* tray icon, a second global-hotkey registration
-//! (which the OS refuses, so the newcomer's hotkey silently does nothing) and
-//! a second recorder that fights the first over the same output filenames.
+//! Frame Fang lives in the tray. Without a guard, launching it again (the
+//! desktop icon, a duplicate autostart entry, typing `framefang` in a shell)
+//! gives a second tray icon, a hotkey the OS refuses to register twice, and a
+//! second recorder writing to the same file names.
 //!
-//! The guard is an advisory lock held on a file in the per-app config
-//! directory for as long as the process lives. Both mechanisms below are
-//! kernel-owned, so the lock is released by process exit *including a crash
-//! or a SIGKILL* — no stale-PID heuristics, and no lock left behind by an
-//! unclean shutdown:
+//! The guard is a lock on a file in the config directory, held by an open
+//! handle for the life of the process. The kernel owns it, so it goes away
+//! when the process does, even after a crash or a kill, and there is no stale
+//! PID to second-guess:
 //!
-//! * Unix    — `flock(LOCK_EX | LOCK_NB)` on an open fd.
-//! * Windows — `CreateFileW` with a share mode of 0, i.e. an exclusive open.
-//!             A second opener gets a sharing violation.
+//! * Unix: `flock(LOCK_EX | LOCK_NB)` on the open file.
+//! * Windows: the file is opened with a share mode of 0, so any other open of
+//!   it fails with a sharing violation while we hold it.
 //!
-//! Losing the race is not an error. The second instance leaves a capture
-//! request next to the lock file and exits quietly; the running instance
-//! picks it up on its next event-loop tick and opens the capture overlay. So
-//! "launch Framefang again" does the useful thing instead of nothing.
+//! A launch that finds the lock taken is not an error. It drops a small
+//! request file next to the lock and exits, and the running copy notices the
+//! file on its next tick and opens the capture overlay (or Settings for
+//! `--settings`). Launching again therefore does something useful.
 
-use std::fs::{self, File, OpenOptions};
-use std::path::{Path, PathBuf};
+use std::{
+    fs::{self, File, OpenOptions},
+    path::{Path, PathBuf},
+    thread,
+    time::{Duration, Instant},
+};
 
-use framefang_core::AppSettings;
+/// The lock file's name in the config directory. This and the request file
+/// names below are shared by every build of Frame Fang (an update relaunch
+/// has an old and a new build meeting through them), so they never change.
+const LOCK_NAME: &str = "instance.lock";
 
-/// Name of the lock file inside the per-app config directory.
-const LOCK_FILE: &str = "instance.lock";
+/// How often `acquire_waiting` tries again while the lock is taken.
+const RETRY_EVERY: Duration = Duration::from_millis(100);
 
-/// Name of the "the user launched me again — please capture" flag file.
-const CAPTURE_REQUEST_FILE: &str = "capture.request";
+fn config_dir() -> Option<PathBuf> {
+    framefang_core::AppSettings::config_dir()
+}
 
-/// Name of the "launched with --settings: open Settings" flag file.
-const SETTINGS_REQUEST_FILE: &str = "settings.request";
-
-/// Held for the lifetime of the primary instance. Dropping it releases the
-/// lock, so it must be kept alive in `main` for as long as the app runs.
+/// Proof that this process is the running Frame Fang. The lock is released
+/// when this is dropped, so `main` keeps it alive until exit.
 pub struct InstanceLock {
-    /// The lock lives on this open handle. Never read or written — closing it
-    /// is the entire contract.
-    _file: File,
+    /// The handle the lock lives on. Its contents are never touched; holding
+    /// it open is all it is for.
+    _handle: File,
 }
 
-/// Outcome of trying to become the one running Framefang.
+/// What happened when we tried to become the running Frame Fang.
 pub enum Instance {
-    /// We hold the lock. Keep the guard alive for the whole process.
+    /// We have the lock. Hold on to the guard for the whole run.
     Primary(InstanceLock),
-    /// Another Framefang already holds it. The caller should exit.
+    /// Another Frame Fang has it. The caller should pass on its request and
+    /// exit.
     AlreadyRunning,
-    /// There is no per-app directory to lock in (no HOME, read-only config
-    /// root, …). We can't tell, so we let the launch through — refusing to
-    /// start is much worse than a duplicate tray icon.
+    /// The lock could not be tried at all (no config directory, a read-only
+    /// one, a filesystem without locks). Starting anyway is the lesser evil:
+    /// a duplicate tray icon beats an app that will not open.
     Unsupported,
 }
 
-fn lock_path() -> Option<PathBuf> {
-    AppSettings::config_dir().map(|d| d.join(LOCK_FILE))
-}
-
-fn capture_request_path() -> Option<PathBuf> {
-    AppSettings::config_dir().map(|d| d.join(CAPTURE_REQUEST_FILE))
-}
-
-fn settings_request_path() -> Option<PathBuf> {
-    AppSettings::config_dir().map(|d| d.join(SETTINGS_REQUEST_FILE))
-}
-
-/// Try to become the primary instance, answering immediately.
+/// Become the running instance if nobody else is, without waiting.
 ///
-/// On success any capture request left over from a previous run is cleared:
-/// it belongs to a conversation with an instance that is no longer around,
-/// and consuming it would open an overlay the user never asked for.
+/// Winning also deletes any request files left from an earlier run. They
+/// were meant for a process that is gone, and acting on them now would open
+/// a window nobody asked for.
 pub fn acquire() -> Instance {
-    acquire_waiting(std::time::Duration::ZERO)
+    acquire_waiting(Duration::ZERO)
 }
 
-/// Try to become the primary instance, retrying until `grace` elapses.
+/// Like [`acquire`], but keep trying for up to `grace` while another instance
+/// holds the lock.
 ///
-/// A zero grace is the plain "is anyone else running?" question. A non-zero
-/// one is for the single case where an overlap is expected and legitimate:
-/// the self-updater spawns the freshly-installed binary and *then* exits, so
-/// for a moment two Framefangs are alive by design. Without the wait the new
-/// process would mistake its own predecessor for a duplicate launch and quit,
-/// leaving the user with no Framefang at all after an update.
-pub fn acquire_waiting(grace: std::time::Duration) -> Instance {
-    let deadline = std::time::Instant::now() + grace;
-    loop {
-        match acquire_once() {
-            Instance::AlreadyRunning if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(100));
+/// The only expected overlap is the self-updater: it starts the newly
+/// installed binary and only then exits itself. A new process that gave up
+/// at once would take its own predecessor for a duplicate and quit, leaving
+/// no Frame Fang running after the update.
+pub fn acquire_waiting(grace: Duration) -> Instance {
+    let give_up_at = Instant::now() + grace;
+    let attempt = || config_dir().map_or(Instance::Unsupported, |dir| acquire_in(&dir));
+    let mut outcome = attempt();
+    while matches!(outcome, Instance::AlreadyRunning) && Instant::now() < give_up_at {
+        thread::sleep(RETRY_EVERY);
+        outcome = attempt();
+    }
+    outcome
+}
+
+/// One attempt at the lock in `dir`.
+fn acquire_in(dir: &Path) -> Instance {
+    let Ok(()) = fs::create_dir_all(dir) else { return Instance::Unsupported };
+    match claim_lock(&dir.join(LOCK_NAME)) {
+        Claim::Held(handle) => {
+            for stale in Request::ALL {
+                let _ = fs::remove_file(stale.path_in(dir));
             }
-            other => return other,
+            Instance::Primary(InstanceLock { _handle: handle })
         }
+        Claim::Taken => Instance::AlreadyRunning,
+        Claim::Unknown => Instance::Unsupported,
     }
 }
 
-fn acquire_once() -> Instance {
-    let Some(path) = lock_path() else { return Instance::Unsupported };
-    if let Some(dir) = path.parent() {
-        if fs::create_dir_all(dir).is_err() {
-            return Instance::Unsupported;
+// ---- requests from a second launch ----
+
+/// Something a second launch can ask the running instance to do. Each is a
+/// file in the config directory: writing it asks, deleting it answers.
+#[derive(Clone, Copy)]
+enum Request {
+    Capture,
+    Settings,
+}
+
+impl Request {
+    const ALL: [Request; 2] = [Request::Capture, Request::Settings];
+
+    /// Written by a second launch to ask for the capture overlay, or by
+    /// `framefang --settings` to ask for the Settings window.
+    fn file_name(self) -> &'static str {
+        match self {
+            Request::Capture => "capture.request",
+            Request::Settings => "settings.request",
         }
     }
 
-    let file = match open_lock_file(&path) {
-        Ok(f) => f,
-        // Windows reports the *contended* case here too, because the
-        // exclusive open below is the open itself. Everything else (no
-        // permission, read-only filesystem) is "we can't tell".
-        Err(e) => return classify_open_error(&e),
-    };
-
-    match try_lock(&file) {
-        LockOutcome::Held => {
-            if let Some(req) = capture_request_path() { let _ = fs::remove_file(req); }
-            if let Some(req) = settings_request_path() { let _ = fs::remove_file(req); }
-            Instance::Primary(InstanceLock { _file: file })
+    /// What goes in the file. Nothing reads it; it only makes a stray file
+    /// self-explanatory.
+    fn contents(self) -> &'static [u8] {
+        match self {
+            Request::Capture => b"capture\n",
+            Request::Settings => b"settings\n",
         }
-        LockOutcome::Contended => Instance::AlreadyRunning,
-        LockOutcome::Unsupported => Instance::Unsupported,
+    }
+
+    fn path_in(self, dir: &Path) -> PathBuf {
+        dir.join(self.file_name())
+    }
+
+    /// Leave the request in `dir`. Failures are ignored: the worst case is a
+    /// second launch that does nothing, which is what it did before the guard.
+    fn raise_in(self, dir: &Path) {
+        let _ = fs::create_dir_all(dir);
+        let _ = fs::write(self.path_in(dir), self.contents());
+    }
+
+    /// Claim a waiting request in `dir`. Deleting the file is the claim, so
+    /// only one caller can ever see a given request as true, and when nothing
+    /// is waiting it costs one failed unlink.
+    fn take_in(self, dir: &Path) -> bool {
+        fs::remove_file(self.path_in(dir)).is_ok()
+    }
+
+    fn raise(self) {
+        if let Some(dir) = config_dir() {
+            self.raise_in(&dir);
+        }
+    }
+
+    fn take(self) -> bool {
+        config_dir().is_some_and(|dir| self.take_in(&dir))
     }
 }
 
-/// Ask the running instance to open the capture overlay.
-///
-/// Best-effort and fire-and-forget: this is the last thing a losing instance
-/// does before exiting, and a failure here just means the extra launch was a
-/// no-op — which is the behaviour we had before the guard existed anyway.
+/// Ask the running instance to open the capture overlay. Called by a launch
+/// that lost the lock, just before it exits.
 pub fn request_capture() {
-    let Some(path) = capture_request_path() else { return };
-    if let Some(dir) = path.parent() { let _ = fs::create_dir_all(dir); }
-    let _ = fs::write(&path, b"capture\n");
+    Request::Capture.raise();
 }
 
-/// Consume a pending capture request, if one is waiting.
-///
-/// Cheap enough to call from the event loop every tick: on the overwhelmingly
-/// common path it is a single `unlink` that fails with `ENOENT`. Removing the
-/// file *is* the claim, so two ticks can never both act on one request.
+/// Claim a pending capture request. Cheap enough for every event-loop tick.
 pub fn take_capture_request() -> bool {
-    let Some(path) = capture_request_path() else { return false };
-    fs::remove_file(path).is_ok()
+    Request::Capture.take()
 }
 
-/// Ask the running instance (or this one, once its loop runs) to open
-/// Settings: `framefang --settings`. Best-effort, like `request_capture`.
+/// Ask for the Settings window (`framefang --settings`). The running
+/// instance, or this one once its loop starts, picks it up.
 pub fn request_settings() {
-    let Some(path) = settings_request_path() else { return };
-    if let Some(dir) = path.parent() { let _ = fs::create_dir_all(dir); }
-    let _ = fs::write(&path, b"settings\n");
+    Request::Settings.raise();
 }
 
-/// Consume a pending Settings request, if one is waiting. Removing the file
-/// is the claim, as with `take_capture_request`.
+/// Claim a pending Settings request, the same way as captures.
 pub fn take_settings_request() -> bool {
-    let Some(path) = settings_request_path() else { return false };
-    fs::remove_file(path).is_ok()
+    Request::Settings.take()
 }
 
-/// Result of the platform's "claim this file" step.
-///
-/// Only the Unix path produces all three: on Windows the exclusive open is
-/// itself the lock, so contention has already been decided by the time
-/// `try_lock` runs and `Held` is the only value it can return.
-#[cfg_attr(not(unix), allow(dead_code))]
-enum LockOutcome {
-    Held,
-    Contended,
-    Unsupported,
+// ---- the lock itself, per platform ----
+
+/// The result of trying to take the lock file.
+enum Claim {
+    /// We hold it, on this handle.
+    Held(File),
+    /// Someone else holds it.
+    Taken,
+    /// Locking is not possible here, so we cannot tell.
+    Unknown,
 }
 
-// ── Unix: flock on the open fd ──────────────────────────────────────────────
-
+/// Unix: open (never truncating) and then `flock` without blocking.
 #[cfg(unix)]
-fn try_lock(file: &File) -> LockOutcome {
-    use std::os::unix::io::AsRawFd;
-    // LOCK_NB so we get an immediate answer instead of blocking behind the
-    // running instance forever.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc == 0 { return LockOutcome::Held; }
-    let err = std::io::Error::last_os_error();
-    match err.raw_os_error() {
-        // EWOULDBLOCK (== EAGAIN on every platform we ship) is the one
-        // outcome that actually means "someone else has it".
-        Some(e) if e == libc::EWOULDBLOCK => LockOutcome::Contended,
-        // flock is unimplemented on some network filesystems. Don't turn that
-        // into a refusal to start.
-        _ => LockOutcome::Unsupported,
+fn claim_lock(path: &Path) -> Claim {
+    use std::os::unix::io::AsRawFd as _;
+
+    // Any failure to open is about the environment, not another instance:
+    // on Unix contention only shows up at the flock.
+    let Ok(handle) = open_token(path) else { return Claim::Unknown };
+    // Exclusive, and non-blocking so a held lock answers at once.
+    let mode = libc::LOCK_EX | libc::LOCK_NB;
+    if unsafe { libc::flock(handle.as_raw_fd(), mode) } == 0 {
+        return Claim::Held(handle);
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        // EWOULDBLOCK (the same number as EAGAIN everywhere we ship) is the
+        // only answer that means another holder.
+        Some(code) if code == libc::EWOULDBLOCK => Claim::Taken,
+        // Some network filesystems do not implement flock at all.
+        _ => Claim::Unknown,
     }
 }
 
-#[cfg(unix)]
-fn classify_open_error(_e: &std::io::Error) -> Instance {
-    // On Unix the open always succeeds when the path is usable; contention is
-    // decided by flock afterwards. Anything failing here is environmental.
-    Instance::Unsupported
-}
-
-// ── Windows: the exclusive open is the lock ─────────────────────────────────
-
+/// Windows: the exclusive open is the whole lock.
 #[cfg(windows)]
-fn try_lock(_file: &File) -> LockOutcome {
-    // Nothing more to do: `open_exclusive` below already succeeded, and it
-    // could only do that if no other process had the file open.
-    LockOutcome::Held
-}
+fn claim_lock(path: &Path) -> Claim {
+    /// Another handle's share mode shuts us out.
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    /// Some filesystems report the same situation as access denied.
+    const ERROR_ACCESS_DENIED: i32 = 5;
 
-#[cfg(windows)]
-fn classify_open_error(e: &std::io::Error) -> Instance {
-    // ERROR_SHARING_VIOLATION (32) — another process holds the file with a
-    // share mode that excludes us, which for this file means another Framefang.
-    // ERROR_ACCESS_DENIED (5) can surface for the same reason on some
-    // filesystems, so treat it the same way rather than starting a duplicate.
-    match e.raw_os_error() {
-        Some(32) | Some(5) => Instance::AlreadyRunning,
-        _ => Instance::Unsupported,
+    match open_token(path) {
+        Ok(file) => Claim::Held(file),
+        Err(e) => match e.raw_os_error() {
+            Some(ERROR_SHARING_VIOLATION | ERROR_ACCESS_DENIED) => Claim::Taken,
+            _ => Claim::Unknown,
+        },
     }
 }
 
-// ── neither: no guard, but never a refusal to start ─────────────────────────
-
+/// Anywhere else there is no lock to take, but that must not stop the app.
 #[cfg(not(any(unix, windows)))]
-fn try_lock(_file: &File) -> LockOutcome { LockOutcome::Unsupported }
-
-#[cfg(not(any(unix, windows)))]
-fn classify_open_error(_e: &std::io::Error) -> Instance { Instance::Unsupported }
-
-/// Open the lock file with the platform's exclusive sharing mode.
-///
-/// Split out from `acquire` so the Windows share-mode flag has somewhere to
-/// live: on Windows the sharing mode *is* the lock, so it has to be part of
-/// the open call itself.
-#[cfg(windows)]
-fn open_lock_file(path: &Path) -> std::io::Result<File> {
-    use std::os::windows::fs::OpenOptionsExt;
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        // dwShareMode = 0: no other process may open this file at all until
-        // our handle closes, which the kernel does for us even on a crash.
-        .share_mode(0)
-        .open(path)
+fn claim_lock(path: &Path) -> Claim {
+    let _ = open_token(path);
+    Claim::Unknown
 }
 
-#[cfg(not(windows))]
-fn open_lock_file(path: &Path) -> std::io::Result<File> {
-    OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)
+/// Open (creating if needed) the lock file without truncating it: it is a
+/// token another process may have open, not data to rewrite.
+fn open_token(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // Share mode 0: no other open of this file succeeds until our handle
+        // closes, which the kernel guarantees even if we crash.
+        options.share_mode(0);
+    }
+    options.open(path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn scratch(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir()
-            .join(format!("framefang-instance-{}-{tag}", std::process::id()));
-        let _ = fs::remove_dir_all(&d);
-        fs::create_dir_all(&d).unwrap();
-        d
+    /// A fresh, empty directory for one test, removed again when the test
+    /// ends (passing or not). The name carries the process id and the test's
+    /// tag, so parallel tests and parallel runs never share one.
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("framefang-instance-test-{}-{tag}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("temp dir should be writable");
+            TestDir(dir)
+        }
+
+        fn lock_path(&self) -> PathBuf {
+            self.0.join(LOCK_NAME)
+        }
     }
 
-    /// The lock is exclusive against a second handle on the same file, and
-    /// released when the first handle is dropped. Exercised directly rather
-    /// than through `acquire`, which is tied to the real config directory.
-    #[cfg(unix)]
-    #[test]
-    fn second_holder_is_refused_until_the_first_drops() {
-        let dir = scratch("exclusive");
-        let path = dir.join(LOCK_FILE);
-
-        let first = open_lock_file(&path).unwrap();
-        assert!(matches!(try_lock(&first), LockOutcome::Held));
-
-        let second = open_lock_file(&path).unwrap();
-        assert!(matches!(try_lock(&second), LockOutcome::Contended),
-            "a second holder must not get the lock");
-        drop(second);
-
-        drop(first);
-        let third = open_lock_file(&path).unwrap();
-        assert!(matches!(try_lock(&third), LockOutcome::Held),
-            "closing the holder must release the lock");
-        drop(third);
-        let _ = fs::remove_dir_all(&dir);
+    impl std::ops::Deref for TestDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
     }
 
-    /// Opening the lock file must never truncate it — the file is a lock
-    /// token, and a truncating open would be a write to a file another
-    /// process is mid-flight on.
-    #[test]
-    fn opening_the_lock_file_preserves_it() {
-        let dir = scratch("notruncate");
-        let path = dir.join(LOCK_FILE);
-        fs::write(&path, b"marker").unwrap();
-        let f = open_lock_file(&path).unwrap();
-        drop(f);
-        assert_eq!(fs::read(&path).unwrap(), b"marker");
-        let _ = fs::remove_dir_all(&dir);
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 
-    /// `take_capture_request` claims by removing, so exactly one caller can
-    /// win a given request. Modelled on the real files, in a scratch dir.
     #[test]
-    fn a_capture_request_is_claimed_exactly_once() {
-        let dir = scratch("request");
-        let path = dir.join(CAPTURE_REQUEST_FILE);
-        fs::write(&path, b"capture\n").unwrap();
-        assert!(fs::remove_file(&path).is_ok(), "first claim wins");
-        assert!(fs::remove_file(&path).is_err(), "second claim finds nothing");
-        let _ = fs::remove_dir_all(&dir);
+    fn the_lock_is_exclusive_until_released() {
+        let dir = TestDir::new("exclusive");
+
+        let Claim::Held(holder) = claim_lock(&dir.lock_path()) else {
+            panic!("the first claim should win")
+        };
+        assert!(matches!(claim_lock(&dir.lock_path()), Claim::Taken),
+            "a second claim must see the lock as taken");
+
+        drop(holder);
+        assert!(matches!(claim_lock(&dir.lock_path()), Claim::Held(_)),
+            "dropping the holder must free the lock");
     }
 
-    /// The two files must be distinct: consuming a capture request must never
-    /// unlink the lock file out from under the running instance.
     #[test]
-    fn lock_and_request_are_different_files() {
-        assert_ne!(LOCK_FILE, CAPTURE_REQUEST_FILE);
+    fn a_second_acquire_sees_the_first_running() {
+        let dir = TestDir::new("acquire");
+        let running = acquire_in(&dir);
+        assert!(matches!(running, Instance::Primary(_)));
+        assert!(matches!(acquire_in(&dir), Instance::AlreadyRunning));
+        drop(running);
+        assert!(matches!(acquire_in(&dir), Instance::Primary(_)));
+    }
+
+    #[test]
+    fn winning_the_lock_clears_stale_requests() {
+        let dir = TestDir::new("stale");
+        Request::Capture.raise_in(&dir);
+        Request::Settings.raise_in(&dir);
+
+        let won = acquire_in(&dir);
+        assert!(matches!(won, Instance::Primary(_)));
+        assert!(!Request::Capture.take_in(&dir));
+        assert!(!Request::Settings.take_in(&dir));
+    }
+
+    #[test]
+    fn opening_the_lock_file_keeps_its_contents() {
+        let dir = TestDir::new("keep");
+        fs::write(dir.lock_path(), b"held by someone").unwrap();
+        drop(open_token(&dir.lock_path()).unwrap());
+        assert_eq!(fs::read(dir.lock_path()).unwrap(), b"held by someone");
+    }
+
+    #[test]
+    fn each_request_is_taken_once() {
+        let dir = TestDir::new("once");
+        assert!(!Request::Capture.take_in(&dir), "nothing waiting yet");
+
+        Request::Capture.raise_in(&dir);
+        assert!(Request::Capture.take_in(&dir), "the first take wins");
+        assert!(!Request::Capture.take_in(&dir), "a second take finds nothing");
+    }
+
+    #[test]
+    fn capture_and_settings_requests_are_independent() {
+        let dir = TestDir::new("independent");
+        Request::Settings.raise_in(&dir);
+        assert!(!Request::Capture.take_in(&dir));
+        assert!(Request::Settings.take_in(&dir));
+    }
+
+    /// Taking a request deletes a file, so no request may share a name with
+    /// the lock the running instance is holding.
+    #[test]
+    fn request_files_never_name_the_lock() {
+        for request in Request::ALL {
+            assert_ne!(request.file_name(), LOCK_NAME);
+        }
+        assert_ne!(Request::Capture.file_name(), Request::Settings.file_name());
     }
 }

@@ -1,0 +1,74 @@
+{
+  "LastTool": "Arrow",
+  "LastColorArgb": 2130771712,
+  "LastThickness": 5.5,
+  "LastTextSize": 31.0,
+  "PixelateBlock": 14,
+  "AutoCopy": true,
+  "CloseAfterCopy": true,
+  "OpenEditor": false,
+  "ScrollAfterCapture": "Edit",
+  "SwitchKey": "Alt",
+  "CaptureCursor": true,
+  "CaptureMode": "Screen",
+  "ToolStyles": {
+    "Arrow": {
+      "Color": -16776961,
+      "Thickness": 7.0
+    }
+  },
+  "SaveDirectory": "D:\\Shots",
+  "RecordingsDirectory": "D:\\Clips",
+  "FfmpegPath": "C:\\Tools\\ffmpeg.exe",
+  "HotkeyModifiers": 6,
+  "HotkeyVirtualKey": 80,
+  "FullScreenHotkeyModifiers": 2,
+  "FullScreenHotkeyVirtualKey": 70,
+  "RecordHotkeyModifiers": 1,
+  "RecordHotkeyVirtualKey": 82,
+  "StartWithWindows": true,
+  "PaletteIndex": 2,
+  "Theme": "Cyan",
+  "MarkerOpacity": 99,
+  "RecordSound": "Both",
+  "FileNamePattern": "{yyyy}-{app}",
+  "FileNameCustom": "{date}_x",
+  "RecordFormat": "GIF",
+  "OutputFrame": "Shadow",
+  "LastRegionHotkeyModifiers": 3,
+  "LastRegionHotkeyVirtualKey": 76,
+  "TextHotkeyModifiers": 6,
+  "TextHotkeyVirtualKey": 84,
+  "QrHotkeyModifiers": 10,
+  "QrHotkeyVirtualKey": 81,
+  "ScrollHotkeyModifiers": 12,
+  "ScrollHotkeyVirtualKey": 83,
+  "MagnifyZoom": 3,
+  "OpenQrLinks": true,
+  "QrSwitchKey": "Shift",
+  "ScrollSwitchKey": "Key:0x20",
+  "StepLook": {
+    "shape": "Terminal",
+    "body": {
+      "r": 220,
+      "g": 38,
+      "b": 38,
+      "a": 255
+    },
+    "ring": {
+      "r": 220,
+      "g": 38,
+      "b": 38,
+      "a": 255
+    },
+    "number": {
+      "r": 255,
+      "g": 255,
+      "b": 255,
+      "a": 255
+    },
+    "shadow": false
+  },
+  "HighlightStyle": "Glow",
+  "KeepRecentCaptures": false
+}

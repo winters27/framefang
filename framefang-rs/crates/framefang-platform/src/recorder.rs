@@ -1,106 +1,83 @@
-//! Screen recording via system tools.
+//! Screen recording, by driving the system's own tools.
 //!
-//! Cross-platform recording isn't a one-binary affair — every OS has its own
-//! capture stack and the high-quality choices live outside the Rust ecosystem.
-//! We deliberately route every platform through `ffmpeg` (or the platform's
-//! built-in equivalent on macOS) so the **output container is identical
-//! everywhere**: MP4, H.264 video, AAC stereo audio. Downstream tools
-//! (`convert_video_form`, the pin preview, anything users do after the fact)
-//! only ever need to know one format.
+//! No single Rust crate records the screen well on every OS, so Frame Fang
+//! runs an outside encoder instead: `ffmpeg` everywhere, or macOS's built-in
+//! `screencapture` for silent recordings there. Whatever records, the file
+//! that comes out is the same: an MP4 with H.264 video and stereo AAC sound.
+//! Everything after recording (conversion, the pin preview, annotating a
+//! clip) only has to understand that one format.
 //!
-//! Per-platform capture stack:
+//! Where the picture comes from:
 //!
-//! * Linux  (X11)     : `ffmpeg -f x11grab` — needs `ffmpeg` installed.
-//!                      Audio: PulseAudio mic + monitor source.
-//! * Linux  (Wayland) : `xdg-desktop-portal` ScreenCast -> PipeWire -> raw
-//!                      frames on ffmpeg's stdin (`recorder_wayland.rs`).
-//!                      `-f x11grab` is never used here: XWayland answers the
-//!                      grab and silently produces a black capture, so the
-//!                      session type is detected up-front (via
-//!                      `XDG_SESSION_TYPE` / `WAYLAND_DISPLAY`) and the two
-//!                      paths never mix. Audio is unchanged — the same
-//!                      `-f pulse` inputs, which PipeWire's Pulse shim serves.
-//!                      Stop is EOF on stdin rather than `q`, because stdin is
-//!                      the video pipe here; see `graceful_signal`.
-//! * Windows          : `ffmpeg -f gdigrab` for video; audio is captured
-//!                      natively via WASAPI (see `recorder_windows_audio.rs`)
-//!                      and streamed into ffmpeg over a loopback TCP socket.
-//!                      The default render endpoint in loopback mode is the
-//!                      system audio and the default capture endpoint is the
-//!                      mic, so both work with **no** Stereo Mix / VB-Audio
-//!                      driver. gdigrab stays for video — it's CPU-heavy and
-//!                      doesn't pick up DWM-composited surfaces as cleanly as
-//!                      `Windows.Graphics.Capture` would, but it's a small,
-//!                      proven delta from the Linux pattern.
-//!                      TODO: port video to `Windows.Graphics.Capture` +
-//!                      MediaFoundation for per-window capture and
-//!                      hardware-accelerated encoding.
-//! * macOS            : video-only recordings use the built-in
-//!                      `screencapture -v` (no ffmpeg dependency). Any audio
-//!                      request routes through `ffmpeg -f avfoundation`
-//!                      instead — the only way to fold an audio device into
-//!                      the capture. Mic works directly; system audio needs a
-//!                      loopback device (BlackHole / Aggregate), mirroring the
-//!                      Windows "Stereo Mix" situation, otherwise it degrades
-//!                      to mic or surfaces an actionable error.
+//! | Session        | Video                                    | Sound                                  |
+//! |----------------|------------------------------------------|----------------------------------------|
+//! | Linux, X11     | `ffmpeg -f x11grab`                      | PulseAudio: the mic and the default sink's monitor |
+//! | Linux, Wayland | ScreenCast portal, PipeWire frames piped into ffmpeg (`recorder_wayland.rs`) | the same Pulse inputs, served by PipeWire's Pulse layer |
+//! | Windows        | `ffmpeg -f gdigrab`                      | WASAPI, sent to ffmpeg over 127.0.0.1 (`recorder_windows_audio.rs`) |
+//! | macOS          | `screencapture -v`, or `ffmpeg -f avfoundation` once sound is asked for | avfoundation for the mic, ScreenCaptureKit for the system mix (`recorder_macos_audio.rs`) |
 //!
-//! Recording is full-screen by default and region-limited when `start_region`
-//! is handed a `CaptureRect`. The rectangle is part of the **public start API**
-//! rather than an x11grab detail, because every backend can honour it and a
-//! future PipeWire / xdg-desktop-portal backend will need the same value:
+//! Wayland never uses x11grab: XWayland would answer it with a black screen.
+//! The session type is decided up front (see `crate::session`) so the two
+//! Linux paths never mix. gdigrab is heavy on the CPU and sees some
+//! composited surfaces less cleanly than Windows.Graphics.Capture would; it
+//! stays because it is proven and mirrors the Linux shape, and moving to
+//! Windows.Graphics.Capture with Media Foundation encoding remains possible.
 //!
-//! * Linux  (X11)     : `-video_size WxH -i <display>+X,Y`
-//! * Windows          : `-offset_x X -offset_y Y -video_size WxH -i desktop`
-//! * macOS            : `screencapture -v -R x,y,w,h`, or an ffmpeg
-//!                      `crop=W:H:X:Y` filter when audio routes capture
-//!                      through avfoundation.
+//! # Regions
 //!
-//! X11 and gdigrab measure from the virtual desktop's corner
-//! (`CaptureRect::offset_x`); `screencapture` measures from the main display's
-//! corner (`CaptureRect::x`). `framefang_core::region` owns that distinction along
-//! with the even-dimension rounding H.264 requires — nothing here re-derives it.
+//! A recording covers the whole desktop unless `start_region` gets a
+//! [`CaptureRect`]. Each backend takes it in its own form:
 //!
-//! Audio is untouched by any of this: the same sources, the same best-effort
-//! degradation, the same `amix`. Only the video input differs.
+//! * X11: `-video_size WxH` and `-i <display>+X,Y`.
+//! * Wayland: a `crop` filter on the shared frames.
+//! * Windows: `-offset_x X -offset_y Y -video_size WxH` before `-i desktop`.
+//! * macOS: `screencapture -v -R x,y,w,h`, or a `crop` filter on the
+//!   avfoundation path.
 //!
-//! Stop is graceful per platform: write `q` to `ffmpeg`'s stdin (Linux,
-//! Windows) or send SIGINT to `screencapture` (macOS) so the MP4 moov atom
-//! is finalized. Every wait after that signal is bounded — ~15 s for an
-//! explicit `stop()`, ~2 s in `Drop` — and escalates to a kill, so a normal
-//! teardown always yields a playable file while a wedged encoder can never
-//! freeze the UI thread. ffmpeg treats `q` on stdin the same on Windows as it
-//! does on Linux, so the `recording_indicator` STOP button needs no
-//! platform-specific tweaks.
+//! X11, Wayland and gdigrab count from the virtual desktop's corner
+//! (`CaptureRect::offset_x`); macOS counts from the main display's corner
+//! (`CaptureRect::x`). `framefang_core::region` owns that difference and the
+//! even sizes H.264 needs. A region never changes the sound inputs.
 //!
-//! Between start and stop the encoder is watched rather than trusted:
-//! `Recorder::poll_health()` reaps a child that died on its own, and the last
-//! lines of its stderr are kept in a ring buffer so the failure can be
-//! reported with its actual cause instead of a bare exit code.
+//! # Stopping
+//!
+//! ffmpeg finishes a file cleanly when it reads `q` on stdin, on Windows as
+//! on Linux; `screencapture` finishes on SIGINT; the Wayland encoder finishes
+//! when its frame pipe closes. Either way the MP4's index gets written. The
+//! wait after asking is always bounded (15 s for `stop`, 2 s on drop) and
+//! then the process is killed, so a stuck encoder can't hang the UI thread.
+//!
+//! # Watching
+//!
+//! Between start and stop, `Recorder::poll_health` notices an encoder that
+//! died, and the last lines of its stderr are kept so the user hears the
+//! real cause rather than an exit code.
 
 use crate::{Error, Result};
 use framefang_core::region::CaptureRect;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-// WASAPI loopback + mic capture lives in its own file to keep the COM-heavy
-// code out of this module. Windows-only; everything it exposes is gated too.
+// WASAPI capture for Windows recordings, kept apart because of its COM code.
 #[cfg(target_os = "windows")]
 #[path = "recorder_windows_audio.rs"]
 mod windows_audio;
 
-// ScreenCaptureKit system-audio capture (macOS), likewise out-of-line.
+// ScreenCaptureKit system sound for macOS recordings.
 #[cfg(target_os = "macos")]
 #[path = "recorder_macos_audio.rs"]
 mod macos_audio;
 
-// ScreenCast-portal + PipeWire screen capture (Linux/Wayland). Linux-only and
-// only reached on a Wayland session; X11 keeps the x11grab path untouched.
+// ScreenCast portal and PipeWire frames for Wayland sessions. X11 sessions
+// never touch it.
 #[cfg(target_os = "linux")]
 #[path = "recorder_wayland.rs"]
 pub mod wayland_cast;
 
-/// What audio sources to mix into the recording. Mirrors the C#
-/// `FramefangRecorder.Start(path, micEnabled, systemAudioEnabled)` triple.
+/// Which sound sources go into a recording.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RecordingOptions {
     pub mic:          bool,
@@ -108,1959 +85,1776 @@ pub struct RecordingOptions {
 }
 
 impl RecordingOptions {
-    pub const NONE:        Self = Self { mic: false, system_audio: false };
-    pub const MIC_ONLY:    Self = Self { mic: true,  system_audio: false };
-    pub const SYSTEM_ONLY: Self = Self { mic: false, system_audio: true  };
-    pub const MIC_AND_SYS: Self = Self { mic: true,  system_audio: true  };
-    pub fn has_audio(self) -> bool { self.mic || self.system_audio }
+    /// Silent.
+    pub const NONE: Self = Self { mic: false, system_audio: false };
+    pub const MIC_ONLY: Self = Self { mic: true, system_audio: false };
+    pub const SYSTEM_ONLY: Self = Self { mic: false, system_audio: true };
+    /// Both, mixed into one track.
+    pub const MIC_AND_SYS: Self = Self { mic: true, system_audio: true };
+
+    /// Whether any sound source is on.
+    pub fn has_audio(self) -> bool {
+        self.mic || self.system_audio
+    }
 }
 
+/// Starts, watches and stops one screen recording at a time.
 pub struct Recorder {
-    backend: Option<Backend>,
-    output:  Option<PathBuf>,
-}
-
-/// What's actually running underneath a live recording. Most platforms drive a
-/// single child process (`ffmpeg` on Linux/Windows, `ffmpeg` or `screencapture`
-/// on macOS); Windows additionally runs WASAPI capture threads that stream PCM
-/// into ffmpeg over a loopback socket, and macOS 15+ drives a native
-/// ScreenCaptureKit session with no child at all.
-enum Backend {
-    Process {
-        child: Child,
-        /// Rolling tail of the child's stderr, kept by the drain thread.
-        stderr: StderrTail,
-        /// Windows-only: WASAPI capture pumps feeding ffmpeg over loopback TCP.
-        /// The field only exists on Windows so every other platform keeps a
-        /// single-field `Process` backend with nothing to join.
-        #[cfg(target_os = "windows")]
-        pumps: Vec<AudioPump>,
-        /// macOS-only: a ScreenCaptureKit system-audio session feeding ffmpeg
-        /// over loopback TCP. `None` for video-only or mic-only recordings.
-        #[cfg(target_os = "macos")]
-        sck: Option<macos_audio::SckSession>,
-        /// Linux-only: a ScreenCast-portal / PipeWire capture writing raw
-        /// frames into ffmpeg's stdin. `Some` on Wayland, `None` on X11 where
-        /// ffmpeg reads the screen itself through `x11grab`.
-        #[cfg(target_os = "linux")]
-        cast: Option<wayland_cast::CastSession>,
-    },
-}
-
-/// How long `Recorder::stop()` waits for the encoder to finalize the container
-/// before escalating to a kill, in 100 ms polls. Generous: a long 4K recording
-/// can spend several seconds writing the moov atom, and killing early corrupts
-/// exactly the file the user asked us to save. Still bounded, because this runs
-/// on the UI thread and a wedged encoder must not freeze the app forever.
-const STOP_POLL_STEPS: u32 = 150;
-
-/// Same escalation ladder for `Drop`, but ~2 s: nobody is waiting on the file
-/// at that point and the process is on its way out.
-const DROP_POLL_STEPS: u32 = 20;
-
-impl Backend {
-    /// Graceful stop for `Recorder::stop()`: signal, wait up to
-    /// `STOP_POLL_STEPS` for the child to finalize the container, then kill.
-    /// `Ok` means the encoder exited on its own and the file is whole; `Err`
-    /// means we escalated and whatever is on disk is very likely truncated.
-    ///
-    /// `output` rides along only so the failure message can name the file: a
-    /// killed encoder usually still leaves a playable clip behind, and an
-    /// error that doesn't say where it is sends the user hunting for it.
-    /// Pass an empty path when there is none to name.
-    fn stop_blocking(self, output: &Path) -> Result<()> {
-        match self {
-            Backend::Process {
-                mut child,
-                stderr,
-                #[cfg(target_os = "windows")] mut pumps,
-                #[cfg(target_os = "macos")] sck,
-                #[cfg(target_os = "linux")] mut cast,
-            } => {
-                graceful_signal(&mut child);
-                #[cfg(target_os = "windows")]
-                for p in &pumps { p.signal_stop(); }
-                // On Wayland the frame writer owns ffmpeg's stdin, so stopping
-                // it *is* the graceful signal: the pipe closes and ffmpeg
-                // finalizes the container. Must run before the wait below,
-                // otherwise ffmpeg has no reason to exit.
-                #[cfg(target_os = "linux")]
-                if let Some(c) = cast.as_mut() { c.stop(); }
-                let exited = wait_bounded(&mut child, STOP_POLL_STEPS);
-                if !exited { let _ = child.kill(); }
-                let _ = child.wait();
-                #[cfg(target_os = "windows")]
-                for p in &mut pumps { p.join(); }
-                #[cfg(target_os = "macos")]
-                if let Some(s) = sck { s.stop(); }
-                crate::child_guard::clear_live();
-                if exited {
-                    Ok(())
-                } else {
-                    let where_ = if output.as_os_str().is_empty() {
-                        String::new()
-                    } else {
-                        format!(" Whatever was written so far is at {}.", output.display())
-                    };
-                    Err(Error::Recording(format!(
-                        "the encoder didn't finish within {} seconds of being asked to \
-                         stop, so it was killed. The saved file may be truncated or \
-                         unplayable.{}{}",
-                        STOP_POLL_STEPS / 10,
-                        where_,
-                        stderr.as_error_suffix()
-                    )))
-                }
-            }
-        }
-    }
-
-    /// Stop for `Drop`: graceful signal, bounded ~2 s wait, then SIGKILL only if
-    /// the child is still alive — so a normal teardown always yields a playable
-    /// file but a wedged child can't hang the app.
-    fn stop_with_timeout(self) {
-        match self {
-            Backend::Process {
-                mut child,
-                stderr: _,
-                #[cfg(target_os = "windows")] mut pumps,
-                #[cfg(target_os = "macos")] sck,
-                #[cfg(target_os = "linux")] mut cast,
-            } => {
-                graceful_signal(&mut child);
-                #[cfg(target_os = "windows")]
-                for p in &pumps { p.signal_stop(); }
-                #[cfg(target_os = "linux")]
-                if let Some(c) = cast.as_mut() { c.stop(); }
-                if !wait_bounded(&mut child, DROP_POLL_STEPS) { let _ = child.kill(); }
-                let _ = child.wait();
-                #[cfg(target_os = "windows")]
-                for p in &mut pumps { p.join(); }
-                #[cfg(target_os = "macos")]
-                if let Some(s) = sck { s.stop(); }
-                crate::child_guard::clear_live();
-            }
-        }
-    }
-
-    /// Has the child already exited on its own? `None` while it's still running
-    /// (the healthy case) or if the status can't be read.
-    fn exited(&mut self) -> Option<std::process::ExitStatus> {
-        match self {
-            Backend::Process { child, .. } => child.try_wait().ok().flatten(),
-        }
-    }
-
-    /// Tear down a backend whose child is already known to be dead: reap it and
-    /// release the audio capture threads. No graceful signal — there's nothing
-    /// left to signal.
-    fn discard_dead(self) {
-        match self {
-            Backend::Process {
-                mut child,
-                stderr: _,
-                #[cfg(target_os = "windows")] mut pumps,
-                #[cfg(target_os = "macos")] sck,
-                #[cfg(target_os = "linux")] mut cast,
-            } => {
-                let _ = child.wait();
-                #[cfg(target_os = "windows")]
-                for p in &mut pumps { p.signal_stop(); p.join(); }
-                #[cfg(target_os = "macos")]
-                if let Some(s) = sck { s.stop(); }
-                #[cfg(target_os = "linux")]
-                if let Some(c) = cast.as_mut() { c.stop(); }
-                crate::child_guard::clear_live();
-            }
-        }
-    }
-
-    fn stderr_tail(&self) -> StderrTail {
-        match self {
-            Backend::Process { stderr, .. } => stderr.clone(),
-        }
-    }
-
-    /// Why the *capture source* stopped, if it did.
-    ///
-    /// Only the Wayland backend can lose its source while the encoder is
-    /// perfectly healthy — screen sharing is a grant the user can revoke from
-    /// their desktop at any moment, and ffmpeg would keep writing the last
-    /// frame forever without noticing. Everywhere else the encoder owns the
-    /// capture, so a dead source is a dead child and `exited()` already covers
-    /// it; those platforms answer `None`.
-    fn source_failure(&self) -> Option<String> {
-        match self {
-            #[cfg(target_os = "linux")]
-            Backend::Process { cast, .. } => cast.as_ref().and_then(|c| c.failure()),
-            #[cfg(not(target_os = "linux"))]
-            Backend::Process { .. } => None,
-        }
-    }
-}
-
-/// Poll `child` for up to `steps` × 100 ms. Returns whether it exited. A
-/// `try_wait` error is reported as "did not exit" so the caller escalates
-/// rather than assuming a clean finalize it can't actually confirm.
-fn wait_bounded(child: &mut Child, steps: u32) -> bool {
-    for _ in 0..steps {
-        match child.try_wait() {
-            Ok(Some(_)) => return true,
-            Ok(None)    => std::thread::sleep(std::time::Duration::from_millis(100)),
-            Err(_)      => return false,
-        }
-    }
-    false
-}
-
-// ── stderr ring buffer ──────────────────────────────────────────────────────
-
-/// How many stderr lines we keep. The encoder's actionable message ("No space
-/// left on device", "Device or resource busy") lands within the last handful of
-/// lines before it dies; sixteen is enough context without holding a log.
-const STDERR_TAIL_LINES: usize = 16;
-
-/// The tail of a running recorder's stderr.
-///
-/// Something has to read that pipe for the whole recording — an unread pipe
-/// fills its kernel buffer and stalls the encoder mid-write — so the drain
-/// thread is not optional. Keeping the last few lines instead of discarding
-/// them costs one small ring buffer and is the difference between telling the
-/// user "recording stopped unexpectedly" and telling them the disk is full.
-#[derive(Clone)]
-struct StderrTail {
-    lines: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
-}
-
-impl StderrTail {
-    fn new() -> Self {
-        Self {
-            lines: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::VecDeque::with_capacity(STDERR_TAIL_LINES))),
-        }
-    }
-
-    /// Record one stderr line, dropping the oldest once the ring is full.
-    /// Blank lines and ffmpeg's per-second progress counters are skipped —
-    /// they'd otherwise push every real diagnostic out of a 16-line window.
-    fn push_line(&self, raw: &[u8]) {
-        let line = sanitize_ascii(&String::from_utf8_lossy(raw));
-        let line = line.trim();
-        if line.is_empty() { return; }
-        if line.starts_with("frame=") || line.starts_with("size=") { return; }
-        if let Ok(mut q) = self.lines.lock() {
-            if q.len() == STDERR_TAIL_LINES { q.pop_front(); }
-            q.push_back(line.to_string());
-        }
-    }
-
-    fn text(&self) -> String {
-        match self.lines.lock() {
-            Ok(q)  => q.iter().cloned().collect::<Vec<_>>().join("\n"),
-            Err(_) => String::new(),
-        }
-    }
-
-    /// The tail formatted for appending to an error message, or nothing at all
-    /// when the encoder said nothing worth repeating.
-    fn as_error_suffix(&self) -> String {
-        let t = self.text();
-        if t.is_empty() { String::new() } else { format!("\n\n{t}") }
-    }
-}
-
-/// Fold arbitrary encoder output down to printable ASCII. Framefang renders text
-/// with a 5x7 ASCII bitmap font, so anything else would reach the user as '?'
-/// anyway — and control bytes would corrupt the layout. Doing it here means
-/// every consumer of the tail gets renderable text.
-fn sanitize_ascii(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '?' })
-        .collect()
-}
-
-/// A background thread streaming captured PCM into ffmpeg over a loopback TCP
-/// socket, plus the flag that tells it to stop. Created only by the Windows
-/// WASAPI path; see `windows_audio`.
-#[cfg(target_os = "windows")]
-struct AudioPump {
-    stop:   std::sync::Arc<std::sync::atomic::AtomicBool>,
-    handle: Option<std::thread::JoinHandle<()>>,
-}
-
-#[cfg(target_os = "windows")]
-impl AudioPump {
-    fn signal_stop(&self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-    fn join(&mut self) {
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
-    }
-}
-
-/// The PCM format + loopback port of one started WASAPI source, everything
-/// `build_windows_ffmpeg_args` needs to wire an `-i tcp://…` input. Plain data
-/// (no COM), so the argv builder stays unit-testable on any host.
-#[cfg(any(target_os = "windows", test))]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct WasapiAudioSpec {
-    pub port:        u16,
-    pub sample_rate: u32,
-    pub channels:    u16,
-    pub ffmpeg_fmt:  &'static str,
+    live:   Option<Live>,
+    output: Option<PathBuf>,
 }
 
 impl Recorder {
     pub fn new() -> Self {
-        Self { backend: None, output: None }
+        Recorder { live: None, output: None }
     }
 
-    pub fn is_recording(&self) -> bool { self.backend.is_some() }
-    pub fn output_path(&self) -> Option<&Path> { self.output.as_deref() }
+    pub fn is_recording(&self) -> bool {
+        self.live.is_some()
+    }
 
-    /// Begin recording the whole desktop to `output`.
-    ///
-    /// Shorthand for [`Recorder::start_region`] with no rectangle.
+    /// The file the running recording is writing.
+    pub fn output_path(&self) -> Option<&Path> {
+        self.output.as_deref()
+    }
+
+    /// Record the whole desktop to `output`; the same as
+    /// [`Recorder::start_region`] with no region.
     pub fn start(&mut self, output: PathBuf, options: RecordingOptions)
         -> Result<RecordingOptions>
     {
         self.start_region(output, options, None)
     }
 
-    /// Begin recording to `output`, optionally limited to `region`.
+    /// Record to `output`, the whole desktop or just `region`.
     ///
-    /// `region` is `None` for the whole desktop, or a `CaptureRect` in
-    /// virtual-desktop coordinates — already clamped to the desktop and already
-    /// even-sized by `framefang_core::region::record_rect_from_selection`. Each
-    /// backend translates it into its own coordinate convention; see the module
-    /// docs. Audio behaves identically either way.
+    /// A region is in virtual-desktop pixels and has already been clamped to
+    /// the desktop and made even by
+    /// `framefang_core::region::record_rect_from_selection`; each backend
+    /// turns it into its own form (see the module notes). Sound works the
+    /// same either way.
     ///
-    /// Returns the **effective** options — what's actually being recorded, not
-    /// what was asked for. Audio is best-effort by design: a box with no
-    /// PulseAudio server, or no default sink to monitor, still records video
-    /// rather than failing outright. Callers must render their "recording
-    /// started" toast from this value, otherwise they promise the user a
-    /// microphone track that isn't in the file.
+    /// The answer is what is really being recorded, which can be less than
+    /// `options`: sound is best effort, so a machine without a sound server
+    /// or a default output still records the picture. The "recording
+    /// started" message has to come from this value, or it may promise a
+    /// microphone track the file won't have.
     ///
-    /// Errors if a recording is already in progress, if the parent directory
-    /// can't be created, or if the platform's recording tool isn't available.
+    /// Fails if a recording is already running, if the folder for `output`
+    /// can't be made, or if the recording tool can't be started.
     pub fn start_region(&mut self,
                         output:  PathBuf,
                         options: RecordingOptions,
                         region:  Option<CaptureRect>)
         -> Result<RecordingOptions>
     {
-        if self.is_recording() {
-            return Err(Error::Recording("a recording is already in progress".into()));
+        if self.live.is_some() {
+            return Err(Error::Recording("a recording is already running".into()));
         }
-        if let Some(parent) = output.parent() {
-            std::fs::create_dir_all(parent)?;
+        if let Some(folder) = output.parent() {
+            std::fs::create_dir_all(folder)?;
         }
-        let (backend, effective) = spawn_recorder(&output, options, region)?;
-        self.backend = Some(backend);
-        self.output  = Some(output);
-        Ok(effective)
+        let (live, got) = launch(&output, options, region)?;
+        self.live = Some(live);
+        self.output = Some(output);
+        Ok(got)
     }
 
-    /// Check whether the recording is still alive, cheaply enough to call from
-    /// the event loop every tick.
+    /// Check that the recording is still going, cheaply enough for every
+    /// event-loop tick.
     ///
-    /// Everything between `start()` and `stop()` used to be unobserved: if the
-    /// encoder died at minute three (disk filled, capture device yanked, OOM
-    /// kill) the app kept flashing its REC dot and `stop()` reported success
-    /// over a truncated file. On a dead child this tears the backend down —
-    /// `is_recording()` is false afterwards, so the caller can drop straight
-    /// back to idle — and returns the reason, encoder stderr included.
+    /// An encoder can die in the middle (a full disk, an unplugged device, a
+    /// kill for memory), and without this the app would keep showing REC
+    /// and `stop` would report success over a cut-off file. When it has died
+    /// the recorder is cleaned up and left idle (`is_recording` turns false)
+    /// and the reason comes back, with the encoder's last words.
     ///
-    /// `Ok(())` while the recording is healthy, and when there's no recording
-    /// at all: polling an idle recorder is not an error.
+    /// `Ok` while all is well, and also when nothing is recording.
     pub fn poll_health(&mut self) -> Result<()> {
-        let Some(backend) = self.backend.as_mut() else { return Ok(()) };
+        let Some(live) = self.live.as_mut() else { return Ok(()) };
 
-        // A revoked screen-cast grant leaves the encoder alive and the picture
-        // frozen, so it has to be asked about separately from the child.
-        if let Some(reason) = backend.source_failure() {
-            let path = self.output.clone();
-            if let Some(b) = self.backend.take() { b.stop_with_timeout(); }
-            self.output = None;
-            let where_ = match &path {
-                Some(p) => format!(" What was recorded up to that point is at {}.", p.display()),
-                None    => String::new(),
-            };
-            return Err(Error::Recording(format!("{reason}{where_}")));
+        // A screen share the user revoked leaves the encoder running on a
+        // frozen picture, so the source is asked separately.
+        if let Some(reason) = live.source_failure() {
+            if let Some(live) = self.live.take() {
+                live.wind_down(DROP_WAIT_TICKS);
+            }
+            let saved = self.output.take()
+                .map(|p| format!(" The recording up to that moment is at {}.", p.display()))
+                .unwrap_or_default();
+            return Err(Error::Recording(format!("{reason}{saved}")));
         }
 
-        let Some(status) = backend.exited() else { return Ok(()) };
-
-        let tail = backend.stderr_tail();
-        // `exited()` borrowed self.backend mutably; it's finished with it now.
-        if let Some(b) = self.backend.take() { b.discard_dead(); }
-        let path = self.output.take();
-
-        let where_ = match &path {
-            Some(p) => format!(" Whatever was written so far is at {}.", p.display()),
-            None    => String::new(),
-        };
+        let Some(status) = live.exited() else { return Ok(()) };
+        // Read after the clean-up, so lines the reader thread is still
+        // catching up on make it into the message.
+        let last_words = live.stderr.clone();
+        if let Some(live) = self.live.take() {
+            live.discard_dead();
+        }
+        let saved = self.output.take().map(|p| written_so_far(&p)).unwrap_or_default();
         Err(Error::Recording(format!(
-            "recording stopped unexpectedly: the encoder exited on its own ({status}).{}{}",
-            where_, tail.as_error_suffix()
+            "the recording ended early because the encoder quit by itself ({status}).{saved}{}",
+            last_words.as_suffix()
         )))
     }
 
-    /// Stop the active recording. Returns the output file path on success.
-    /// The OS recorder needs a moment to flush the trailing frames + finalize
-    /// the container — we block on it (bounded; see `STOP_POLL_STEPS`) so the
-    /// file is playable when this returns.
+    /// Stop the recording and hand back the file it made.
+    ///
+    /// The encoder needs a moment to write its last frames and close the
+    /// file; this waits for that (up to 15 seconds), so the file plays as
+    /// soon as this returns.
     pub fn stop(&mut self) -> Result<PathBuf> {
-        let backend = self.backend.take()
-            .ok_or_else(|| Error::Recording("not currently recording".into()))?;
-        let path = self.output.take()
-            .unwrap_or_else(PathBuf::new);
+        let live = self.live.take()
+            .ok_or_else(|| Error::Recording("there is no recording to stop".into()))?;
+        let path = self.output.take().unwrap_or_default();
+        let finished = live.stop_blocking(&path);
 
-        let finalized = backend.stop_blocking(&path);
-
-        // Late-failure catch: the encoder can clear the startup window yet still
-        // fail to produce a file (it died mid-recording, or a downstream mux
-        // error left nothing on disk). Don't hand back a path to nothing.
-        // Checked before the finalize verdict because "no file at all" is the
-        // more actionable of the two messages.
-        if !path.as_os_str().is_empty() {
-            match std::fs::metadata(&path) {
-                Ok(m) if m.len() > 0 => {}
-                Ok(_) => return Err(Error::Recording(format!(
-                    "recording stopped but the saved file is empty: {} — the \
-                     encoder likely failed mid-recording.", path.display()))),
-                Err(_) => return Err(Error::Recording(format!(
-                    "recording stopped but no file was written to {} — the \
-                     encoder likely failed to start.", path.display()))),
-            }
+        // The encoder can get through startup and still leave nothing usable
+        // behind (it died later, or the muxer failed). Never hand back a path
+        // to nothing; and "no file" says more than "had to be killed", so it
+        // is checked first.
+        let named = !path.as_os_str().is_empty();
+        let problem = match named.then(|| std::fs::metadata(&path).map(|meta| meta.len())) {
+            Some(Ok(0)) => Some("is empty: the encoder probably failed partway through"),
+            Some(Err(_)) => Some("was never written: the encoder probably never got going"),
+            _ => None,
+        };
+        if let Some(problem) = problem {
+            return Err(Error::Recording(format!(
+                "the recording stopped, but {} {problem}.", path.display())));
         }
-        finalized?;
-        Ok(path)
+        finished.map(|()| path)
     }
 }
 
 impl Drop for Recorder {
     fn drop(&mut self) {
-        if let Some(b) = self.backend.take() {
-            b.stop_with_timeout();
+        if let Some(live) = self.live.take() {
+            live.wind_down(DROP_WAIT_TICKS);
         }
     }
 }
 
-// ── ffmpeg lookup (shared by Linux + Windows) ───────────────────────────────
+/// " What it wrote so far is at <path>." for messages about a recording that
+/// went wrong: a killed or crashed encoder usually still leaves a playable
+/// clip, and the user shouldn't have to hunt for it.
+fn written_so_far(path: &Path) -> String {
+    format!(" What it wrote so far is at {}.", path.display())
+}
 
-/// Where Framefang keeps the FFmpeg it downloads for people who have none:
-/// `%LOCALAPPDATA%\Framefang\ffmpeg\ffmpeg.exe`. Windows only; elsewhere
-/// FFmpeg comes from the system's package manager.
-pub fn downloaded_ffmpeg_path() -> Option<PathBuf> {
+// ---- The running recording -------------------------------------------------
+
+/// How long one wait step lasts while an encoder finishes.
+const TICK: Duration = Duration::from_millis(100);
+
+/// `stop` waits up to 15 s for the file to be finished. A long 4K recording
+/// can take seconds to write its index, and killing it early ruins exactly
+/// the file the user asked for; but this is the UI thread, so it is bounded.
+const STOP_WAIT_TICKS: u32 = 150;
+
+/// On drop, or after a lost screen share, nobody is waiting on the file, so
+/// 2 s is enough.
+const DROP_WAIT_TICKS: u32 = 20;
+
+/// A recording in progress: the child doing the encoding (`ffmpeg` or
+/// `screencapture`) plus whatever feeds it on this OS.
+struct Live {
+    child:  Child,
+    /// The end of the child's stderr, kept up to date by a reader thread.
+    stderr: RecentStderr,
+    /// Windows: the WASAPI threads sending sound to ffmpeg.
     #[cfg(target_os = "windows")]
-    {
-        std::env::var_os("LOCALAPPDATA")
-            .map(|d| PathBuf::from(d).join("Framefang").join("ffmpeg").join("ffmpeg.exe"))
+    pumps:  Vec<AudioPump>,
+    /// macOS: the ScreenCaptureKit session sending system sound to ffmpeg,
+    /// when system sound was asked for.
+    #[cfg(target_os = "macos")]
+    sck:    Option<macos_audio::SckSession>,
+    /// Linux: the screen cast writing frames into ffmpeg's stdin, on Wayland
+    /// only (x11grab reads the screen itself).
+    #[cfg(target_os = "linux")]
+    cast:   Option<wayland_cast::CastSession>,
+}
+
+impl Live {
+    /// A recording with nothing feeding it but the child itself.
+    fn bare(child: Child, stderr: RecentStderr) -> Self {
+        Live {
+            child,
+            stderr,
+            #[cfg(target_os = "windows")]
+            pumps: Vec::new(),
+            #[cfg(target_os = "macos")]
+            sck: None,
+            #[cfg(target_os = "linux")]
+            cast: None,
+        }
     }
-    #[cfg(not(target_os = "windows"))]
-    {
+
+    /// Tell the feeders to stop, before waiting on the encoder. On Wayland
+    /// this is what ends the recording: the frame writer owns ffmpeg's stdin,
+    /// and its pipe closing is ffmpeg's cue to finish.
+    fn halt_feeds(&mut self) {
+        #[cfg(target_os = "windows")]
+        for pump in &self.pumps {
+            pump.request_stop();
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(cast) = self.cast.as_mut() {
+            cast.stop();
+        }
+    }
+
+    /// Release what is left of the feeders once the encoder is gone.
+    fn release_feeds(&mut self) {
+        #[cfg(target_os = "windows")]
+        for pump in &mut self.pumps {
+            pump.finish();
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(sck) = self.sck.take() {
+            sck.stop();
+        }
+    }
+
+    /// Ask the encoder to finish, give it `ticks` steps to do so, kill it if
+    /// it hasn't, and clean up. True when it finished on its own, meaning the
+    /// file is whole.
+    fn wind_down(mut self, ticks: u32) -> bool {
+        ask_to_finish(&mut self.child);
+        self.halt_feeds();
+        let finished = exits_within(&mut self.child, ticks);
+        if !finished {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+        self.release_feeds();
+        crate::child_guard::clear_live();
+        finished
+    }
+
+    /// The careful stop behind `Recorder::stop`. An error means the encoder
+    /// had to be killed, so the file is probably cut short; `output` (empty
+    /// if unknown) is named in that message.
+    fn stop_blocking(self, output: &Path) -> Result<()> {
+        let last_words = self.stderr.clone();
+        if self.wind_down(STOP_WAIT_TICKS) {
+            return Ok(());
+        }
+        let saved = if output.as_os_str().is_empty() { String::new() } else { written_so_far(output) };
+        Err(Error::Recording(format!(
+            "the encoder was still busy {} seconds after being asked to stop, so it was ended by \
+             force. The file may be cut short or fail to play.{saved}{}",
+            STOP_WAIT_TICKS / 10,
+            last_words.as_suffix()
+        )))
+    }
+
+    /// Clean up after an encoder that has already exited. There is nothing
+    /// left to ask nicely.
+    fn discard_dead(mut self) {
+        let _ = self.child.wait();
+        self.halt_feeds();
+        self.release_feeds();
+        crate::child_guard::clear_live();
+    }
+
+    /// The child's exit status if it has quit; `None` while it runs (or if
+    /// that can't be told).
+    fn exited(&mut self) -> Option<ExitStatus> {
+        self.child.try_wait().ok().flatten()
+    }
+
+    /// Why the picture stopped coming, when the encoder is fine but its
+    /// source isn't.
+    ///
+    /// Only Wayland can get here: the screen share is a grant the user can
+    /// withdraw at any time, and ffmpeg would go on repeating the last frame
+    /// without noticing. Elsewhere the encoder reads the screen itself, so a
+    /// lost source is a dead child, which `exited` already sees.
+    fn source_failure(&self) -> Option<String> {
+        #[cfg(target_os = "linux")]
+        return self.cast.as_ref().and_then(|cast| cast.failure());
+        #[cfg(not(target_os = "linux"))]
         None
     }
 }
 
-/// The FFmpeg picked in Settings (`FfmpegPath`), set by the tray whenever
-/// settings load or change; `None` to find one automatically.
-static CHOSEN_FFMPEG: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
-
-pub fn set_chosen_ffmpeg(path: Option<PathBuf>) {
-    *CHOSEN_FFMPEG.lock().unwrap_or_else(|e| e.into_inner()) = path;
+/// Wait up to `ticks` steps for `child` to exit. A `try_wait` error counts as
+/// still running, so the caller kills rather than trusting a finish it can't
+/// see.
+fn exits_within(child: &mut Child, ticks: u32) -> bool {
+    for _ in 0..ticks {
+        match child.try_wait() {
+            Ok(None) => std::thread::sleep(TICK),
+            settled => return settled.is_ok(),
+        }
+    }
+    false // still running
 }
 
-/// Locate a usable `ffmpeg` binary: the one lookup recording, conversion and
-/// Settings all share. The FFmpeg picked in Settings comes first while that
-/// file exists; otherwise `auto_ffmpeg`.
+/// Ask a recorder to finish its file and exit.
 ///
-/// Returns `None` if no candidate is found — callers fall back to plain
-/// `"ffmpeg"` so the existing "ffmpeg not found in PATH" error message still
-/// surfaces from `Command::spawn`.
-pub fn locate_ffmpeg() -> Option<PathBuf> {
-    let chosen = CHOSEN_FFMPEG.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    locate_ffmpeg_with(chosen.as_deref())
-}
-
-/// `locate_ffmpeg` with `chosen` as the picked FFmpeg (Settings asks this of
-/// its draft before the tray has the change).
-pub fn locate_ffmpeg_with(chosen: Option<&Path>) -> Option<PathBuf> {
-    if let Some(c) = chosen.filter(|c| c.is_file()) { return Some(c.to_path_buf()); }
-    auto_ffmpeg()
-}
-
-/// Find FFmpeg without the user's pick. Search order:
-///
-///   1. Next to our own executable (a local build's copy).
-///   2. macOS `.app/Contents/Resources/ffmpeg`.
-///   3. `PATH`, so an FFmpeg the user already has always wins.
-///   4. The copy Framefang downloaded (`downloaded_ffmpeg_path`).
-pub fn auto_ffmpeg() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?;
-    let bundle_name = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
-    let next_to_us = dir.join(bundle_name);
-    if next_to_us.is_file() { return Some(next_to_us); }
-
-    if cfg!(target_os = "macos") {
-        if let Some(contents) = dir.parent() {
-            let mac_resources = contents.join("Resources").join("ffmpeg");
-            if mac_resources.is_file() { return Some(mac_resources); }
-        }
-    }
-
-    if let Ok(path_var) = std::env::var("PATH") {
-        let sep = if cfg!(windows) { ";" } else { ":" };
-        for p in path_var.split(sep) {
-            let candidate = std::path::Path::new(p).join(bundle_name);
-            if candidate.is_file() { return Some(candidate); }
-        }
-    }
-    downloaded_ffmpeg_path().filter(|p| p.is_file())
-}
-
-// ── platform spawn / signal ─────────────────────────────────────────────────
-
-#[cfg(target_os = "linux")]
-fn spawn_recorder(output: &Path, options: RecordingOptions, region: Option<CaptureRect>)
-    -> Result<(Backend, RecordingOptions)>
-{
-    // Wayland is a different capture stack entirely — `-f x11grab` against
-    // XWayland silently captures only XWayland clients (typically a black
-    // frame), and on Wayland-only sessions DISPLAY may be unset. The two paths
-    // share their audio handling and nothing else.
-    if crate::session::is_wayland() {
-        return spawn_recorder_wayland(output, options, region);
-    }
-    let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into());
-    let path = output.to_str().ok_or_else(||
-        Error::Recording("non-UTF-8 output path".into()))?;
-
-    let (opt, monitor_source) = probe_pulse_sources(options);
-
-    let args = build_linux_ffmpeg_args(&display, path, opt, monitor_source.as_deref(), region);
-    let ffmpeg = locate_ffmpeg().unwrap_or_else(|| PathBuf::from("ffmpeg"));
-    let res = crate::child_guard::spawn_guarded(
-        Command::new(&ffmpeg)
-            .args(&args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped()));
-
-    match res {
-        Ok(c) => {
-            let (child, stderr) = watch_recorder_startup(c)?;
-            Ok((Backend::Process { child, stderr, cast: None }, opt))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::Recording(
-            "ffmpeg isn't on PATH. Install it with: sudo apt install ffmpeg".into()
-        )),
-        Err(e) => Err(Error::Recording(format!("failed to spawn ffmpeg: {e}"))),
-    }
-}
-
-/// Work out which PulseAudio inputs are actually usable, given what was asked
-/// for. Shared by both Linux capture stacks: PipeWire's Pulse shim serves the
-/// same `-f pulse` inputs on Wayland that PulseAudio proper serves on X11, so
-/// the audio half of a recording is identical either way.
-///
-/// Returns the **effective** options plus the monitor source name to pass to
-/// ffmpeg. Audio is best-effort by design — a box with no sound server, or no
-/// default sink to monitor, records video rather than failing outright — so the
-/// caller must report from the returned options, not from what was requested.
-#[cfg(target_os = "linux")]
-fn probe_pulse_sources(options: RecordingOptions) -> (RecordingOptions, Option<String>) {
-    // Pulse must be reachable for either audio source to work — `pactl info`
-    // returns 0 when a server is up. If it isn't reachable we silently drop
-    // back to video-only so headless / no-audio boxes still record cleanly.
-    let pulse_ok = Command::new("pactl")
-        .arg("info")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    let mut opt = if pulse_ok { options } else { RecordingOptions::NONE };
-
-    // System-audio source is the default sink's monitor (`<sink>.monitor`).
-    // If we can't name one, drop system audio and keep the rest: video and a
-    // requested mic are still perfectly recordable without it.
-    let monitor_source: Option<String> = if opt.system_audio {
-        match default_pulse_monitor_source() {
-            Some(m) => Some(m),
-            None    => { opt.system_audio = false; None }
-        }
-    } else { None };
-
-    (opt, monitor_source)
-}
-
-/// Wayland: ScreenCast portal -> PipeWire -> raw frames on ffmpeg's stdin.
-///
-/// Order matters. The cast is negotiated *first* because only it can say how
-/// big the frames are and in what layout, and ffmpeg needs both on its command
-/// line before it will read a single byte of `-f rawvideo`. Anything that goes
-/// wrong before ffmpeg exists — no portal, the user cancelling the share
-/// prompt, a compositor handing out buffers we can't read — surfaces as an
-/// error here, with no file created and nothing claimed to have been saved.
-#[cfg(target_os = "linux")]
-fn spawn_recorder_wayland(output: &Path, options: RecordingOptions, region: Option<CaptureRect>)
-    -> Result<(Backend, RecordingOptions)>
-{
-    let path = output.to_str().ok_or_else(||
-        Error::Recording("non-UTF-8 output path".into()))?;
-
-    let (opt, monitor_source) = probe_pulse_sources(options);
-
-    // Blocks while the user answers their desktop's screen-sharing prompt.
-    let mut cast = wayland_cast::CastSession::start()?;
-    let format = cast.format();
-
-    let args = build_wayland_ffmpeg_args(
-        format.pix_fmt, format.width, format.height,
-        wayland_cast::TARGET_FPS, path, opt, monitor_source.as_deref(), region);
-    let ffmpeg = locate_ffmpeg().unwrap_or_else(|| PathBuf::from("ffmpeg"));
-    let res = crate::child_guard::spawn_guarded(
-        Command::new(&ffmpeg)
-            .args(&args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped()));
-
-    let mut child = match res {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Error::Recording(
-            "ffmpeg isn't on PATH. Install it with: sudo apt install ffmpeg".into()
-        )),
-        Err(e) => return Err(Error::Recording(format!("failed to spawn ffmpeg: {e}"))),
-    };
-
-    // Hand ffmpeg's stdin to the frame writer. From here on `child.stdin` is
-    // `None`, which is exactly what makes `graceful_signal`'s `q` a no-op on
-    // this backend — stopping the writer closes the pipe instead.
-    let Some(stdin) = child.stdin.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(Error::Recording("ffmpeg started without a usable stdin pipe".into()));
-    };
-    if let Err(e) = cast.attach(stdin) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(e);
-    }
-
-    match watch_recorder_startup(child) {
-        Ok((child, stderr)) => Ok((Backend::Process { child, stderr, cast: Some(cast) }, opt)),
-        Err(e) => { cast.stop(); Err(e) }
-    }
-}
-
-/// Name the PulseAudio monitor source for the current default sink, i.e. the
-/// pseudo-input that carries what the speakers are playing.
-///
-/// `pactl get-default-sink` can exit non-zero, or exit zero and print nothing,
-/// when there's no server or no default sink. Both used to be folded into a
-/// literal `".monitor"` source name, which ffmpeg can't open — and since a
-/// failed input aborts the whole command, a missing sink took the video down
-/// with it. `None` here means "record without system audio".
-#[cfg(target_os = "linux")]
-fn default_pulse_monitor_source() -> Option<String> {
-    let out = Command::new("pactl")
-        .arg("get-default-sink")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() { return None; }
-    let sink = String::from_utf8(out.stdout).ok()?;
-    let sink = sink.trim();
-    if sink.is_empty() { return None; }
-    Some(format!("{sink}.monitor"))
-}
-
-/// Build the ffmpeg argv for Linux X11 capture. Pure function so the test
-/// suite can assert exact argv composition without spawning a process.
-///
-/// `region` limits the grab: x11grab takes the size as `-video_size` *before*
-/// the input and the top-left corner as a `+X,Y` suffix on the display name
-/// (`:0.0+120,80`). Those coordinates are measured from the X root window's
-/// corner, which is the virtual desktop's corner — hence `offset_x/offset_y`
-/// rather than the absolute fields.
-#[cfg(any(target_os = "linux", test))]
-pub(crate) fn build_linux_ffmpeg_args(
-    display:        &str,
-    output_path:    &str,
-    options:        RecordingOptions,
-    monitor_source: Option<&str>,
-    region:         Option<CaptureRect>,
-) -> Vec<String> {
-    let mut a: Vec<String> = Vec::with_capacity(36);
-    let push = |a: &mut Vec<String>, s: &str| a.push(s.to_string());
-    push(&mut a, "-y");
-    push(&mut a, "-f"); push(&mut a, "x11grab");
-    push(&mut a, "-framerate"); push(&mut a, "30");
-    match region {
-        Some(r) => {
-            push(&mut a, "-video_size"); a.push(r.video_size());
-            push(&mut a, "-i");
-            a.push(format!("{display}+{},{}", r.offset_x(), r.offset_y()));
-        }
-        None => { push(&mut a, "-i"); push(&mut a, display); }
-    }
-    if options.mic {
-        push(&mut a, "-f"); push(&mut a, "pulse");
-        push(&mut a, "-i"); push(&mut a, "default");
-    }
-    if let Some(m) = monitor_source {
-        push(&mut a, "-f"); push(&mut a, "pulse");
-        push(&mut a, "-i"); push(&mut a, m);
-    }
-    push_linux_encode_tail(&mut a, options.mic, monitor_source.is_some());
-    push(&mut a, output_path);
-    a
-}
-
-/// The encode half of a Linux ffmpeg command line: H.264 video plus whatever
-/// mixing the requested Pulse inputs need.
-///
-/// Shared by the X11 and Wayland builders because it is genuinely the same
-/// command in both: video is always input 0 (x11grab there, `pipe:0` here),
-/// the mic is input 1 when present, and the sink monitor is the next index
-/// after that. Only the input half differs between the two stacks.
-#[cfg(any(target_os = "linux", test))]
-fn push_linux_encode_tail(a: &mut Vec<String>, mic: bool, monitor: bool) {
-    let push = |a: &mut Vec<String>, s: &str| a.push(s.to_string());
-    push(a, "-c:v"); push(a, "libx264");
-    push(a, "-preset"); push(a, "ultrafast");
-    push(a, "-pix_fmt"); push(a, "yuv420p");
-    push(a, "-vf"); push(a, "pad=ceil(iw/2)*2:ceil(ih/2)*2");
-    match (mic, monitor) {
-        (true, true) => {
-            push(a, "-filter_complex");
-            push(a, "[1:a][2:a]amix=inputs=2:duration=longest:dropout_transition=0[aout]");
-            push(a, "-map"); push(a, "0:v");
-            push(a, "-map"); push(a, "[aout]");
-            push(a, "-c:a"); push(a, "aac");
-            push(a, "-b:a"); push(a, "160k");
-        }
-        (true, false) | (false, true) => {
-            push(a, "-c:a"); push(a, "aac");
-            push(a, "-b:a"); push(a, "160k");
-        }
-        (false, false) => {}
-    }
-}
-
-/// Build the ffmpeg argv for a Wayland recording: raw frames on stdin as input
-/// 0, the same Pulse inputs the X11 path uses after it. Pure function so the
-/// test suite can assert the argv without a compositor, a portal, or PipeWire.
-///
-/// The two `-pix_fmt` flags are not a typo. The first sits before `-i` and
-/// describes the bytes we're about to write; the second sits after every input
-/// and asks for `yuv420p` in the file, which is what makes the MP4 play in
-/// consumer players. `-framerate` before `-i` is what gives the stream its
-/// timing — `-f rawvideo` carries no timestamps at all, which is why the
-/// writer thread paces itself at exactly this rate.
-#[cfg(any(target_os = "linux", test))]
-pub(crate) fn build_wayland_ffmpeg_args(
-    pix_fmt:        &str,
-    width:          u32,
-    height:         u32,
-    fps:            u32,
-    output_path:    &str,
-    options:        RecordingOptions,
-    monitor_source: Option<&str>,
-    region:         Option<CaptureRect>,
-) -> Vec<String> {
-    let mut a: Vec<String> = Vec::with_capacity(40);
-    let push = |a: &mut Vec<String>, s: &str| a.push(s.to_string());
-    push(&mut a, "-y");
-    push(&mut a, "-f"); push(&mut a, "rawvideo");
-    push(&mut a, "-pix_fmt"); a.push(pix_fmt.to_string());
-    push(&mut a, "-video_size"); a.push(format!("{width}x{height}"));
-    push(&mut a, "-framerate"); a.push(fps.to_string());
-    // Keeps the demuxer from dropping frames while the encoder is busy, the
-    // same reason the Windows audio inputs set it.
-    push(&mut a, "-thread_queue_size"); push(&mut a, "1024");
-    push(&mut a, "-i"); push(&mut a, "pipe:0");
-    if options.mic {
-        push(&mut a, "-f"); push(&mut a, "pulse");
-        push(&mut a, "-i"); push(&mut a, "default");
-    }
-    if let Some(m) = monitor_source {
-        push(&mut a, "-f"); push(&mut a, "pulse");
-        push(&mut a, "-i"); a.push(m.to_string());
-    }
-    push_linux_encode_tail(&mut a, options.mic, monitor_source.is_some());
-    // The cast hands over whole frames — there is no `-video_size`/offset
-    // input option on a raw pipe the way x11grab has — so a region becomes a
-    // `crop` ahead of the even-dimension `pad` every Linux recording gets.
-    // The offsets are measured from the desktop corner, which is where the
-    // cast's frame starts when the user shares the whole desktop; a crop that
-    // falls outside the shared surface makes ffmpeg fail at startup, which
-    // `watch_recorder_startup` turns into an error rather than a silent
-    // full-screen file.
-    if let Some(r) = region {
-        if let Some(i) = a.iter().position(|s| s == "-vf") {
-            a[i + 1] = format!("crop={}:{}:{}:{},{}",
-                               r.width, r.height, r.offset_x(), r.offset_y(), a[i + 1]);
-        }
-    }
-    push(&mut a, output_path);
-    a
-}
-
-// ── macOS: screencapture / avfoundation video + mic, ScreenCaptureKit audio ──
-//
-// `screencapture -v` (dependency-free) still handles the video-only common
-// case. When audio is requested, video + optional mic come through ffmpeg's
-// avfoundation input, and **system audio** comes from ScreenCaptureKit
-// (recorder_macos_audio.rs) streamed into ffmpeg over a loopback socket — so it
-// works with no BlackHole / Aggregate device. ffmpeg muxes (and `amix`es when
-// both mic and system audio are present), exactly like the Linux path.
-#[cfg(target_os = "macos")]
-fn spawn_recorder(output: &Path, options: RecordingOptions, region: Option<CaptureRect>)
-    -> Result<(Backend, RecordingOptions)>
-{
-    let path = output.to_str().ok_or_else(||
-        Error::Recording("non-UTF-8 output path".into()))?;
-
-    // Video-only: keep the dependency-free built-in. stdin stays null, which
-    // is how `graceful_signal` tells the two backends apart.
-    if !options.has_audio() {
-        let child = crate::child_guard::spawn_guarded(
-            Command::new("screencapture")
-                .args(build_macos_screencapture_args(path, region))
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped()))
-            .map_err(|e| Error::Recording(format!("failed to spawn screencapture: {e}")))?;
-        let (child, stderr) = watch_recorder_startup(child)?;
-        return Ok((Backend::Process { child, stderr, sck: None }, RecordingOptions::NONE));
-    }
-
-    // Audio requested → ffmpeg avfoundation (video + optional mic).
-    let ffmpeg = locate_ffmpeg().ok_or_else(|| Error::Recording(
-        "recording audio on macOS needs ffmpeg, which wasn't found next to \
-         Framefang or on your PATH. Install it with: brew install ffmpeg — then \
-         retry. (Video-only recording works without ffmpeg.)".into()
-    ))?;
-
-    let listing = list_avfoundation_devices(&ffmpeg);
-    let (video_devs, audio_devs) = parse_avfoundation_devices(&listing);
-    let screen_idx = pick_macos_screen_index(&video_devs)?;
-    let mic_idx = if options.mic { pick_macos_mic_device(&audio_devs) } else { None };
-
-    // System audio via ScreenCaptureKit, started before we build the argv so we
-    // know the loopback port. If ffmpeg later fails to spawn we tear this down.
-    let sck = if options.system_audio {
-        Some(macos_audio::start_system_audio()?)
-    } else {
-        None
-    };
-    let sck_port = sck.as_ref().map(|s| s.port);
-
-    // What we're actually about to record: a requested mic that avfoundation
-    // never listed isn't in the file, whatever the caller asked for.
-    let effective = RecordingOptions {
-        mic:          mic_idx.is_some(),
-        system_audio: sck.is_some(),
-    };
-
-    let args = build_macos_ffmpeg_args(screen_idx, mic_idx, sck_port, path, region);
-    let res = crate::child_guard::spawn_guarded(
-        Command::new(&ffmpeg)
-            .args(&args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped()));
-
-    match res {
-        Ok(child) => match watch_recorder_startup(child) {
-            Ok((child, stderr)) => Ok((Backend::Process { child, stderr, sck }, effective)),
-            Err(e)              => { if let Some(s) = sck { s.stop(); } Err(e) }
-        },
-        Err(e) => {
-            if let Some(s) = sck { s.stop(); }
-            if e.kind() == std::io::ErrorKind::NotFound {
-                Err(Error::Recording("ffmpeg isn't installed. Install it with: brew install ffmpeg".into()))
-            } else {
-                Err(Error::Recording(format!("failed to spawn ffmpeg: {e}")))
-            }
-        }
-    }
-}
-
-/// Build the `screencapture` argv for the dependency-free video-only path.
-///
-/// `-R x,y,w,h` limits the capture to a rectangle in macOS' global display
-/// space, whose origin is the **main display's** top-left corner — the same
-/// origin `CaptureRect`'s absolute fields use, so no translation is needed.
-/// That space is measured in *points*, though, while the rectangle arrives in
-/// device pixels (the overlay is stitched at device resolution), so on a
-/// Retina / scaled display the fields are divided by the capture scale first
-/// — otherwise the recorded area lands 2x too far right/down and 2x too big.
-/// Pure function so the argv can be asserted without a Mac.
-#[cfg(any(target_os = "macos", test))]
-pub(crate) fn build_macos_screencapture_args(
-    output_path: &str,
-    region:      Option<CaptureRect>,
-) -> Vec<String> {
-    let mut a: Vec<String> = Vec::with_capacity(4);
-    a.push("-v".to_string());
-    if let Some(r) = region {
-        // `screencapture` parses its options with getopt, so the rectangle can
-        // ride in its own argv slot rather than being glued to the flag.
-        a.push("-R".to_string());
-        let (x, y, w, h) = r.points();
-        a.push(format!("{x},{y},{w},{h}"));
-    }
-    a.push(output_path.to_string());
-    a
-}
-
-/// Build the ffmpeg argv for macOS: avfoundation video (+ optional fused mic)
-/// as input 0, plus an optional ScreenCaptureKit system-audio TCP input. When
-/// both mic and system audio are present they're `amix`ed to one stereo AAC
-/// track. Pure function so the suite can assert argv shape without a Mac.
-///
-/// avfoundation has no capture-rectangle option, so a `region` becomes a
-/// `crop` filter ahead of the usual even-dimension `pad`. Crop coordinates are
-/// relative to the frame the screen device delivers — the main display — which
-/// is also where macOS' global coordinate origin sits, so the absolute fields
-/// go in unchanged. That frame is delivered at device resolution, so unlike
-/// `screencapture -R` the pixel fields are the right unit here. A region living entirely on a *secondary* display is
-/// outside that frame; the video-only `screencapture` path has no such limit.
-#[cfg(any(target_os = "macos", test))]
-pub(crate) fn build_macos_ffmpeg_args(
-    screen_idx: usize,
-    mic_idx:    Option<usize>,
-    sck_port:   Option<u16>,
-    output_path: &str,
-    region:     Option<CaptureRect>,
-) -> Vec<String> {
-    let mut a: Vec<String> = Vec::with_capacity(32);
-    let push = |a: &mut Vec<String>, s: &str| a.push(s.to_string());
-    push(&mut a, "-y");
-    push(&mut a, "-f"); push(&mut a, "avfoundation");
-    push(&mut a, "-framerate"); push(&mut a, "30");
-    // avfoundation fuses one video + one audio device into a single token
-    // "<video>:<audio>"; an empty audio half means video-only.
-    let input = match mic_idx {
-        Some(ai) => format!("{screen_idx}:{ai}"),
-        None      => format!("{screen_idx}:"),
-    };
-    push(&mut a, "-i"); a.push(input);
-    // System audio (ScreenCaptureKit) is a raw-PCM TCP input — input index 1.
-    if let Some(port) = sck_port {
-        push(&mut a, "-thread_queue_size"); push(&mut a, "1024");
-        push(&mut a, "-f"); push(&mut a, "f32le");
-        push(&mut a, "-ar"); push(&mut a, "48000");
-        push(&mut a, "-ac"); push(&mut a, "2");
-        push(&mut a, "-i"); a.push(format!("tcp://127.0.0.1:{port}"));
-    }
-    push(&mut a, "-c:v"); push(&mut a, "libx264");
-    push(&mut a, "-preset"); push(&mut a, "ultrafast");
-    push(&mut a, "-pix_fmt"); push(&mut a, "yuv420p");
-    push(&mut a, "-vf"); a.push(video_filter_chain(region));
-    match (mic_idx.is_some(), sck_port.is_some()) {
-        (true, true) => {
-            // Mic (avf input 0 audio) + system audio (input 1) → one track.
-            push(&mut a, "-filter_complex");
-            push(&mut a, "[0:a][1:a]amix=inputs=2:duration=longest:dropout_transition=0[aout]");
-            push(&mut a, "-map"); push(&mut a, "0:v");
-            push(&mut a, "-map"); push(&mut a, "[aout]");
-            push(&mut a, "-c:a"); push(&mut a, "aac");
-            push(&mut a, "-b:a"); push(&mut a, "160k");
-            push(&mut a, "-ac"); push(&mut a, "2");
-        }
-        (true, false) => {
-            push(&mut a, "-map"); push(&mut a, "0:v");
-            push(&mut a, "-map"); push(&mut a, "0:a");
-            push(&mut a, "-c:a"); push(&mut a, "aac");
-            push(&mut a, "-b:a"); push(&mut a, "160k");
-            push(&mut a, "-ac"); push(&mut a, "2");
-        }
-        (false, true) => {
-            push(&mut a, "-map"); push(&mut a, "0:v");
-            push(&mut a, "-map"); push(&mut a, "1:a");
-            push(&mut a, "-c:a"); push(&mut a, "aac");
-            push(&mut a, "-b:a"); push(&mut a, "160k");
-            push(&mut a, "-ac"); push(&mut a, "2");
-        }
-        (false, false) => {}
-    }
-    push(&mut a, output_path);
-    a
-}
-
-/// The `-vf` chain for the macOS avfoundation path: an optional `crop` for a
-/// region, then the even-dimension `pad` every platform applies. `pad` stays
-/// even when cropping — a `CaptureRect` is already even, so it is a no-op there
-/// and a safety net for the full-screen case (an odd-sized display).
-#[cfg(any(target_os = "macos", test))]
-fn video_filter_chain(region: Option<CaptureRect>) -> String {
-    const PAD: &str = "pad=ceil(iw/2)*2:ceil(ih/2)*2";
-    match region {
-        Some(r) => format!("crop={}:{}:{}:{},{PAD}", r.width, r.height, r.x, r.y),
-        None    => PAD.to_string(),
-    }
-}
-
-/// Run `ffmpeg -f avfoundation -list_devices true -i ""`. avfoundation writes
-/// the device table to stderr and exits non-zero (it never actually opens a
-/// stream) — that's expected, we only want the stderr text.
-#[cfg(target_os = "macos")]
-fn list_avfoundation_devices(ffmpeg: &Path) -> String {
-    let out = Command::new(ffmpeg)
-        .args(["-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""])
-        .stdin(Stdio::null())
-        .output();
-    match out {
-        Ok(o) => String::from_utf8_lossy(&o.stderr).into_owned(),
-        Err(_) => String::new(),
-    }
-}
-
-/// Parse the avfoundation `-list_devices` stderr into `(video, audio)` device
-/// lists of `(index, name)`. Pure so it's unit-testable off a Mac. The table
-/// looks like:
-///   [AVFoundation indev @ ..] AVFoundation video devices:
-///   [AVFoundation indev @ ..] [0] FaceTime HD Camera
-///   [AVFoundation indev @ ..] [1] Capture screen 0
-///   [AVFoundation indev @ ..] AVFoundation audio devices:
-///   [AVFoundation indev @ ..] [0] MacBook Pro Microphone
-///   [AVFoundation indev @ ..] [1] BlackHole 2ch
-#[cfg(any(target_os = "macos", test))]
-pub(crate) fn parse_avfoundation_devices(stderr: &str) -> (Vec<(usize, String)>, Vec<(usize, String)>) {
-    #[derive(PartialEq)]
-    enum Section { None, Video, Audio }
-    let mut sect = Section::None;
-    let mut video = Vec::new();
-    let mut audio = Vec::new();
-    for line in stderr.lines() {
-        let low = line.to_ascii_lowercase();
-        if low.contains("video devices:") { sect = Section::Video; continue; }
-        if low.contains("audio devices:") { sect = Section::Audio; continue; }
-        // Pull "[N] Name" — N is the device index ffmpeg expects in the -i spec.
-        let Some(open) = line.find('[') else { continue };
-        // Skip the leading "[AVFoundation indev @ 0x..]" log prefix bracket(s);
-        // the device-index bracket is the last "[<digits>]" on the line.
-        let Some(idx_open) = line.rfind('[') else { continue };
-        let _ = open;
-        let Some(idx_close) = line[idx_open..].find(']').map(|p| idx_open + p) else { continue };
-        let inner = &line[idx_open + 1..idx_close];
-        let Ok(idx) = inner.trim().parse::<usize>() else { continue };
-        let name = line[idx_close + 1..].trim().to_string();
-        if name.is_empty() { continue; }
-        match sect {
-            Section::Video => video.push((idx, name)),
-            Section::Audio => audio.push((idx, name)),
-            Section::None  => {}
-        }
-    }
-    (video, audio)
-}
-
-/// Choose the screen-capture video device index. avfoundation exposes the
-/// display as a "Capture screen N" pseudo-camera; pick the first one. Errors
-/// if none is present (e.g. Screen Recording permission not granted, which
-/// makes the screen devices vanish from the listing).
-#[cfg(any(target_os = "macos", test))]
-pub(crate) fn pick_macos_screen_index(video: &[(usize, String)]) -> Result<usize> {
-    video.iter()
-        .find(|(_, n)| n.to_ascii_lowercase().contains("capture screen"))
-        .map(|(i, _)| *i)
-        .ok_or_else(|| Error::Recording(
-            "no screen-capture device found. Grant Framefang Screen Recording \
-             permission in System Settings > Privacy & Security > Screen \
-             Recording, then reopen Framefang and try again.".into()
-        ))
-}
-
-/// Pick the avfoundation microphone device index. System audio no longer comes
-/// through here — it's captured natively by ScreenCaptureKit — so this only
-/// chooses a mic: prefer a microphone-looking name, else the first audio
-/// device, else `None` (no mic available → video[+system] only). Pure so it's
-/// unit-testable off a Mac.
-#[cfg(any(target_os = "macos", test))]
-pub(crate) fn pick_macos_mic_device(audio: &[(usize, String)]) -> Option<usize> {
-    audio.iter()
-        .find(|(_, n)| {
-            let l = n.to_ascii_lowercase();
-            l.contains("microphone") || l.contains("mic") || l.contains("built-in")
-                || l.contains("macbook") || l.contains("headset")
-        })
-        .or_else(|| audio.first())
-        .map(|(i, _)| *i)
-}
-
-// ── Windows: ffmpeg -f gdigrab video + WASAPI audio over loopback TCP ────────
-//
-// Video stays on gdigrab (low-risk, already shipping). Audio is captured
-// natively via WASAPI (see recorder_windows_audio.rs): the default render
-// endpoint in loopback mode is the system audio, the default capture endpoint
-// is the mic — no Stereo Mix, no VB-Audio driver. Each source streams raw PCM
-// over a 127.0.0.1 socket that ffmpeg reads as an extra `-i`, and ffmpeg does
-// the resample + amix, exactly like the Linux pulse + monitor path.
-
-#[cfg(target_os = "windows")]
-fn spawn_recorder(output: &Path, options: RecordingOptions, region: Option<CaptureRect>)
-    -> Result<(Backend, RecordingOptions)>
-{
-    use windows_audio::SourceKind;
-
-    let path = output.to_str().ok_or_else(||
-        Error::Recording("non-UTF-8 output path".into()))?;
-    let ffmpeg = locate_ffmpeg().unwrap_or_else(|| PathBuf::from("ffmpeg.exe"));
-
-    // One WASAPI capture per requested source. Input-index order is irrelevant
-    // (both feed amix), so mic-then-system is fine. If any source fails to
-    // start, tear down the ones already running so we never leak a capture
-    // thread, then surface the actionable error (mic-privacy is the usual one).
-    let mut kinds: Vec<SourceKind> = Vec::new();
-    if options.mic          { kinds.push(SourceKind::Microphone); }
-    if options.system_audio { kinds.push(SourceKind::SystemLoopback); }
-
-    let mut started: Vec<windows_audio::StartedSource> = Vec::new();
-    for kind in kinds {
-        match windows_audio::start_source(kind) {
-            Ok(s) => started.push(s),
-            Err(e) => {
-                for mut s in started { s.pump.signal_stop(); s.pump.join(); }
-                return Err(e);
-            }
-        }
-    }
-
-    let specs: Vec<WasapiAudioSpec> = started.iter().map(|s| s.spec.clone()).collect();
-    let args = build_windows_ffmpeg_args(path, &specs, region);
-
-    // CREATE_NO_WINDOW (0x08000000): ffmpeg.exe is a console app, so without
-    // this flag Windows allocates a visible black console window that stays up
-    // for the whole recording. Suppress it.
-    use std::os::windows::process::CommandExt;
-    let res = crate::child_guard::spawn_guarded(
-        Command::new(&ffmpeg)
-            .args(&args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .creation_flags(0x0800_0000));
-
-    match res {
-        Ok(child) => match watch_recorder_startup(child) {
-            Ok((child, stderr)) => {
-                let pumps = started.into_iter().map(|s| s.pump).collect();
-                // Every requested source started or we'd have bailed above, so
-                // the effective options are the requested ones.
-                Ok((Backend::Process { child, stderr, pumps }, options))
-            }
-            Err(e) => {
-                for mut s in started { s.pump.signal_stop(); s.pump.join(); }
-                Err(e)
-            }
-        },
-        Err(e) => {
-            for mut s in started { s.pump.signal_stop(); s.pump.join(); }
-            if e.kind() == std::io::ErrorKind::NotFound {
-                Err(Error::Recording(
-                    "ffmpeg.exe not found — the Framefang installer normally ships \
-                     it next to framefang.exe. Reinstall, or drop ffmpeg.exe into \
-                     the same folder as framefang.exe and retry.".into()))
-            } else {
-                Err(Error::Recording(format!("failed to spawn ffmpeg: {e}")))
-            }
-        }
-    }
-}
-
-/// Build the ffmpeg argv for Windows: gdigrab video plus one raw-PCM TCP input
-/// per WASAPI source, mixed down to a single stereo AAC track. Pure function so
-/// the suite can assert exact argv composition without WASAPI or a real device.
-///
-/// A `region` becomes `-offset_x` / `-offset_y` / `-video_size`, all of which
-/// gdigrab reads *before* its `-i desktop`. gdigrab adds the offsets to
-/// `SM_XVIRTUALSCREEN` / `SM_YVIRTUALSCREEN`, i.e. it measures from the virtual
-/// desktop's corner — which is why this uses `offset_x()` and not `x`. On a
-/// layout with a monitor left of the primary one those differ by 1920.
-#[cfg(any(target_os = "windows", test))]
-pub(crate) fn build_windows_ffmpeg_args(
-    output_path: &str,
-    audio:       &[WasapiAudioSpec],
-    region:      Option<CaptureRect>,
-) -> Vec<String> {
-    let mut a: Vec<String> = Vec::with_capacity(52);
-    let push = |a: &mut Vec<String>, s: &str| a.push(s.to_string());
-    push(&mut a, "-y");
-    // Video: GDI grab of the desktop at 30 fps. `desktop` is gdigrab's
-    // pseudo-device name for the full virtual screen; the offset/size options
-    // below narrow it to the user's rectangle.
-    push(&mut a, "-f"); push(&mut a, "gdigrab");
-    push(&mut a, "-framerate"); push(&mut a, "30");
-    if let Some(r) = region {
-        push(&mut a, "-offset_x"); a.push(r.offset_x().to_string());
-        push(&mut a, "-offset_y"); a.push(r.offset_y().to_string());
-        push(&mut a, "-video_size"); a.push(r.video_size());
-    }
-    push(&mut a, "-i"); push(&mut a, "desktop");
-    // Audio: one raw-PCM input per WASAPI source. We're already listening on
-    // the loopback port; ffmpeg connects back as the TCP client. The format /
-    // rate / channels are exactly what the device handed us, so no conversion
-    // happens before ffmpeg. `-thread_queue_size` keeps the demuxer from
-    // dropping packets while the encoder is busy.
-    for s in audio {
-        push(&mut a, "-thread_queue_size"); push(&mut a, "1024");
-        push(&mut a, "-f"); push(&mut a, s.ffmpeg_fmt);
-        push(&mut a, "-ar"); a.push(s.sample_rate.to_string());
-        push(&mut a, "-ac"); a.push(s.channels.to_string());
-        push(&mut a, "-i"); a.push(format!("tcp://127.0.0.1:{}", s.port));
-    }
-    // Video encode: H.264 ultrafast preset, yuv420p so the result plays in
-    // every consumer player. Same even-dimension `pad` as Linux because
-    // gdigrab on odd-sized monitor layouts otherwise fails the same way.
-    push(&mut a, "-c:v"); push(&mut a, "libx264");
-    push(&mut a, "-preset"); push(&mut a, "ultrafast");
-    push(&mut a, "-pix_fmt"); push(&mut a, "yuv420p");
-    push(&mut a, "-vf"); push(&mut a, "pad=ceil(iw/2)*2:ceil(ih/2)*2");
-    match audio.len() {
-        0 => {}
-        1 => {
-            // Single source: video is input 0, audio is input 1.
-            push(&mut a, "-map"); push(&mut a, "0:v");
-            push(&mut a, "-map"); push(&mut a, "1:a");
-            push(&mut a, "-c:a"); push(&mut a, "aac");
-            push(&mut a, "-b:a"); push(&mut a, "160k");
-            push(&mut a, "-ac"); push(&mut a, "2");
-        }
-        n => {
-            // Mix every audio input (mic + system) into one stereo AAC track,
-            // mirroring the Linux amix path.
-            let inputs: String = (1..=n).map(|i| format!("[{i}:a]")).collect();
-            push(&mut a, "-filter_complex");
-            a.push(format!(
-                "{inputs}amix=inputs={n}:duration=longest:dropout_transition=0[aout]"
-            ));
-            push(&mut a, "-map"); push(&mut a, "0:v");
-            push(&mut a, "-map"); push(&mut a, "[aout]");
-            push(&mut a, "-c:a"); push(&mut a, "aac");
-            push(&mut a, "-b:a"); push(&mut a, "160k");
-            push(&mut a, "-ac"); push(&mut a, "2");
-        }
-    }
-    push(&mut a, output_path);
-    a
-}
-
-// ── unreachable on the platforms above, kept so non-tier-1 OSes still build ──
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn spawn_recorder(_output: &Path,
-                  _options: RecordingOptions,
-                  _region:  Option<CaptureRect>)
-    -> Result<(Backend, RecordingOptions)>
-{
-    Err(Error::Recording(
-        "screen recording is not implemented on this platform yet".into()))
-}
-
-/// Send the platform-appropriate "please finish gracefully" signal so the
-/// container is finalized before the process exits.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-fn graceful_signal(child: &mut Child) {
+/// ffmpeg was started with a stdin pipe and finishes on `q`, on Windows too,
+/// where a windowless child can't be sent Ctrl+C. On Wayland the frame writer
+/// has already taken that pipe, so nothing is sent here and stopping the
+/// writer closes it instead (`Live::halt_feeds`). macOS `screencapture` has
+/// no pipe and finishes on SIGINT.
+fn ask_to_finish(child: &mut Child) {
     use std::io::Write;
-    if let Some(mut stdin) = child.stdin.take() {
-        // ffmpeg interprets 'q' on stdin as "stop and finalize" on every
-        // platform — including Windows, where there's no SIGINT to send to
-        // a console-less child.
-        let _ = writeln!(stdin, "q");
-    }
-    // A Wayland recording has no stdin left to take: the frame writer owns it,
-    // and the pipe closing when that thread stops is the finalize signal. So
-    // this is deliberately a no-op there rather than a special case — see
-    // `stop_blocking`, which stops the cast before waiting on the child.
-}
-
-#[cfg(target_os = "macos")]
-fn graceful_signal(child: &mut Child) {
-    use std::io::Write;
-    // Two backends: ffmpeg (audio recordings) is spawned with a piped stdin
-    // and stops on 'q'; screencapture (video-only) has a null stdin and stops
-    // on SIGINT. Presence of the stdin pipe is how we tell them apart.
     if let Some(mut stdin) = child.stdin.take() {
         let _ = writeln!(stdin, "q");
         return;
     }
-    // We don't depend on libc, so shell out to /bin/kill — part of base macOS.
-    let pid = child.id().to_string();
-    let _ = Command::new("/bin/kill").args(["-INT", &pid]).status();
+    // libc is a Unix dependency of this crate, but `/bin/kill` ships with
+    // every macOS and keeps this a plain process call.
+    #[cfg(target_os = "macos")]
+    {
+        let pid = child.id().to_string();
+        let _ = Command::new("/bin/kill").args(["-INT", &pid]).status();
+    }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn graceful_signal(_child: &mut Child) {}
+// ---- The encoder's last words ------------------------------------------------
 
-// ── startup-failure detection ────────────────────────────────────────────────
+/// How many stderr lines are kept. The line that matters ("No space left on
+/// device", "Device or resource busy") comes in the last few before the
+/// encoder dies.
+const KEPT_LINES: usize = 16;
 
-/// Watch a freshly-spawned recorder child for an *immediate* failure.
+/// The most recent lines of a recorder's stderr.
 ///
-/// ffmpeg (and macOS `screencapture`) validate their inputs at startup: a
-/// missing pulse demuxer, an unopenable capture device, a Wayland display, or a
-/// malformed argv make the process exit within a few hundred ms — before a
-/// single frame is written. We used to route stderr to `/dev/null` and treat a
-/// successful *spawn* as a successful *recording*, so those failures produced a
-/// cheery "recording started" toast and silently left no file behind.
+/// The pipe has to be read for the whole recording anyway: once its buffer
+/// fills, the encoder blocks mid-write. Keeping the last lines instead of
+/// throwing them away is the difference between "recording stopped" and
+/// "the disk is full".
+#[derive(Clone)]
+struct RecentStderr {
+    lines: Arc<Mutex<VecDeque<String>>>,
+}
+
+impl RecentStderr {
+    fn new() -> Self {
+        RecentStderr { lines: Arc::new(Mutex::new(VecDeque::with_capacity(KEPT_LINES))) }
+    }
+
+    /// Keep one line, forgetting the oldest when full. Blank lines and
+    /// ffmpeg's once-a-second progress lines are skipped, since they would
+    /// push every real message out of the window.
+    fn keep(&self, raw: &[u8]) {
+        let printable = printable_ascii(&String::from_utf8_lossy(raw));
+        let line = printable.trim();
+        if line.is_empty() || line.starts_with("frame=") || line.starts_with("size=") {
+            return;
+        }
+        let Ok(mut lines) = self.lines.lock() else { return };
+        if lines.len() == KEPT_LINES {
+            lines.pop_front();
+        }
+        lines.push_back(line.to_owned());
+    }
+
+    /// The kept lines, oldest first, one per line.
+    fn joined(&self) -> String {
+        self.lines.lock()
+            .map(|lines| lines.iter().map(String::as_str).collect::<Vec<_>>().join("\n"))
+            .unwrap_or_default()
+    }
+
+    /// The kept lines, set off by a blank line, ready to end an error
+    /// message; empty when the encoder said nothing worth repeating.
+    fn as_suffix(&self) -> String {
+        match self.joined() {
+            t if t.is_empty() => t,
+            t => format!("\n\n{t}"),
+        }
+    }
+}
+
+/// Encoder output reduced to printable ASCII. The app's text is drawn with a
+/// 5x7 ASCII font, so anything else would show as '?' anyway, and control
+/// characters would break the layout; doing it here covers every reader.
+fn printable_ascii(s: &str) -> String {
+    s.chars().map(|c| if c == ' ' || c.is_ascii_graphic() { c } else { '?' }).collect()
+}
+
+/// Keep an eye on a recorder for its first moments.
 ///
-/// Instead: poll for ~400 ms. If the child already died, hand back the tail of
-/// its stderr as an actionable error. If it survived the window, keep draining
-/// stderr to EOF on a detached thread — an unread pipe eventually fills and
-/// stalls a long recording — but into a `StderrTail` ring rather than a sink,
-/// so a *later* death (`Recorder::poll_health`, `Recorder::stop`) can still name
-/// its cause. Caller must spawn with `stderr(Stdio::piped())` for either
-/// diagnostic to work.
+/// ffmpeg and `screencapture` check their inputs as they start, so a missing
+/// demuxer, a device that won't open or a bad argument ends the process
+/// within a few hundred milliseconds, before any frame is written. If that
+/// happens within 400 ms the error carries the end of its stderr. If it
+/// doesn't, a thread keeps reading stderr into a [`RecentStderr`] so a later
+/// death can still be explained. The child must have been spawned with
+/// `stderr(Stdio::piped())`.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn watch_recorder_startup(mut child: Child) -> Result<(Child, StderrTail)> {
+fn watch_recorder_startup(mut child: Child) -> Result<(Child, RecentStderr)> {
     use std::io::Read;
     let mut stderr = child.stderr.take();
 
     for _ in 0..8 {
         match child.try_wait() {
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
             Ok(Some(status)) => {
-                // The child we just recorded as live is already dead; drop the
-                // record now so the next launch doesn't try to reap its pid.
+                // Already gone: forget it as the live recorder now, or the next
+                // launch would go looking for its pid.
                 crate::child_guard::clear_live();
-                let mut buf = String::new();
-                if let Some(mut e) = stderr.take() { let _ = e.read_to_string(&mut buf); }
+                let mut said = String::new();
+                if let Some(mut pipe) = stderr.take() {
+                    let _ = pipe.read_to_string(&mut said);
+                }
                 return Err(Error::Recording(format!(
-                    "recording failed to start: the encoder exited immediately ({status}).\n\n{}",
-                    ffmpeg_error_tail(&buf)
+                    "the recording couldn't start: the encoder quit straight away ({status}).\n\n{}",
+                    startup_diagnosis(&said)
                 )));
             }
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
-            Err(_)   => break,
+            Err(_) => break,
         }
     }
 
-    let tail = StderrTail::new();
-    if let Some(e) = stderr.take() {
-        let sink = tail.clone();
-        std::thread::spawn(move || drain_stderr_into(e, sink));
+    let tail = RecentStderr::new();
+    if let Some(pipe) = stderr {
+        let keep = tail.clone();
+        std::thread::spawn(move || read_stderr_into(pipe, keep));
     }
     Ok((child, tail))
 }
 
-/// Read a recorder child's stderr to EOF, keeping the last few lines in `tail`.
+/// Read a recorder's stderr until it closes, keeping the last lines in
+/// `tail`.
 ///
-/// Split on both `\n` and `\r`: ffmpeg overwrites its progress counter with a
-/// carriage return, so a newline-only reader would treat an entire recording's
-/// stats as one unbounded line and never see the error printed after it.
-/// Over-long lines are clipped rather than grown without limit — nothing
-/// actionable lives past a few hundred characters.
+/// Lines end at `\n` or `\r`, because ffmpeg redraws its progress line with a
+/// carriage return; splitting on newlines alone would make one endless line
+/// of a whole recording's progress and miss the error after it. Lines are cut
+/// at 512 bytes, which is far past anything useful.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn drain_stderr_into(mut src: std::process::ChildStderr, tail: StderrTail) {
+fn read_stderr_into(mut pipe: std::process::ChildStderr, tail: RecentStderr) {
     use std::io::Read;
-    const MAX_LINE: usize = 512;
-    let mut buf  = [0u8; 8192];
-    let mut line = Vec::with_capacity(MAX_LINE);
-    loop {
-        let n = match src.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
-        };
-        for &b in &buf[..n] {
-            if b == b'\n' || b == b'\r' {
-                tail.push_line(&line);
-                line.clear();
-            } else if line.len() < MAX_LINE {
-                line.push(b);
+    const LONGEST: usize = 512;
+    let mut chunk = [0u8; 8192];
+    let mut line = Vec::with_capacity(LONGEST);
+    while let Some(n) = pipe.read(&mut chunk).ok().filter(|&n| n > 0) {
+        for &byte in &chunk[..n] {
+            match byte {
+                b'\n' | b'\r' => {
+                    tail.keep(&line);
+                    line.clear();
+                }
+                _ if line.len() < LONGEST => line.push(byte),
+                _ => {}
             }
         }
     }
-    // Whatever the encoder printed without a trailing newline before dying is
-    // usually the most interesting line of all.
-    tail.push_line(&line);
+    // A last line with no newline is often the reason it died.
+    tail.keep(&line);
 }
 
-/// Pull the most useful lines out of an encoder's startup stderr. The actionable
-/// message ("Unknown input format: 'pulse'", "Error opening input files",
-/// "Permission denied") is always near the end, after the banner + build config.
+/// The useful end of an encoder's startup stderr: its last six non-blank
+/// lines. The message that explains it ("Unknown input format: 'pulse'",
+/// "Error opening input files", "Permission denied") comes after the banner
+/// and build settings.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn ffmpeg_error_tail(stderr: &str) -> String {
-    let lines: Vec<&str> = stderr
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
+fn startup_diagnosis(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
     if lines.is_empty() {
-        return "The encoder produced no diagnostics. Check that recording isn't \
-                running on Wayland (X11 only for now), that the bundled ffmpeg \
-                supports your audio backend, and that the capture device exists."
+        return "The encoder printed nothing to say why. Check that the capture device exists \
+                and that this ffmpeg build supports your sound system."
             .to_string();
     }
-    let start = lines.len().saturating_sub(6);
-    lines[start..].join("\n")
+    lines[lines.len().saturating_sub(6)..].join("\n")
 }
 
-// ── tests ───────────────────────────────────────────────────────────────────
+// ---- Finding ffmpeg --------------------------------------------------------
+
+/// Where Frame Fang keeps the FFmpeg it downloads for people without one,
+/// `%LOCALAPPDATA%\Framefang\ffmpeg\ffmpeg.exe`. Windows only: other systems
+/// get FFmpeg from their package manager.
+pub fn downloaded_ffmpeg_path() -> Option<PathBuf> {
+    if cfg!(target_os = "windows") {
+        let local = std::env::var_os("LOCALAPPDATA")?;
+        Some(PathBuf::from(local).join("Framefang").join("ffmpeg").join("ffmpeg.exe"))
+    } else {
+        None
+    }
+}
+
+/// The FFmpeg chosen in Settings (`FfmpegPath`), or `None` to search. The
+/// tray sets it whenever the settings load or change.
+static CHOSEN_FFMPEG: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+pub fn set_chosen_ffmpeg(path: Option<PathBuf>) {
+    *CHOSEN_FFMPEG.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = path;
+}
+
+/// The `ffmpeg` that recording, conversion and Settings all use: the one
+/// chosen in Settings while that file exists, otherwise [`auto_ffmpeg`].
+///
+/// `None` when there is none anywhere; callers then run plain `"ffmpeg"` so
+/// the system's own "not found" error still comes through.
+pub fn locate_ffmpeg() -> Option<PathBuf> {
+    let chosen = CHOSEN_FFMPEG.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+    locate_ffmpeg_with(chosen.as_deref())
+}
+
+/// [`locate_ffmpeg`] with `chosen` standing in for the Settings choice, so
+/// Settings can ask about its unsaved draft.
+pub fn locate_ffmpeg_with(chosen: Option<&Path>) -> Option<PathBuf> {
+    match chosen {
+        Some(file) if file.is_file() => Some(file.to_path_buf()),
+        _ => auto_ffmpeg(),
+    }
+}
+
+/// Look for FFmpeg without the Settings choice. The first file found wins:
+///
+/// 1. beside our own executable (a local build's copy);
+/// 2. `Contents/Resources/ffmpeg` in a macOS app bundle;
+/// 3. each `PATH` folder in order, so an FFmpeg the user installed comes
+///    before ours;
+/// 4. the copy Frame Fang downloaded ([`downloaded_ffmpeg_path`]).
+pub fn auto_ffmpeg() -> Option<PathBuf> {
+    let file_name = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+    let exe = std::env::current_exe().ok()?;
+    let home = exe.parent()?;
+
+    let mut candidates = vec![home.join(file_name)];
+    if cfg!(target_os = "macos") {
+        if let Some(contents) = home.parent() {
+            candidates.push(contents.join("Resources").join("ffmpeg"));
+        }
+    }
+    if let Ok(search) = std::env::var("PATH") {
+        let separator = if cfg!(windows) { ';' } else { ':' };
+        candidates.extend(search.split(separator).map(|folder| Path::new(folder).join(file_name)));
+    }
+    candidates.extend(downloaded_ffmpeg_path());
+    candidates.into_iter().find(|candidate| candidate.is_file())
+}
+
+// ---- Building ffmpeg command lines ---------------------------------------------
+//
+// Pure functions, so every argument list can be checked in tests on any
+// machine. Every ffmpeg line has the same shape: `-y` (overwrite), the video
+// input, any sound inputs, H.264 encoding with an even-size filter, the
+// sound output, and the file.
+
+/// An ffmpeg argument list being put together.
+struct Argv(Vec<String>);
+
+impl Argv {
+    fn new() -> Self {
+        Argv(vec!["-y".to_string()])
+    }
+
+    fn opt(&mut self, flag: &str, value: impl Into<String>) -> &mut Self {
+        self.0.push(flag.to_string());
+        self.0.push(value.into());
+        self
+    }
+
+    fn finish(mut self, output_path: &str) -> Vec<String> {
+        self.0.push(output_path.to_string());
+        self.0
+    }
+}
+
+/// Rounds the picture up to even sides, which yuv420p H.264 requires. A
+/// `CaptureRect` is already even, so after a crop it does nothing; it is
+/// there for a full screen of odd size.
+const EVEN_PAD: &str = "pad=ceil(iw/2)*2:ceil(ih/2)*2";
+
+/// The `-vf` chain: an optional `crop=w:h:x:y`, then [`EVEN_PAD`].
+fn video_filter(crop: Option<(u32, u32, i32, i32)>) -> String {
+    match crop {
+        Some((w, h, x, y)) => format!("crop={w}:{h}:{x}:{y},{EVEN_PAD}"),
+        None => EVEN_PAD.to_string(),
+    }
+}
+
+/// Video encoding shared by every backend: fast H.264 in yuv420p, the pixel
+/// layout every common player accepts.
+fn h264(argv: &mut Argv, filter: String) {
+    argv.opt("-c:v", "libx264").opt("-preset", "ultrafast").opt("-pix_fmt", "yuv420p").opt("-vf", filter);
+}
+
+/// The stream labels of sound inputs numbered from 1 (video being input 0).
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
+fn numbered_sound(count: usize) -> Vec<String> {
+    (1..=count).map(|i| format!("{i}:a")).collect()
+}
+
+/// Put the sound `inputs` (stream labels such as `"1:a"`) into one AAC
+/// track: as it is when there is one, through `amix` when there are more.
+///
+/// `mapped` is how macOS and Windows do it: every stream mapped by hand and
+/// the track made two-channel. Linux leaves a lone input to ffmpeg's default
+/// stream choice, with the channel count it came with.
+fn sound_out(argv: &mut Argv, inputs: &[String], mapped: bool) {
+    match inputs {
+        [] => return,
+        [only] => {
+            if mapped {
+                argv.opt("-map", "0:v").opt("-map", only.as_str());
+            }
+        }
+        several => {
+            let labels: String = several.iter().map(|l| format!("[{l}]")).collect();
+            let graph = format!(
+                "{labels}amix=inputs={}:duration=longest:dropout_transition=0[aout]",
+                several.len()
+            );
+            argv.opt("-filter_complex", graph).opt("-map", "0:v").opt("-map", "[aout]");
+        }
+    }
+    argv.opt("-c:a", "aac").opt("-b:a", "160k");
+    if mapped {
+        argv.opt("-ac", "2");
+    }
+}
+
+/// One raw PCM sound input that ffmpeg reads from a socket we listen on. The
+/// queue size stops the demuxer dropping packets while the encoder is busy.
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+fn pcm_input(argv: &mut Argv, format: &str, rate: u32, channels: u16, port: u16) {
+    argv.opt("-thread_queue_size", "1024")
+        .opt("-f", format)
+        .opt("-ar", rate.to_string())
+        .opt("-ac", channels.to_string())
+        .opt("-i", format!("tcp://127.0.0.1:{port}"));
+}
+
+/// The Pulse sound inputs both Linux paths use: the default source as the
+/// mic, and the named monitor for what is playing.
+#[cfg(any(target_os = "linux", test))]
+fn pulse_inputs(argv: &mut Argv, mic: bool, monitor: Option<&str>) {
+    if mic {
+        argv.opt("-f", "pulse").opt("-i", "default");
+    }
+    if let Some(source) = monitor {
+        argv.opt("-f", "pulse").opt("-i", source);
+    }
+}
+
+/// Everything after the inputs on Linux, the same for X11 and Wayland:
+/// video is input 0 on both, then the mic, then the monitor.
+#[cfg(any(target_os = "linux", test))]
+fn linux_encode(argv: &mut Argv, mic: bool, monitor: bool, crop: Option<(u32, u32, i32, i32)>) {
+    h264(argv, video_filter(crop));
+    sound_out(argv, &numbered_sound(usize::from(mic) + usize::from(monitor)), false);
+}
+
+/// ffmpeg's arguments for an X11 recording.
+///
+/// x11grab takes a region's size as `-video_size` ahead of the input and its
+/// corner as `+X,Y` after the display name (`:0.0+120,80`), counted from the
+/// root window's corner, which is the virtual desktop's corner; hence the
+/// offsets, not the absolute position.
+#[cfg(any(target_os = "linux", test))]
+fn build_linux_ffmpeg_args(display: &str, output_path: &str, sound: RecordingOptions,
+                           monitor: Option<&str>, region: Option<CaptureRect>) -> Vec<String> {
+    let mut argv = Argv::new();
+    argv.opt("-f", "x11grab").opt("-framerate", "30");
+    let screen = match region {
+        Some(r) => {
+            argv.opt("-video_size", r.video_size());
+            format!("{display}+{},{}", r.offset_x(), r.offset_y())
+        }
+        None => display.to_string(),
+    };
+    argv.opt("-i", screen);
+    pulse_inputs(&mut argv, sound.mic, monitor);
+    linux_encode(&mut argv, sound.mic, monitor.is_some(), None);
+    argv.finish(output_path)
+}
+
+/// ffmpeg's arguments for a Wayland recording: raw frames on stdin as input
+/// 0, then the same Pulse inputs as X11.
+///
+/// There are two `-pix_fmt`s on purpose. The one before `-i` describes the
+/// bytes we write; the one in the encoding asks for yuv420p in the file.
+/// Raw video carries no timestamps, so `-framerate` before `-i` is its only
+/// clock, and the frame writer keeps exactly that pace. A pipe has no
+/// offset option, so a region becomes a `crop`, counted from the desktop's
+/// corner, which is where the shared frame starts when the whole desktop is
+/// shared. A crop outside the shared picture makes ffmpeg fail as it
+/// starts, which the startup watch reports.
+#[cfg(any(target_os = "linux", test))]
+#[allow(clippy::too_many_arguments)]
+fn build_wayland_ffmpeg_args(pix_fmt: &str, width: u32, height: u32, fps: u32, output_path: &str,
+                             sound: RecordingOptions, monitor: Option<&str>, region: Option<CaptureRect>)
+    -> Vec<String>
+{
+    let mut argv = Argv::new();
+    argv.opt("-f", "rawvideo")
+        .opt("-pix_fmt", pix_fmt)
+        .opt("-video_size", format!("{width}x{height}"))
+        .opt("-framerate", fps.to_string())
+        // Same reason as the socket inputs: don't drop frames while busy.
+        .opt("-thread_queue_size", "1024")
+        .opt("-i", "pipe:0");
+    pulse_inputs(&mut argv, sound.mic, monitor);
+    let crop = region.map(|r| (r.width, r.height, r.offset_x(), r.offset_y()));
+    linux_encode(&mut argv, sound.mic, monitor.is_some(), crop);
+    argv.finish(output_path)
+}
+
+/// `screencapture`'s arguments for a silent macOS recording.
+///
+/// `-R x,y,w,h` is in macOS's global display space, which starts at the main
+/// display's corner (the same origin as `CaptureRect`'s absolute fields) but
+/// counts points, while the rectangle arrives in device pixels. So the
+/// fields are divided by the capture's scale; otherwise a Retina recording
+/// would be twice as big and twice as far from the corner.
+#[cfg(any(target_os = "macos", test))]
+fn build_macos_screencapture_args(output_path: &str, region: Option<CaptureRect>) -> Vec<String> {
+    // getopt parsing, so the rectangle can be its own argument after `-R`.
+    let rectangle = region.map(|area| {
+        let (left, top, wide, high) = area.points();
+        ["-R".to_string(), format!("{left},{top},{wide},{high}")]
+    });
+    std::iter::once("-v".to_string())
+        .chain(rectangle.into_iter().flatten())
+        .chain(std::iter::once(output_path.to_string()))
+        .collect()
+}
+
+/// ffmpeg's arguments for a macOS recording with sound: avfoundation video
+/// (with the mic folded into the same input) as input 0, and the
+/// ScreenCaptureKit system sound as a socket input 1 when there is one.
+///
+/// avfoundation has no capture rectangle, so a region is a `crop`. Its
+/// frame is the main display at device resolution, the same origin and unit
+/// the rectangle's absolute fields use, so they go in as they are. A region
+/// wholly on another display falls outside that frame; the silent
+/// `screencapture` path has no such limit.
+#[cfg(any(target_os = "macos", test))]
+fn build_macos_ffmpeg_args(screen: usize, mic: Option<usize>, system_port: Option<u16>,
+                           output_path: &str, region: Option<CaptureRect>) -> Vec<String> {
+    let mut argv = Argv::new();
+    // "<video>:<audio>", with the audio half empty when there's no mic.
+    let devices = format!("{screen}:{}", mic.map(|i| i.to_string()).unwrap_or_default());
+    argv.opt("-f", "avfoundation").opt("-framerate", "30").opt("-i", devices);
+    // ScreenCaptureKit delivers 48 kHz stereo float; see recorder_macos_audio.rs.
+    if let Some(socket) = system_port {
+        pcm_input(&mut argv, "f32le", 48000, 2, socket);
+    }
+    h264(&mut argv, video_filter(region.map(|r| (r.width, r.height, r.x, r.y))));
+    // The mic is the avfoundation input's own sound; system sound is input 1.
+    let sound: Vec<String> = [(mic.is_some(), "0:a"), (system_port.is_some(), "1:a")]
+        .into_iter()
+        .filter_map(|(present, label)| present.then(|| label.to_string()))
+        .collect();
+    sound_out(&mut argv, &sound, true);
+    argv.finish(output_path)
+}
+
+/// What ffmpeg needs to read one WASAPI source: the socket port and the PCM
+/// layout the device delivers. Plain data, so the Windows argument list can
+/// be tested on any machine.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WasapiAudioSpec {
+    pub ffmpeg_fmt:  &'static str,
+    pub sample_rate: u32,
+    pub channels:    u16,
+    pub port:        u16,
+}
+
+/// ffmpeg's arguments for a Windows recording: gdigrab video, then one
+/// socket input per WASAPI source, in the format the device gave, mixed to
+/// one stereo track.
+///
+/// gdigrab reads a region's `-offset_x`, `-offset_y` and `-video_size` before
+/// `-i desktop`, and adds the offsets to `SM_XVIRTUALSCREEN` and
+/// `SM_YVIRTUALSCREEN`: it counts from the virtual desktop's corner. With a
+/// monitor left of the primary one that is 1920 away from the absolute
+/// position, hence the offsets.
+#[cfg(any(target_os = "windows", test))]
+fn build_windows_ffmpeg_args(output_path: &str, sources: &[WasapiAudioSpec], region: Option<CaptureRect>)
+    -> Vec<String>
+{
+    let mut argv = Argv::new();
+    // `desktop` is the whole virtual screen; a region narrows it.
+    argv.opt("-f", "gdigrab").opt("-framerate", "30");
+    if let Some(area) = region {
+        argv.opt("-offset_x", area.offset_x().to_string())
+            .opt("-offset_y", area.offset_y().to_string())
+            .opt("-video_size", area.video_size());
+    }
+    argv.opt("-i", "desktop");
+    // We already listen on each port; ffmpeg connects to it.
+    for source in sources {
+        pcm_input(&mut argv, source.ffmpeg_fmt, source.sample_rate, source.channels, source.port);
+    }
+    h264(&mut argv, video_filter(None));
+    sound_out(&mut argv, &numbered_sound(sources.len()), true);
+    argv.finish(output_path)
+}
+
+// ---- Starting a recorder ---------------------------------------------------
+
+/// An ffmpeg process with stdin piped (for `q`), stdout discarded and stderr
+/// piped (for the startup watch). On Windows it gets no console window,
+/// which would otherwise sit on screen for the whole recording.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn ffmpeg_command(program: &Path, args: &[String]) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.args(args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+/// The output path as text, which is how ffmpeg gets it.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn path_text(output: &Path) -> Result<&str> {
+    output.to_str().ok_or_else(|| Error::Recording("the recording's file path isn't valid UTF-8".into()))
+}
+
+/// The error for an ffmpeg that wouldn't start, with install advice when it
+/// simply isn't there.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn ffmpeg_start_failure(e: std::io::Error, not_found: &str) -> Error {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        Error::Recording(not_found.into())
+    } else {
+        Error::Recording(format!("ffmpeg couldn't be started: {e}"))
+    }
+}
+
+#[cfg(target_os = "linux")]
+const LINUX_NO_FFMPEG: &str =
+    "ffmpeg wasn't found on PATH. Install it (for example: sudo apt install ffmpeg) and try again.";
+
+/// Start Linux's ffmpeg with `args`, through the recorder guard.
+#[cfg(target_os = "linux")]
+fn start_linux_ffmpeg(args: &[String]) -> Result<Child> {
+    let program = locate_ffmpeg().unwrap_or_else(|| "ffmpeg".into());
+    crate::child_guard::spawn_guarded(&mut ffmpeg_command(&program, args))
+        .map_err(|e| ffmpeg_start_failure(e, LINUX_NO_FFMPEG))
+}
+
+#[cfg(target_os = "linux")]
+fn launch(file: &Path, wanted: RecordingOptions, area: Option<CaptureRect>) -> Result<(Live, RecordingOptions)> {
+    // x11grab under XWayland records only XWayland windows (usually a black
+    // frame), and a pure Wayland session may have no DISPLAY at all. The two
+    // stacks share their sound setup and nothing else.
+    if crate::session::is_wayland() {
+        return launch_wayland(file, wanted, area);
+    }
+    let display = std::env::var("DISPLAY").unwrap_or_else(|_| String::from(":0"));
+    let path = path_text(file)?;
+    let (got, monitor) = usable_pulse_sources(wanted);
+    let encoder = start_linux_ffmpeg(&build_linux_ffmpeg_args(&display, path, got, monitor.as_deref(), area))?;
+    watch_recorder_startup(encoder).map(|(child, stderr)| (Live::bare(child, stderr), got))
+}
+
+/// `pactl` with its input and error output discarded.
+#[cfg(target_os = "linux")]
+fn pactl(request: &str) -> Command {
+    let mut cmd = Command::new("pactl");
+    cmd.arg(request).stdin(Stdio::null()).stderr(Stdio::null());
+    cmd
+}
+
+/// Which of the requested sound sources Pulse can really give, and the
+/// monitor source to name for system sound. Both Linux stacks use this,
+/// since PipeWire's Pulse layer serves the same inputs on Wayland.
+///
+/// Sound is best effort: with no sound server, or no default output to
+/// monitor, the picture is still recorded. The caller reports the returned
+/// options, not the requested ones.
+#[cfg(target_os = "linux")]
+fn usable_pulse_sources(wanted: RecordingOptions) -> (RecordingOptions, Option<String>) {
+    // `pactl info` succeeds only with a server to talk to. Without one, both
+    // sources are dropped and the recording goes ahead silently.
+    let server_up = pactl("info").stdout(Stdio::null()).status().is_ok_and(|done| done.success());
+    let mut got = if server_up { wanted } else { RecordingOptions::NONE };
+
+    // System sound is the default sink's monitor. Without one to name, only
+    // system sound goes; the picture and the mic don't need it.
+    let monitor = if got.system_audio { default_sink_monitor() } else { None };
+    got.system_audio = monitor.is_some();
+    (got, monitor)
+}
+
+/// Wayland: the ScreenCast portal, then PipeWire, then raw frames into
+/// ffmpeg's stdin.
+///
+/// The cast comes first because only it knows the frame size and layout,
+/// and ffmpeg needs both on its command line before reading raw video. So
+/// whatever goes wrong before ffmpeg starts (no portal, the user declining
+/// the share, buffers we can't read) is an error here, with no file made.
+#[cfg(target_os = "linux")]
+fn launch_wayland(file: &Path, wanted: RecordingOptions, area: Option<CaptureRect>)
+    -> Result<(Live, RecordingOptions)>
+{
+    let path = path_text(file)?;
+    let (got, monitor) = usable_pulse_sources(wanted);
+
+    // This waits while the desktop asks the user what to share.
+    let mut share = wayland_cast::CastSession::start()?;
+    let layout = share.format();
+    let mut encoder = start_linux_ffmpeg(&build_wayland_ffmpeg_args(
+        layout.pix_fmt, layout.width, layout.height, wayland_cast::TARGET_FPS,
+        path, got, monitor.as_deref(), area))?;
+
+    // The frame writer takes ffmpeg's stdin. With `encoder.stdin` now empty,
+    // `ask_to_finish` sends no `q` here: stopping the writer closes the pipe.
+    let hooked_up = encoder.stdin.take()
+        .ok_or_else(|| Error::Recording("ffmpeg started, but without a stdin pipe to send it frames".into()))
+        .and_then(|pipe| share.attach(pipe));
+    if let Err(why) = hooked_up {
+        encoder.kill().ok();
+        encoder.wait().ok();
+        return Err(why);
+    }
+
+    let (child, stderr) = watch_recorder_startup(encoder).inspect_err(|_| share.stop())?;
+    let mut live = Live::bare(child, stderr);
+    live.cast = Some(share);
+    Ok((live, got))
+}
+
+/// The Pulse monitor source of the default sink: the input that carries what
+/// the speakers play.
+///
+/// `pactl get-default-sink` can fail, or succeed and print nothing, when
+/// there is no server or no default sink. Treating either as a sink named ""
+/// would hand ffmpeg ".monitor", which it can't open, and a bad input takes
+/// the whole recording down. `None` means record without system sound.
+#[cfg(target_os = "linux")]
+fn default_sink_monitor() -> Option<String> {
+    let answer = pactl("get-default-sink").output().ok().filter(|out| out.status.success())?;
+    let printed = String::from_utf8(answer.stdout).ok()?;
+    match printed.trim() {
+        "" => None,
+        sink => Some(format!("{sink}.monitor")),
+    }
+}
+
+/// macOS. A silent recording uses the built-in `screencapture -v`, which
+/// needs no ffmpeg. With sound, ffmpeg records the picture and the mic
+/// through avfoundation, and system sound comes from ScreenCaptureKit over a
+/// socket (no BlackHole or Aggregate device), mixed by ffmpeg like on Linux.
+#[cfg(target_os = "macos")]
+fn launch(file: &Path, wanted: RecordingOptions, area: Option<CaptureRect>) -> Result<(Live, RecordingOptions)> {
+    let path = path_text(file)?;
+
+    if wanted == RecordingOptions::NONE {
+        // stdin stays closed: `ask_to_finish` tells the two tools apart by it.
+        let mut silent = Command::new("screencapture");
+        silent.args(build_macos_screencapture_args(path, area))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let recorder = crate::child_guard::spawn_guarded(&mut silent)
+            .map_err(|e| Error::Recording(format!("screencapture couldn't be started: {e}")))?;
+        return watch_recorder_startup(recorder)
+            .map(|(child, stderr)| (Live::bare(child, stderr), RecordingOptions::NONE));
+    }
+
+    let Some(ffmpeg) = locate_ffmpeg() else {
+        return Err(Error::Recording(
+            "recording with sound on macOS needs ffmpeg, and there is none next to Frame Fang or \
+             on your PATH. Install it (brew install ffmpeg) and try again; recording without \
+             sound works without it.".into()));
+    };
+    let (cameras, sound_devices) = parse_avfoundation_devices(&list_avfoundation_devices(&ffmpeg));
+    let screen = pick_macos_screen_index(&cameras)?;
+    let mic = wanted.mic.then(|| pick_macos_mic_device(&sound_devices)).flatten();
+
+    // Started before the arguments are built, because they need its port.
+    let system = if wanted.system_audio { Some(macos_audio::start_system_audio()?) } else { None };
+    // A mic avfoundation didn't list won't be in the file, whatever was asked.
+    let got = RecordingOptions { mic: mic.is_some(), system_audio: system.is_some() };
+
+    let args = build_macos_ffmpeg_args(screen, mic, system.as_ref().map(|s| s.port), path, area);
+    let started = crate::child_guard::spawn_guarded(&mut ffmpeg_command(&ffmpeg, &args))
+        .map_err(|e| ffmpeg_start_failure(e, "ffmpeg wasn't found. Install it with brew install ffmpeg and try again."))
+        .and_then(watch_recorder_startup);
+    match started {
+        Ok((child, stderr)) => {
+            let mut live = Live::bare(child, stderr);
+            live.sck = system;
+            Ok((live, got))
+        }
+        Err(why) => {
+            // Nothing will read the system sound now.
+            if let Some(session) = system {
+                session.stop();
+            }
+            Err(why)
+        }
+    }
+}
+
+/// avfoundation's device table, from
+/// `ffmpeg -f avfoundation -list_devices true -i ""`. It prints the table to
+/// stderr and then exits with an error, having opened nothing; only the text
+/// matters.
+#[cfg(target_os = "macos")]
+fn list_avfoundation_devices(ffmpeg: &Path) -> String {
+    Command::new(ffmpeg)
+        .args(["-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""])
+        .stdin(Stdio::null())
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stderr).into_owned())
+        .unwrap_or_default()
+}
+
+/// Split avfoundation's device table into `(video, audio)` lists of
+/// `(index, name)`. The table reads:
+///
+/// ```text
+/// [AVFoundation indev @ 0x..] AVFoundation video devices:
+/// [AVFoundation indev @ 0x..] [0] FaceTime HD Camera
+/// [AVFoundation indev @ 0x..] [1] Capture screen 0
+/// [AVFoundation indev @ 0x..] AVFoundation audio devices:
+/// [AVFoundation indev @ 0x..] [0] MacBook Pro Microphone
+/// ```
+#[cfg(any(target_os = "macos", test))]
+fn parse_avfoundation_devices(table: &str) -> (Vec<(usize, String)>, Vec<(usize, String)>) {
+    let mut lists: [Vec<(usize, String)>; 2] = [Vec::new(), Vec::new()];
+    let mut section = None;
+    for line in table.lines() {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("video devices:") {
+            section = Some(0);
+        } else if lower.contains("audio devices:") {
+            section = Some(1);
+        } else if let (Some(list), Some(device)) = (section, avfoundation_entry(line)) {
+            lists[list].push(device);
+        }
+    }
+    let [cameras, sound] = lists;
+    (cameras, sound)
+}
+
+/// One `"[N] Name"` table row. The index is the line's last bracket, after
+/// the log prefix's own; a row without a number or a name isn't a device.
+#[cfg(any(target_os = "macos", test))]
+fn avfoundation_entry(line: &str) -> Option<(usize, String)> {
+    let open = line.rfind('[')?;
+    let close = open + line[open..].find(']')?;
+    let index = line[open + 1..close].trim().parse().ok()?;
+    let name = line[close + 1..].trim();
+    (!name.is_empty()).then(|| (index, name.to_string()))
+}
+
+/// The avfoundation index of the screen, which it lists as a camera called
+/// "Capture screen N". None listed usually means the Screen Recording
+/// permission is missing, which hides the screens.
+#[cfg(any(target_os = "macos", test))]
+fn pick_macos_screen_index(cameras: &[(usize, String)]) -> Result<usize> {
+    let is_screen = |name: &str| name.to_ascii_lowercase().contains("capture screen");
+    match cameras.iter().find(|(_, name)| is_screen(name)) {
+        Some(&(index, _)) => Ok(index),
+        None => Err(Error::Recording(
+            "ffmpeg lists no screen to capture, which usually means Frame Fang lacks Screen \
+             Recording permission. Turn it on in System Settings > Privacy & Security > Screen \
+             Recording, then reopen Frame Fang and try again.".into())),
+    }
+}
+
+/// The avfoundation microphone to use: one whose name sounds like a mic,
+/// else the first sound device, else none. System sound doesn't come from
+/// this list (ScreenCaptureKit gives it), so loopback devices aren't wanted.
+#[cfg(any(target_os = "macos", test))]
+fn pick_macos_mic_device(devices: &[(usize, String)]) -> Option<usize> {
+    const MIC_WORDS: [&str; 5] = ["microphone", "mic", "built-in", "macbook", "headset"];
+    let sounds_like_mic = |name: &str| {
+        let lower = name.to_ascii_lowercase();
+        MIC_WORDS.iter().any(|word| lower.contains(word))
+    };
+    let (index, _) = devices.iter().find(|(_, name)| sounds_like_mic(name)).or(devices.first())?;
+    Some(*index)
+}
+
+/// Windows: gdigrab for the picture and WASAPI for sound, each source sent
+/// to ffmpeg over its own 127.0.0.1 socket. Playback in loopback mode gives
+/// the system sound and the default capture device the mic, with no Stereo
+/// Mix or virtual cable; ffmpeg resamples and mixes them.
+#[cfg(target_os = "windows")]
+fn launch(file: &Path, wanted: RecordingOptions, area: Option<CaptureRect>) -> Result<(Live, RecordingOptions)> {
+    use windows_audio::{SourceKind, StartedSource};
+
+    /// Stop the sources already running, so no capture thread is left.
+    fn stop_all(sources: Vec<StartedSource>) {
+        for mut source in sources {
+            source.pump.request_stop();
+            source.pump.finish();
+        }
+    }
+
+    let path = path_text(file)?;
+    let ffmpeg = locate_ffmpeg().unwrap_or_else(|| "ffmpeg.exe".into());
+
+    // Mic first, then system sound; the order only sets input numbers, and
+    // amix doesn't care. One that won't start (the mic privacy switch is
+    // the usual reason) stops the others and its error is returned.
+    let kinds = [(wanted.mic, SourceKind::Microphone), (wanted.system_audio, SourceKind::SystemLoopback)];
+    let mut sources: Vec<StartedSource> = Vec::new();
+    for (_, kind) in kinds.into_iter().filter(|(on, _)| *on) {
+        match windows_audio::start_source(kind) {
+            Ok(source) => sources.push(source),
+            Err(why) => {
+                stop_all(sources);
+                return Err(why);
+            }
+        }
+    }
+
+    let specs: Vec<WasapiAudioSpec> = sources.iter().map(|s| s.spec.clone()).collect();
+    let command_line = build_windows_ffmpeg_args(path, &specs, area);
+    let started = crate::child_guard::spawn_guarded(&mut ffmpeg_command(&ffmpeg, &command_line))
+        .map_err(|e| ffmpeg_start_failure(e,
+            "ffmpeg.exe wasn't found. The installer normally puts it beside framefang.exe; \
+             reinstall, or copy ffmpeg.exe into the folder framefang.exe is in, and try again."))
+        .and_then(watch_recorder_startup);
+    match started {
+        Ok((child, stderr)) => {
+            let mut live = Live::bare(child, stderr);
+            live.pumps = sources.into_iter().map(|s| s.pump).collect();
+            // Any source that failed ended the start above, so the recording
+            // has everything that was asked for.
+            Ok((live, wanted))
+        }
+        Err(why) => {
+            stop_all(sources);
+            Err(why)
+        }
+    }
+}
+
+/// Builds on other systems, where there is no recorder yet.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn launch(_: &Path, _: RecordingOptions, _: Option<CaptureRect>) -> Result<(Live, RecordingOptions)> {
+    Err(Error::Recording("Frame Fang can't record the screen on this operating system yet".into()))
+}
+
+/// A thread sending WASAPI sound to ffmpeg's socket, and the flag that ends
+/// it. Made by `windows_audio`.
+#[cfg(target_os = "windows")]
+struct AudioPump {
+    stop:   Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(target_os = "windows")]
+impl AudioPump {
+    fn request_stop(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Wait for the thread to end. Safe to call twice.
+    fn finish(&mut self) {
+        if let Some(thread) = self.handle.take() {
+            let _ = thread.join();
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use framefang_core::region::{record_rect_from_selection, DesktopBounds};
 
-    /// A 1920x1080 desktop rooted at the origin — the single-monitor case.
-    fn desktop() -> DesktopBounds { DesktopBounds::new(0, 0, 1920, 1080) }
+    /// One 1920x1080 monitor at the origin.
+    fn one_screen() -> DesktopBounds {
+        DesktopBounds::new(0, 0, 1920, 1080)
+    }
+
+    /// A 640x480 area at (320, 180), as the overlay would hand it over.
+    fn window_area() -> CaptureRect {
+        record_rect_from_selection((320, 180, 640, 480), one_screen()).unwrap()
+    }
+
+    fn words(list: &[&str]) -> Vec<String> {
+        list.iter().map(|w| w.to_string()).collect()
+    }
+
+    /// Whether `flag` is directly followed by `value`.
+    fn has(args: &[String], flag: &str, value: &str) -> bool {
+        args.windows(2).any(|pair| pair[0] == flag && pair[1] == value)
+    }
+
+    fn value_of<'a>(args: &'a [String], flag: &str) -> &'a str {
+        let at = args.iter().position(|a| a == flag).unwrap_or_else(|| panic!("no {flag} in {args:?}"));
+        &args[at + 1]
+    }
+
+    /// Everything from the video codec on.
+    fn encoding(args: &[String]) -> Vec<String> {
+        let at = args.iter().position(|a| a == "-c:v").expect("no encoding section");
+        args[at..].to_vec()
+    }
+
+    fn wasapi(port: u16, rate: u32, channels: u16, fmt: &'static str) -> WasapiAudioSpec {
+        WasapiAudioSpec { port, sample_rate: rate, channels, ffmpeg_fmt: fmt }
+    }
+
+    const MIX_TWO: &str = "[1:a][2:a]amix=inputs=2:duration=longest:dropout_transition=0[aout]";
+
+    // ---- ffmpeg lookup
 
     #[test]
-    fn a_picked_ffmpeg_wins_while_it_exists_and_falls_back_when_gone() {
-        let dir = std::env::temp_dir().join(format!("ff-pick-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let picked = dir.join(if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" });
-        std::fs::write(&picked, b"stub").unwrap();
-        assert_eq!(locate_ffmpeg_with(Some(&picked)), Some(picked.clone()), "the pick comes first");
+    fn chosen_ffmpeg_is_used_only_while_it_is_a_file() {
+        let folder = std::env::temp_dir().join(format!("framefang-chosen-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let chosen = folder.join(if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" });
+        std::fs::write(&chosen, b"not really ffmpeg").unwrap();
+
+        assert_eq!(locate_ffmpeg_with(Some(&chosen)), Some(chosen.clone()));
         assert_eq!(locate_ffmpeg_with(None), auto_ffmpeg());
-        std::fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(locate_ffmpeg_with(Some(&picked)), auto_ffmpeg(), "a missing pick falls back");
-        // A folder is not an FFmpeg.
-        assert_eq!(locate_ffmpeg_with(Some(&std::env::temp_dir())), auto_ffmpeg());
+        std::fs::remove_dir_all(&folder).unwrap();
+        assert_eq!(locate_ffmpeg_with(Some(&chosen)), auto_ffmpeg(), "gone, so search instead");
+        assert_eq!(locate_ffmpeg_with(Some(&std::env::temp_dir())), auto_ffmpeg(), "a folder doesn't count");
     }
 
-    /// The rectangle a user would drag for "record this window", already
-    /// clamped + even-sized the way the overlay hands it to the recorder.
-    fn region() -> CaptureRect {
-        record_rect_from_selection((320, 180, 640, 480), desktop()).unwrap()
-    }
-
-    // Linux argv-builder: assert the shape of the command we hand to ffmpeg
-    // for every audio combination, without spawning anything.
+    // ---- full argument lists, one per branch
 
     #[test]
-    fn linux_argv_video_only() {
-        let a = build_linux_ffmpeg_args(":0", "/tmp/out.mp4", RecordingOptions::NONE, None, None);
-        assert!(a.windows(2).any(|w| w == ["-f", "x11grab"]),
-                "missing -f x11grab in: {:?}", a);
-        assert!(a.windows(2).any(|w| w == ["-c:v", "libx264"]));
-        assert!(!a.iter().any(|s| s == "pulse"), "pulse should be absent when audio off");
-        assert!(!a.iter().any(|s| s == "-c:a"), "audio codec should be absent when audio off");
-        assert_eq!(a.last().unwrap(), "/tmp/out.mp4");
-    }
-
-    #[test]
-    fn linux_argv_mic_only() {
-        let a = build_linux_ffmpeg_args(":0", "/tmp/out.mp4", RecordingOptions::MIC_ONLY, None, None);
-        // mic is stream index 1 with `-i default`.
-        let i_default_pos = a.iter().position(|s| s == "default")
-            .expect("missing pulse mic input");
-        assert_eq!(a[i_default_pos - 1], "-i");
-        assert!(a.windows(2).any(|w| w == ["-f", "pulse"]));
-        assert!(a.windows(2).any(|w| w == ["-c:a", "aac"]));
-    }
-
-    #[test]
-    fn linux_argv_mic_and_sys_uses_amix() {
-        let a = build_linux_ffmpeg_args(":0", "/tmp/out.mp4",
-            RecordingOptions::MIC_AND_SYS, Some("alsa_output.0.monitor"), None);
-        let fc = a.iter().position(|s| s == "-filter_complex").expect("missing -filter_complex");
-        assert!(a[fc + 1].contains("amix=inputs=2"),
-                "expected amix filter, got {:?}", a[fc + 1]);
-        assert!(a.iter().any(|s| s == "alsa_output.0.monitor"));
-    }
-
-    // Wayland argv-builder: raw frames on stdin instead of a capture device,
-    // then the same Pulse inputs the X11 path uses. Gated
-    // `#[cfg(any(target_os = "linux", test))]` like the others, so the Windows
-    // and macOS CI runners catch regressions in it too.
-
-    #[test]
-    fn wayland_argv_reads_raw_frames_from_stdin() {
-        let a = build_wayland_ffmpeg_args(
-            "bgr0", 2560, 1440, 30, "/tmp/out.mp4", RecordingOptions::NONE, None, None);
-        assert!(a.windows(2).any(|w| w == ["-f", "rawvideo"]),
-                "video must come from stdin, not a capture device: {a:?}");
-        assert!(a.windows(2).any(|w| w == ["-i", "pipe:0"]));
-        assert!(!a.iter().any(|s| s == "x11grab"),
-                "x11grab must never appear on the Wayland path: {a:?}");
-        assert!(a.windows(2).any(|w| w == ["-video_size", "2560x1440"]),
-                "the negotiated frame size must be declared: {a:?}");
-        assert!(a.windows(2).any(|w| w == ["-framerate", "30"]),
-                "rawvideo has no timestamps, so the rate must be declared: {a:?}");
-        assert_eq!(a.last().unwrap(), "/tmp/out.mp4");
-    }
-
-    #[test]
-    fn wayland_argv_declares_input_and_output_pixel_formats_separately() {
-        // The input `-pix_fmt` describes the bytes we write; the output one is
-        // what makes the MP4 playable. Collapsing them into one would either
-        // mangle the frames or produce a file consumer players refuse.
-        let a = build_wayland_ffmpeg_args(
-            "bgra", 800, 600, 30, "/tmp/out.mp4", RecordingOptions::NONE, None, None);
-        let input_pix = a.iter().position(|s| s == "-pix_fmt").expect("no input -pix_fmt");
-        assert_eq!(a[input_pix + 1], "bgra");
-        let input_i = a.iter().position(|s| s == "-i").expect("no -i");
-        assert!(input_pix < input_i, "input -pix_fmt must precede -i: {a:?}");
-        let output_pix = a.iter().rposition(|s| s == "-pix_fmt").expect("no output -pix_fmt");
-        assert_eq!(a[output_pix + 1], "yuv420p");
-        assert!(output_pix > input_i, "output -pix_fmt must follow the inputs: {a:?}");
-    }
-
-    #[test]
-    fn wayland_argv_keeps_the_same_pulse_audio_wiring_as_x11() {
-        // Audio does not change with the session type: PipeWire's Pulse shim
-        // serves the same inputs, at the same stream indices, so mic + monitor
-        // still amix over [1:a][2:a].
-        let a = build_wayland_ffmpeg_args(
-            "bgr0", 1920, 1080, 30, "/tmp/out.mp4",
-            RecordingOptions::MIC_AND_SYS, Some("alsa_output.0.monitor"), None);
-        assert!(a.windows(2).any(|w| w == ["-i", "default"]), "mic input missing: {a:?}");
-        assert!(a.iter().any(|s| s == "alsa_output.0.monitor"));
-        let fc = a.iter().position(|s| s == "-filter_complex").expect("missing -filter_complex");
-        assert!(a[fc + 1].contains("[1:a][2:a]amix=inputs=2"),
-                "video is still input 0 on this path, so the mix indices must \
-                 match X11's: {:?}", a[fc + 1]);
-        assert!(a.windows(2).any(|w| w == ["-map", "0:v"]));
-        assert!(a.windows(2).any(|w| w == ["-map", "[aout]"]));
-    }
-
-    #[test]
-    fn wayland_and_x11_argv_share_one_encode_tail() {
-        // The two builders differ only in their inputs. If they ever drift on
-        // codec, preset or mixing, the same recording would come out different
-        // on the two Linux session types — exactly the parity break this
-        // asserts against.
-        let tail_of = |v: &[String]| {
-            let at = v.iter().position(|s| s == "-c:v").expect("no encode tail");
-            v[at..].to_vec()
+    fn x11_lists_are_exact() {
+        let tail = |sound: &[&str]| {
+            let mut t = words(&["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-vf", EVEN_PAD]);
+            t.extend(words(sound));
+            t.push("/o.mp4".into());
+            t
         };
-        for opts in [RecordingOptions::NONE, RecordingOptions::MIC_ONLY,
-                     RecordingOptions::SYSTEM_ONLY, RecordingOptions::MIC_AND_SYS] {
-            let monitor = opts.system_audio.then_some("sink.monitor");
-            let x11 = build_linux_ffmpeg_args(":0", "/tmp/out.mp4", opts, monitor, None);
-            let way = build_wayland_ffmpeg_args(
-                "bgr0", 1920, 1080, 30, "/tmp/out.mp4", opts, monitor, None);
-            assert_eq!(tail_of(&x11), tail_of(&way), "encode tails diverged for {opts:?}");
-        }
-    }
+        let head = |inputs: &[&str]| {
+            let mut h = words(&["-y", "-f", "x11grab", "-framerate", "30"]);
+            h.extend(words(inputs));
+            h
+        };
+        let aac = ["-c:a", "aac", "-b:a", "160k"];
 
-    // Windows argv-builder: gdigrab video plus one raw-PCM TCP input per
-    // WASAPI source. Gated `#[cfg(any(target_os = "windows", test))]` so a
-    // Linux CI agent catches regressions in the argv we hand to ffmpeg.
+        let mut want = head(&["-i", ":0"]);
+        want.extend(tail(&[]));
+        assert_eq!(build_linux_ffmpeg_args(":0", "/o.mp4", RecordingOptions::NONE, None, None), want);
 
-    fn spec(port: u16, rate: u32, ch: u16, fmt: &'static str) -> WasapiAudioSpec {
-        WasapiAudioSpec { port, sample_rate: rate, channels: ch, ffmpeg_fmt: fmt }
-    }
+        let mut want = head(&["-i", ":0", "-f", "pulse", "-i", "default"]);
+        want.extend(tail(&aac));
+        assert_eq!(build_linux_ffmpeg_args(":0", "/o.mp4", RecordingOptions::MIC_ONLY, None, None), want);
 
-    #[test]
-    fn windows_argv_video_only_no_audio_sources() {
-        let a = build_windows_ffmpeg_args("C:/tmp/out.mp4", &[], None);
-        assert!(a.windows(2).any(|w| w == ["-f", "gdigrab"]),
-                "missing -f gdigrab in: {:?}", a);
-        assert!(a.windows(2).any(|w| w == ["-i", "desktop"]));
-        assert!(a.windows(2).any(|w| w == ["-c:v", "libx264"]));
-        assert!(!a.iter().any(|s| s.starts_with("tcp://")),
-                "no audio sockets when video-only: {:?}", a);
-        assert!(!a.iter().any(|s| s == "-c:a"), "audio codec should be absent when audio off");
-        assert_eq!(a.last().unwrap(), "C:/tmp/out.mp4");
+        let mut want = head(&["-i", ":0", "-f", "pulse", "-i", "s.monitor"]);
+        want.extend(tail(&aac));
+        assert_eq!(build_linux_ffmpeg_args(":0", "/o.mp4", RecordingOptions::SYSTEM_ONLY, Some("s.monitor"), None),
+                   want);
+
+        let mut want = head(&["-video_size", "640x480", "-i", ":0+320,180",
+                              "-f", "pulse", "-i", "default", "-f", "pulse", "-i", "s.monitor"]);
+        want.extend(tail(&["-filter_complex", MIX_TWO, "-map", "0:v", "-map", "[aout]",
+                           "-c:a", "aac", "-b:a", "160k"]));
+        assert_eq!(build_linux_ffmpeg_args(":0", "/o.mp4", RecordingOptions::MIC_AND_SYS, Some("s.monitor"),
+                                           Some(window_area())), want);
     }
 
     #[test]
-    fn windows_argv_single_source_maps_input_one() {
-        // One WASAPI source → input index 1 (gdigrab is 0). The declared
-        // format/rate/channels are exactly what the device reported.
-        let a = build_windows_ffmpeg_args("C:/tmp/out.mp4",
-            &[spec(54123, 48000, 2, "f32le")], None);
-        assert!(a.windows(2).any(|w| w == ["-f", "f32le"]),
-                "audio input format must match the device: {:?}", a);
-        assert!(a.windows(2).any(|w| w == ["-ar", "48000"]));
-        assert!(a.windows(2).any(|w| w == ["-ac", "2"]));
-        assert!(a.iter().any(|s| s == "tcp://127.0.0.1:54123"),
-                "missing loopback tcp input: {:?}", a);
-        assert!(a.windows(2).any(|w| w == ["-map", "0:v"]));
-        assert!(a.windows(2).any(|w| w == ["-map", "1:a"]));
-        assert!(a.windows(2).any(|w| w == ["-c:a", "aac"]));
-        assert_eq!(a.last().unwrap(), "C:/tmp/out.mp4");
+    fn wayland_lists_are_exact() {
+        let mut silent = words(&["-y", "-f", "rawvideo", "-pix_fmt", "bgr0", "-video_size", "1920x1080",
+                                 "-framerate", "30", "-thread_queue_size", "1024", "-i", "pipe:0"]);
+        let mut loud = silent.clone();
+        silent.extend(words(&["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                              "-vf", EVEN_PAD, "/o.mp4"]));
+        assert_eq!(build_wayland_ffmpeg_args("bgr0", 1920, 1080, 30, "/o.mp4", RecordingOptions::NONE, None, None),
+                   silent);
+
+        loud.extend(words(&["-f", "pulse", "-i", "default", "-f", "pulse", "-i", "s.monitor",
+                            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                            "-vf", "crop=640:480:320:180,pad=ceil(iw/2)*2:ceil(ih/2)*2",
+                            "-filter_complex", MIX_TWO, "-map", "0:v", "-map", "[aout]",
+                            "-c:a", "aac", "-b:a", "160k", "/o.mp4"]));
+        assert_eq!(build_wayland_ffmpeg_args("bgr0", 1920, 1080, 30, "/o.mp4", RecordingOptions::MIC_AND_SYS,
+                                             Some("s.monitor"), Some(window_area())), loud);
     }
 
     #[test]
-    fn windows_argv_two_sources_uses_amix() {
-        // mic + system loopback → two inputs (1 and 2) mixed to one AAC track.
-        let a = build_windows_ffmpeg_args("C:/tmp/out.mp4",
-            &[spec(40001, 48000, 2, "f32le"), spec(40002, 44100, 1, "s16le")], None);
-        let fc = a.iter().position(|s| s == "-filter_complex")
-            .expect("missing -filter_complex");
-        assert!(a[fc + 1].contains("[1:a][2:a]amix=inputs=2"),
-                "expected amix over both inputs, got {:?}", a[fc + 1]);
-        assert!(a.windows(2).any(|w| w == ["-map", "[aout]"]));
-        // Each source keeps its own declared format/rate.
-        assert!(a.iter().any(|s| s == "tcp://127.0.0.1:40001"));
-        assert!(a.iter().any(|s| s == "tcp://127.0.0.1:40002"));
-        assert!(a.windows(2).any(|w| w == ["-f", "s16le"]),
-                "second source's int16 format must be declared: {:?}", a);
+    fn macos_ffmpeg_lists_are_exact() {
+        let input = |devices: &str| words(&["-y", "-f", "avfoundation", "-framerate", "30", "-i", devices]);
+        let socket = |port: &str| words(&["-thread_queue_size", "1024", "-f", "f32le", "-ar", "48000",
+                                          "-ac", "2", "-i", port]);
+        let encode = |vf: &str| words(&["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-vf", vf]);
+        let stereo_aac = words(&["-c:a", "aac", "-b:a", "160k", "-ac", "2", "/o.mp4"]);
+
+        let mut want = input("2:");
+        want.extend(encode(EVEN_PAD));
+        want.push("/o.mp4".into());
+        assert_eq!(build_macos_ffmpeg_args(2, None, None, "/o.mp4", None), want);
+
+        let mut want = input("1:0");
+        want.extend(encode(EVEN_PAD));
+        want.extend(words(&["-map", "0:v", "-map", "0:a"]));
+        want.extend(stereo_aac.clone());
+        assert_eq!(build_macos_ffmpeg_args(1, Some(0), None, "/o.mp4", None), want);
+
+        let mut want = input("2:");
+        want.extend(socket("tcp://127.0.0.1:50321"));
+        want.extend(encode(EVEN_PAD));
+        want.extend(words(&["-map", "0:v", "-map", "1:a"]));
+        want.extend(stereo_aac.clone());
+        assert_eq!(build_macos_ffmpeg_args(2, None, Some(50321), "/o.mp4", None), want);
+
+        let mut want = input("1:0");
+        want.extend(socket("tcp://127.0.0.1:40044"));
+        want.extend(encode("crop=640:480:320:180,pad=ceil(iw/2)*2:ceil(ih/2)*2"));
+        want.extend(words(&["-filter_complex",
+                            "[0:a][1:a]amix=inputs=2:duration=longest:dropout_transition=0[aout]",
+                            "-map", "0:v", "-map", "[aout]"]));
+        want.extend(stereo_aac);
+        assert_eq!(build_macos_ffmpeg_args(1, Some(0), Some(40044), "/o.mp4", Some(window_area())), want);
     }
 
     #[test]
-    fn windows_argv_uses_thread_queue_size_per_audio_input() {
-        // Guards against demuxer packet drops while the encoder is busy.
-        let a = build_windows_ffmpeg_args("C:/tmp/out.mp4",
-            &[spec(50000, 48000, 2, "f32le")], None);
-        assert!(a.windows(2).any(|w| w == ["-thread_queue_size", "1024"]),
-                "audio input should set -thread_queue_size: {:?}", a);
-    }
+    fn windows_lists_are_exact() {
+        let encode = words(&["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-vf", EVEN_PAD]);
+        let stereo_aac = words(&["-c:a", "aac", "-b:a", "160k", "-ac", "2", "C:/o.mp4"]);
 
-    // macOS avfoundation: argv-builder, device-table parser, and picker.
-    // Same `#[cfg(any(target_os = "macos", test))]` strategy so a Linux CI
-    // agent catches regressions in the command we hand to ffmpeg on a Mac.
+        let mut want = words(&["-y", "-f", "gdigrab", "-framerate", "30", "-i", "desktop"]);
+        want.extend(encode.clone());
+        want.push("C:/o.mp4".into());
+        assert_eq!(build_windows_ffmpeg_args("C:/o.mp4", &[], None), want);
 
-    #[test]
-    fn macos_argv_mic_only_uses_avfoundation_fused_input() {
-        // Mic, no system audio → just the fused avfoundation input, no TCP.
-        let a = build_macos_ffmpeg_args(1, Some(0), None, "/tmp/out.mp4", None);
-        assert!(a.windows(2).any(|w| w == ["-f", "avfoundation"]),
-                "missing -f avfoundation in: {:?}", a);
-        assert!(a.windows(2).any(|w| w == ["-i", "1:0"]),
-                "expected fused -i 1:0 in: {:?}", a);
-        assert!(!a.iter().any(|s| s.starts_with("tcp://")),
-                "no system-audio socket when system audio is off: {:?}", a);
-        assert!(a.windows(2).any(|w| w == ["-map", "0:a"]));
-        assert!(a.windows(2).any(|w| w == ["-c:a", "aac"]));
-        assert!(a.windows(2).any(|w| w == ["-ac", "2"]));
-        assert_eq!(a.last().unwrap(), "/tmp/out.mp4");
-    }
+        let mut want = words(&["-y", "-f", "gdigrab", "-framerate", "30",
+                               "-offset_x", "320", "-offset_y", "180", "-video_size", "640x480",
+                               "-i", "desktop",
+                               "-thread_queue_size", "1024", "-f", "f32le", "-ar", "48000", "-ac", "2",
+                               "-i", "tcp://127.0.0.1:54123"]);
+        want.extend(encode.clone());
+        want.extend(words(&["-map", "0:v", "-map", "1:a"]));
+        want.extend(stereo_aac.clone());
+        assert_eq!(build_windows_ffmpeg_args("C:/o.mp4", &[wasapi(54123, 48000, 2, "f32le")], Some(window_area())),
+                   want);
 
-    #[test]
-    fn macos_argv_system_only_adds_sck_tcp_input() {
-        // System audio, no mic → video-only avf input plus the SCK TCP input
-        // mapped as the audio track.
-        let a = build_macos_ffmpeg_args(2, None, Some(50321), "/tmp/out.mp4", None);
-        assert!(a.windows(2).any(|w| w == ["-i", "2:"]),
-                "expected video-only fused input '2:' in: {:?}", a);
-        assert!(a.iter().any(|s| s == "tcp://127.0.0.1:50321"),
-                "missing SCK loopback input: {:?}", a);
-        assert!(a.windows(2).any(|w| w == ["-f", "f32le"]));
-        assert!(a.windows(2).any(|w| w == ["-map", "1:a"]));
-        assert!(a.windows(2).any(|w| w == ["-c:a", "aac"]));
+        let mut want = words(&["-y", "-f", "gdigrab", "-framerate", "30", "-i", "desktop",
+                               "-thread_queue_size", "1024", "-f", "f32le", "-ar", "48000", "-ac", "2",
+                               "-i", "tcp://127.0.0.1:40001",
+                               "-thread_queue_size", "1024", "-f", "s16le", "-ar", "44100", "-ac", "1",
+                               "-i", "tcp://127.0.0.1:40002"]);
+        want.extend(encode);
+        want.extend(words(&["-filter_complex", MIX_TWO, "-map", "0:v", "-map", "[aout]"]));
+        want.extend(stereo_aac);
+        assert_eq!(build_windows_ffmpeg_args("C:/o.mp4",
+            &[wasapi(40001, 48000, 2, "f32le"), wasapi(40002, 44100, 1, "s16le")], None), want);
     }
 
     #[test]
-    fn macos_argv_mic_and_system_uses_amix() {
-        // Mic (avf input 0 audio) + system audio (input 1) → amix to one track.
-        let a = build_macos_ffmpeg_args(1, Some(0), Some(40044), "/tmp/out.mp4", None);
-        let fc = a.iter().position(|s| s == "-filter_complex")
-            .expect("missing -filter_complex");
-        assert!(a[fc + 1].contains("[0:a][1:a]amix=inputs=2"),
-                "expected amix over mic + system, got {:?}", a[fc + 1]);
-        assert!(a.windows(2).any(|w| w == ["-map", "[aout]"]));
-        assert!(a.iter().any(|s| s == "tcp://127.0.0.1:40044"));
+    fn three_windows_sources_are_mixed_together() {
+        let sources = [wasapi(1, 48000, 2, "f32le"), wasapi(2, 48000, 2, "f32le"), wasapi(3, 48000, 2, "f32le")];
+        let args = build_windows_ffmpeg_args("C:/o.mp4", &sources, None);
+        assert_eq!(value_of(&args, "-filter_complex"),
+                   "[1:a][2:a][3:a]amix=inputs=3:duration=longest:dropout_transition=0[aout]");
+    }
+
+    // ---- X11
+
+    #[test]
+    fn x11_without_sound_has_no_pulse_inputs_or_audio_codec() {
+        let args = build_linux_ffmpeg_args(":0", "/tmp/out.mp4", RecordingOptions::NONE, None, None);
+        assert!(has(&args, "-f", "x11grab"));
+        assert!(has(&args, "-c:v", "libx264"));
+        assert!(!args.iter().any(|a| a == "pulse" || a == "-c:a"), "{args:?}");
+        assert_eq!(args.last().unwrap(), "/tmp/out.mp4");
     }
 
     #[test]
-    fn macos_argv_video_only_omits_audio_codec() {
-        // No mic, no system audio (shouldn't normally reach the builder, but be
-        // defensive): video-only input and no audio codec.
-        let a = build_macos_ffmpeg_args(2, None, None, "/tmp/out.mp4", None);
-        assert!(a.windows(2).any(|w| w == ["-i", "2:"]));
-        assert!(!a.iter().any(|s| s == "-c:a"),
-                "audio codec should be absent with no audio: {:?}", a);
+    fn x11_mic_is_the_default_pulse_source() {
+        let args = build_linux_ffmpeg_args(":0", "/tmp/out.mp4", RecordingOptions::MIC_ONLY, None, None);
+        assert!(has(&args, "-f", "pulse"));
+        assert!(has(&args, "-i", "default"));
+        assert!(has(&args, "-c:a", "aac"));
     }
 
     #[test]
-    fn parse_avfoundation_splits_video_and_audio() {
-        let sample = r#"
-[AVFoundation indev @ 0x7f] AVFoundation video devices:
-[AVFoundation indev @ 0x7f] [0] FaceTime HD Camera
-[AVFoundation indev @ 0x7f] [1] Capture screen 0
-[AVFoundation indev @ 0x7f] AVFoundation audio devices:
-[AVFoundation indev @ 0x7f] [0] MacBook Pro Microphone
-[AVFoundation indev @ 0x7f] [1] BlackHole 2ch
-"#;
-        let (video, audio) = parse_avfoundation_devices(sample);
-        assert_eq!(video, vec![(0, "FaceTime HD Camera".to_string()),
-                               (1, "Capture screen 0".to_string())]);
-        assert_eq!(audio, vec![(0, "MacBook Pro Microphone".to_string()),
-                               (1, "BlackHole 2ch".to_string())]);
-    }
-
-    #[test]
-    fn parse_avfoundation_handles_empty() {
-        let (v, a) = parse_avfoundation_devices("");
-        assert!(v.is_empty() && a.is_empty());
-    }
-
-    #[test]
-    fn pick_macos_screen_finds_capture_screen() {
-        let video = vec![(0, "FaceTime HD Camera".to_string()),
-                         (3, "Capture screen 0".to_string())];
-        assert_eq!(pick_macos_screen_index(&video).unwrap(), 3);
-    }
-
-    #[test]
-    fn pick_macos_screen_errors_without_capture_device() {
-        // Screen Recording permission not granted → screen devices vanish.
-        let video = vec![(0, "FaceTime HD Camera".to_string())];
-        let err = pick_macos_screen_index(&video).unwrap_err();
-        let Error::Recording(msg) = err else { panic!("wrong error variant") };
-        assert!(msg.to_lowercase().contains("screen recording"),
-                "should name the permission to grant: {msg}");
-    }
-
-    #[test]
-    fn pick_macos_mic_prefers_microphone_named_device() {
-        // System audio no longer routes through avfoundation, so the picker
-        // only chooses a mic — it should skip the Aggregate device and pick the
-        // real microphone.
-        let audio = vec![(0, "Aggregate Device".to_string()),
-                         (1, "MacBook Pro Microphone".to_string())];
-        assert_eq!(pick_macos_mic_device(&audio), Some(1));
-    }
-
-    #[test]
-    fn pick_macos_mic_falls_back_to_first_when_no_mic_named() {
-        let audio = vec![(0, "Line In".to_string()), (1, "Aux".to_string())];
-        assert_eq!(pick_macos_mic_device(&audio), Some(0));
-    }
-
-    #[test]
-    fn pick_macos_mic_none_when_no_audio_devices() {
-        assert_eq!(pick_macos_mic_device(&[]), None);
-    }
-
-    // Region recording: the same rectangle has to reach three very different
-    // capture stacks with the right coordinate convention on each, and the
-    // audio wiring must not shift by a single argument.
-
-    #[test]
-    fn linux_argv_region_sets_video_size_and_display_offset() {
-        let a = build_linux_ffmpeg_args(":0", "/tmp/out.mp4", RecordingOptions::NONE,
-                                        None, Some(region()));
-        assert!(a.windows(2).any(|w| w == ["-video_size", "640x480"]),
-                "region size must be declared before the input: {a:?}");
-        // x11grab carries the corner as a +X,Y suffix on the display name.
-        assert!(a.windows(2).any(|w| w == ["-i", ":0+320,180"]),
-                "expected display+offset input: {a:?}");
-        // -video_size only means anything ahead of the -i it applies to.
-        let vs = a.iter().position(|s| s == "-video_size").unwrap();
-        let i  = a.iter().position(|s| s == "-i").unwrap();
-        assert!(vs < i, "-video_size must precede -i: {a:?}");
-        assert_eq!(a.last().unwrap(), "/tmp/out.mp4");
-    }
-
-    #[test]
-    fn linux_argv_full_screen_has_no_region_flags() {
-        let a = build_linux_ffmpeg_args(":0", "/tmp/out.mp4", RecordingOptions::NONE, None, None);
-        assert!(!a.iter().any(|s| s == "-video_size"), "no size for a full grab: {a:?}");
-        assert!(a.windows(2).any(|w| w == ["-i", ":0"]), "bare display input: {a:?}");
-    }
-
-    #[test]
-    fn linux_argv_region_leaves_audio_wiring_alone() {
-        // The whole point of threading the rect through `start` rather than
-        // patching the x11grab branch: audio must be byte-identical.
-        let full = build_linux_ffmpeg_args(":0", "/tmp/o.mp4", RecordingOptions::MIC_AND_SYS,
+    fn x11_mic_and_monitor_are_mixed() {
+        let args = build_linux_ffmpeg_args(":0", "/tmp/out.mp4", RecordingOptions::MIC_AND_SYS,
                                            Some("alsa_output.0.monitor"), None);
-        let reg  = build_linux_ffmpeg_args(":0", "/tmp/o.mp4", RecordingOptions::MIC_AND_SYS,
-                                           Some("alsa_output.0.monitor"), Some(region()));
-        let audio_of = |a: &[String]| -> Vec<String> {
-            let start = a.iter().position(|s| s == "-c:v").unwrap();
-            a[start..].to_vec()
-        };
-        assert_eq!(audio_of(&full), audio_of(&reg),
-                   "everything from the video codec onward must match");
-        assert!(reg.windows(2).any(|w| w == ["-i", "alsa_output.0.monitor"]));
+        assert!(value_of(&args, "-filter_complex").contains("amix=inputs=2"));
+        assert!(has(&args, "-i", "alsa_output.0.monitor"));
     }
 
     #[test]
-    fn linux_argv_region_offsets_from_the_desktop_corner() {
-        // X11's root window starts at the desktop corner, so a desktop whose
-        // origin is not (0,0) must not be addressed with absolute coordinates.
-        let bounds = DesktopBounds::new(-1920, 0, 3840, 1080);
-        let r = record_rect_from_selection((-1600, 200, 800, 600), bounds).unwrap();
-        let a = build_linux_ffmpeg_args(":0.0", "/tmp/out.mp4", RecordingOptions::NONE,
-                                        None, Some(r));
-        assert!(a.windows(2).any(|w| w == ["-i", ":0.0+320,200"]),
-                "offset must be relative to the desktop corner: {a:?}");
+    fn x11_region_declares_its_size_before_the_offset_display() {
+        let args = build_linux_ffmpeg_args(":0", "/tmp/out.mp4", RecordingOptions::NONE, None, Some(window_area()));
+        assert!(has(&args, "-video_size", "640x480"));
+        assert!(has(&args, "-i", ":0+320,180"));
+        let size = args.iter().position(|a| a == "-video_size").unwrap();
+        let input = args.iter().position(|a| a == "-i").unwrap();
+        assert!(size < input, "x11grab only reads -video_size ahead of its -i: {args:?}");
     }
 
     #[test]
-    fn windows_argv_region_uses_gdigrab_offsets_before_the_input() {
-        let a = build_windows_ffmpeg_args("C:/tmp/out.mp4", &[], Some(region()));
-        assert!(a.windows(2).any(|w| w == ["-offset_x", "320"]), "{a:?}");
-        assert!(a.windows(2).any(|w| w == ["-offset_y", "180"]), "{a:?}");
-        assert!(a.windows(2).any(|w| w == ["-video_size", "640x480"]), "{a:?}");
-        assert!(a.windows(2).any(|w| w == ["-i", "desktop"]));
-        let ox = a.iter().position(|s| s == "-offset_x").unwrap();
-        let i  = a.iter().position(|s| s == "-i").unwrap();
-        assert!(ox < i, "gdigrab reads its offsets before -i: {a:?}");
+    fn x11_full_screen_has_a_bare_display() {
+        let args = build_linux_ffmpeg_args(":0", "/tmp/out.mp4", RecordingOptions::NONE, None, None);
+        assert!(!args.iter().any(|a| a == "-video_size"));
+        assert!(has(&args, "-i", ":0"));
     }
 
     #[test]
-    fn windows_argv_region_offsets_from_the_virtual_screen_corner() {
-        // gdigrab adds -offset_x to SM_XVIRTUALSCREEN, which is negative when a
-        // monitor sits left of the primary. Absolute coordinates would land the
-        // capture 1920 px to the right of what the user selected.
-        let bounds = DesktopBounds::new(-1920, -120, 3840, 1200);
-        let r = record_rect_from_selection((-1000, 0, 500, 400), bounds).unwrap();
-        let a = build_windows_ffmpeg_args("C:/tmp/out.mp4", &[], Some(r));
-        assert!(a.windows(2).any(|w| w == ["-offset_x", "920"]), "{a:?}");
-        assert!(a.windows(2).any(|w| w == ["-offset_y", "120"]), "{a:?}");
+    fn x11_region_leaves_the_sound_alone() {
+        let monitor = Some("alsa_output.0.monitor");
+        let whole = build_linux_ffmpeg_args(":0", "/o.mp4", RecordingOptions::MIC_AND_SYS, monitor, None);
+        let part = build_linux_ffmpeg_args(":0", "/o.mp4", RecordingOptions::MIC_AND_SYS, monitor, Some(window_area()));
+        assert_eq!(encoding(&whole), encoding(&part));
+        assert!(has(&part, "-i", "alsa_output.0.monitor"));
     }
 
     #[test]
-    fn windows_argv_region_leaves_audio_wiring_alone() {
-        let specs = [spec(40001, 48000, 2, "f32le"), spec(40002, 44100, 1, "s16le")];
-        let full = build_windows_ffmpeg_args("C:/o.mp4", &specs, None);
-        let reg  = build_windows_ffmpeg_args("C:/o.mp4", &specs, Some(region()));
-        let tail = |a: &[String]| -> Vec<String> {
-            let start = a.iter().position(|s| s == "-c:v").unwrap();
-            a[start..].to_vec()
-        };
-        assert_eq!(tail(&full), tail(&reg));
-        // Audio inputs keep their indices — the region adds no new input.
-        assert!(reg.iter().any(|s| s == "tcp://127.0.0.1:40001"));
-        assert!(reg.iter().any(|s| s == "tcp://127.0.0.1:40002"));
+    fn x11_region_counts_from_the_desktop_corner() {
+        // The root window begins at the desktop's corner, here 1920 left of
+        // the primary monitor.
+        let desktop = DesktopBounds::new(-1920, 0, 3840, 1080);
+        let area = record_rect_from_selection((-1600, 200, 800, 600), desktop).unwrap();
+        let args = build_linux_ffmpeg_args(":0.0", "/tmp/out.mp4", RecordingOptions::NONE, None, Some(area));
+        assert!(has(&args, "-i", ":0.0+320,200"), "{args:?}");
     }
 
     #[test]
-    fn windows_argv_full_screen_has_no_offsets() {
-        let a = build_windows_ffmpeg_args("C:/tmp/out.mp4", &[], None);
-        assert!(!a.iter().any(|s| s == "-offset_x"), "{a:?}");
-        assert!(!a.iter().any(|s| s == "-video_size"), "{a:?}");
+    fn losing_system_sound_keeps_the_mic() {
+        // What the Linux path does when no default sink can be named.
+        let mut got = RecordingOptions::MIC_AND_SYS;
+        got.system_audio = false;
+        assert_eq!(got, RecordingOptions::MIC_ONLY);
+        let args = build_linux_ffmpeg_args(":0", "/tmp/out.mp4", got, None, None);
+        assert!(has(&args, "-i", "default"));
+        assert!(!args.iter().any(|a| a.ends_with(".monitor") || a == "-filter_complex"), "{args:?}");
+    }
+
+    // ---- Wayland
+
+    #[test]
+    fn wayland_video_comes_from_stdin_with_its_size_and_rate() {
+        let args = build_wayland_ffmpeg_args("bgr0", 2560, 1440, 30, "/tmp/out.mp4", RecordingOptions::NONE, None, None);
+        assert!(has(&args, "-f", "rawvideo"));
+        assert!(has(&args, "-i", "pipe:0"));
+        assert!(has(&args, "-video_size", "2560x1440"));
+        assert!(has(&args, "-framerate", "30"));
+        assert!(!args.iter().any(|a| a == "x11grab"), "{args:?}");
+        assert_eq!(args.last().unwrap(), "/tmp/out.mp4");
     }
 
     #[test]
-    fn macos_screencapture_argv_region_passes_absolute_rect() {
-        // screencapture measures from the main display's corner, which is the
-        // origin of the absolute coordinates — no translation.
-        let a = build_macos_screencapture_args("/tmp/out.mp4", Some(region()));
-        assert_eq!(a, vec!["-v", "-R", "320,180,640,480", "/tmp/out.mp4"]);
+    fn wayland_input_and_output_pixel_formats_are_separate() {
+        let args = build_wayland_ffmpeg_args("bgra", 800, 600, 30, "/tmp/out.mp4", RecordingOptions::NONE, None, None);
+        let input = args.iter().position(|a| a == "-i").unwrap();
+        let first = args.iter().position(|a| a == "-pix_fmt").unwrap();
+        let last = args.iter().rposition(|a| a == "-pix_fmt").unwrap();
+        assert!(first < input && args[first + 1] == "bgra", "{args:?}");
+        assert!(last > input && args[last + 1] == "yuv420p", "{args:?}");
     }
 
     #[test]
-    fn macos_screencapture_argv_region_is_in_points_on_scaled_displays() {
-        // A 2x capture: the overlay handed back device pixels, screencapture
-        // wants points, so every field halves.
-        let bounds = DesktopBounds::new(0, 0, 2880, 1800).with_scale(2.0);
-        let r = record_rect_from_selection((200, 100, 800, 600), bounds).unwrap();
-        let a = build_macos_screencapture_args("/tmp/out.mp4", Some(r));
-        assert_eq!(a, vec!["-v", "-R", "100,50,400,300", "/tmp/out.mp4"]);
-        // The avfoundation crop stays in device pixels — that frame is
-        // delivered at device resolution.
-        assert!(video_filter_chain(Some(r)).starts_with("crop=800:600:200:100,"));
+    fn wayland_sound_is_wired_like_x11() {
+        let args = build_wayland_ffmpeg_args("bgr0", 1920, 1080, 30, "/tmp/out.mp4", RecordingOptions::MIC_AND_SYS,
+                                             Some("alsa_output.0.monitor"), None);
+        assert!(has(&args, "-i", "default"));
+        assert!(has(&args, "-i", "alsa_output.0.monitor"));
+        assert!(value_of(&args, "-filter_complex").starts_with("[1:a][2:a]amix=inputs=2"));
+        assert!(has(&args, "-map", "0:v") && has(&args, "-map", "[aout]"));
     }
 
     #[test]
-    fn macos_screencapture_argv_full_screen_is_unchanged() {
-        let a = build_macos_screencapture_args("/tmp/out.mp4", None);
-        assert_eq!(a, vec!["-v", "/tmp/out.mp4"]);
-    }
-
-    #[test]
-    fn macos_argv_region_crops_before_padding() {
-        // avfoundation has no capture rectangle, so the region is a filter.
-        let a = build_macos_ffmpeg_args(1, Some(0), None, "/tmp/out.mp4", Some(region()));
-        let vf = a.iter().position(|s| s == "-vf").expect("missing -vf");
-        assert_eq!(a[vf + 1], "crop=640:480:320:180,pad=ceil(iw/2)*2:ceil(ih/2)*2");
-        // Audio mapping is untouched by the crop.
-        assert!(a.windows(2).any(|w| w == ["-map", "0:a"]));
-    }
-
-    #[test]
-    fn macos_argv_full_screen_keeps_the_bare_pad_filter() {
-        let a = build_macos_ffmpeg_args(1, None, None, "/tmp/out.mp4", None);
-        let vf = a.iter().position(|s| s == "-vf").expect("missing -vf");
-        assert_eq!(a[vf + 1], "pad=ceil(iw/2)*2:ceil(ih/2)*2");
-    }
-
-    #[test]
-    fn every_backend_receives_even_dimensions() {
-        // The encoder-facing invariant, asserted where it actually reaches an
-        // encoder: an odd drag must never produce an odd -video_size / crop.
-        let r = record_rect_from_selection((11, 23, 401, 303), desktop()).unwrap();
-        assert_eq!(r.video_size(), "400x302");
-        let lin = build_linux_ffmpeg_args(":0", "/o.mp4", RecordingOptions::NONE, None, Some(r));
-        assert!(lin.windows(2).any(|w| w == ["-video_size", "400x302"]));
-        let win = build_windows_ffmpeg_args("C:/o.mp4", &[], Some(r));
-        assert!(win.windows(2).any(|w| w == ["-video_size", "400x302"]));
-        let mac = build_macos_screencapture_args("/o.mp4", Some(r));
-        assert!(mac.iter().any(|s| s == "11,23,400,302"), "{mac:?}");
-        let vf = video_filter_chain(Some(r));
-        assert!(vf.starts_with("crop=400:302:"), "{vf}");
-    }
-
-    // stderr ring buffer: what turns "recording stopped unexpectedly" into a
-    // message that names the cause.
-
-    #[test]
-    fn stderr_tail_keeps_only_the_last_lines() {
-        let t = StderrTail::new();
-        for i in 0..(STDERR_TAIL_LINES + 20) {
-            t.push_line(format!("line {i}").as_bytes());
+    fn wayland_and_x11_encode_the_same_way() {
+        for options in [RecordingOptions::NONE, RecordingOptions::MIC_ONLY,
+                        RecordingOptions::SYSTEM_ONLY, RecordingOptions::MIC_AND_SYS] {
+            let monitor = options.system_audio.then_some("sink.monitor");
+            let x11 = build_linux_ffmpeg_args(":0", "/tmp/out.mp4", options, monitor, None);
+            let wayland = build_wayland_ffmpeg_args("bgr0", 1920, 1080, 30, "/tmp/out.mp4", options, monitor, None);
+            assert_eq!(encoding(&x11), encoding(&wayland), "{options:?}");
         }
-        let text = t.text();
-        assert_eq!(text.lines().count(), STDERR_TAIL_LINES);
-        assert!(text.contains(&format!("line {}", STDERR_TAIL_LINES + 19)),
-                "newest line must survive: {text}");
-        assert!(!text.contains("line 0\n"), "oldest line must be evicted: {text}");
     }
 
     #[test]
-    fn stderr_tail_skips_progress_and_blank_lines() {
-        // ffmpeg emits one of these per second; sixteen of them would push the
-        // real diagnostic out of the window before anyone reads it.
-        let t = StderrTail::new();
-        t.push_line(b"No space left on device");
-        for _ in 0..40 {
-            t.push_line(b"frame= 1234 fps= 30 q=28.0 size=   65536kB");
-            t.push_line(b"   ");
+    fn wayland_region_crops_from_the_desktop_corner() {
+        let desktop = DesktopBounds::new(-1920, 0, 3840, 1080);
+        let area = record_rect_from_selection((-1600, 200, 800, 600), desktop).unwrap();
+        let args = build_wayland_ffmpeg_args("bgr0", 3840, 1080, 30, "/o.mp4", RecordingOptions::NONE, None, Some(area));
+        assert_eq!(value_of(&args, "-vf"), "crop=800:600:320:200,pad=ceil(iw/2)*2:ceil(ih/2)*2");
+    }
+
+    // ---- Windows
+
+    #[test]
+    fn windows_silent_recording_opens_no_socket() {
+        let args = build_windows_ffmpeg_args("C:/tmp/out.mp4", &[], None);
+        assert!(has(&args, "-f", "gdigrab") && has(&args, "-i", "desktop"));
+        assert!(has(&args, "-c:v", "libx264"));
+        assert!(!args.iter().any(|a| a.starts_with("tcp://") || a == "-c:a"), "{args:?}");
+        assert_eq!(args.last().unwrap(), "C:/tmp/out.mp4");
+    }
+
+    #[test]
+    fn windows_one_source_is_input_one_in_the_device_format() {
+        let args = build_windows_ffmpeg_args("C:/tmp/out.mp4", &[wasapi(54123, 48000, 2, "f32le")], None);
+        for (flag, value) in [("-f", "f32le"), ("-ar", "48000"), ("-ac", "2"), ("-i", "tcp://127.0.0.1:54123"),
+                              ("-map", "0:v"), ("-map", "1:a"), ("-c:a", "aac")] {
+            assert!(has(&args, flag, value), "{flag} {value} missing: {args:?}");
         }
-        assert_eq!(t.text(), "No space left on device");
     }
 
     #[test]
-    fn stderr_tail_reduces_output_to_printable_ascii() {
-        // The bitmap font can't render anything else, and control bytes would
-        // wreck the toast layout.
-        let t = StderrTail::new();
-        t.push_line("caf\u{e9}.mp4: \u{7} Invalid\targument".as_bytes());
-        assert_eq!(t.text(), "caf?.mp4: ? Invalid?argument");
-        assert!(t.text().is_ascii());
+    fn windows_two_sources_are_mixed_and_keep_their_formats() {
+        let args = build_windows_ffmpeg_args("C:/tmp/out.mp4",
+            &[wasapi(40001, 48000, 2, "f32le"), wasapi(40002, 44100, 1, "s16le")], None);
+        assert!(value_of(&args, "-filter_complex").starts_with("[1:a][2:a]amix=inputs=2"));
+        assert!(has(&args, "-map", "[aout]"));
+        assert!(has(&args, "-i", "tcp://127.0.0.1:40001") && has(&args, "-i", "tcp://127.0.0.1:40002"));
+        assert!(has(&args, "-f", "s16le"));
     }
 
     #[test]
-    fn stderr_tail_error_suffix_is_empty_without_diagnostics() {
-        let t = StderrTail::new();
-        assert_eq!(t.as_error_suffix(), "");
-        t.push_line(b"Device or resource busy");
-        assert!(t.as_error_suffix().starts_with("\n\n"));
-        assert!(t.as_error_suffix().contains("Device or resource busy"));
+    fn windows_sound_inputs_get_a_deep_queue() {
+        let args = build_windows_ffmpeg_args("C:/tmp/out.mp4", &[wasapi(50000, 48000, 2, "f32le")], None);
+        assert!(has(&args, "-thread_queue_size", "1024"));
     }
 
-    // Effective-options accounting: a caller that toasts what it asked for
-    // instead of what it got promises audio tracks that aren't in the file.
+    #[test]
+    fn windows_region_offsets_come_before_the_input() {
+        let args = build_windows_ffmpeg_args("C:/tmp/out.mp4", &[], Some(window_area()));
+        assert!(has(&args, "-offset_x", "320") && has(&args, "-offset_y", "180"));
+        assert!(has(&args, "-video_size", "640x480") && has(&args, "-i", "desktop"));
+        let offset = args.iter().position(|a| a == "-offset_x").unwrap();
+        let input = args.iter().position(|a| a == "-i").unwrap();
+        assert!(offset < input, "{args:?}");
+    }
 
     #[test]
-    fn recording_options_none_when_no_audio_requested() {
+    fn windows_region_counts_from_the_virtual_screen_corner() {
+        // SM_XVIRTUALSCREEN is negative with a monitor left of the primary.
+        let desktop = DesktopBounds::new(-1920, -120, 3840, 1200);
+        let area = record_rect_from_selection((-1000, 0, 500, 400), desktop).unwrap();
+        let args = build_windows_ffmpeg_args("C:/tmp/out.mp4", &[], Some(area));
+        assert!(has(&args, "-offset_x", "920") && has(&args, "-offset_y", "120"), "{args:?}");
+    }
+
+    #[test]
+    fn windows_region_leaves_the_sound_alone() {
+        let sources = [wasapi(40001, 48000, 2, "f32le"), wasapi(40002, 44100, 1, "s16le")];
+        let whole = build_windows_ffmpeg_args("C:/o.mp4", &sources, None);
+        let part = build_windows_ffmpeg_args("C:/o.mp4", &sources, Some(window_area()));
+        assert_eq!(encoding(&whole), encoding(&part));
+        assert!(has(&part, "-i", "tcp://127.0.0.1:40001") && has(&part, "-i", "tcp://127.0.0.1:40002"));
+    }
+
+    #[test]
+    fn windows_full_screen_has_no_offsets() {
+        let args = build_windows_ffmpeg_args("C:/tmp/out.mp4", &[], None);
+        assert!(!args.iter().any(|a| a == "-offset_x" || a == "-video_size"), "{args:?}");
+    }
+
+    // ---- macOS
+
+    #[test]
+    fn macos_mic_rides_in_the_avfoundation_input() {
+        let args = build_macos_ffmpeg_args(1, Some(0), None, "/tmp/out.mp4", None);
+        assert!(has(&args, "-f", "avfoundation") && has(&args, "-i", "1:0"));
+        assert!(!args.iter().any(|a| a.starts_with("tcp://")));
+        assert!(has(&args, "-map", "0:a") && has(&args, "-c:a", "aac") && has(&args, "-ac", "2"));
+        assert_eq!(args.last().unwrap(), "/tmp/out.mp4");
+    }
+
+    #[test]
+    fn macos_system_sound_is_a_socket_input() {
+        let args = build_macos_ffmpeg_args(2, None, Some(50321), "/tmp/out.mp4", None);
+        assert!(has(&args, "-i", "2:") && has(&args, "-i", "tcp://127.0.0.1:50321"));
+        assert!(has(&args, "-f", "f32le") && has(&args, "-map", "1:a") && has(&args, "-c:a", "aac"));
+    }
+
+    #[test]
+    fn macos_mic_and_system_sound_are_mixed() {
+        let args = build_macos_ffmpeg_args(1, Some(0), Some(40044), "/tmp/out.mp4", None);
+        assert!(value_of(&args, "-filter_complex").starts_with("[0:a][1:a]amix=inputs=2"));
+        assert!(has(&args, "-map", "[aout]") && has(&args, "-i", "tcp://127.0.0.1:40044"));
+    }
+
+    #[test]
+    fn macos_without_sound_has_no_audio_codec() {
+        let args = build_macos_ffmpeg_args(2, None, None, "/tmp/out.mp4", None);
+        assert!(has(&args, "-i", "2:"));
+        assert!(!args.iter().any(|a| a == "-c:a"), "{args:?}");
+    }
+
+    #[test]
+    fn macos_region_is_a_crop_ahead_of_the_pad() {
+        let args = build_macos_ffmpeg_args(1, Some(0), None, "/tmp/out.mp4", Some(window_area()));
+        assert_eq!(value_of(&args, "-vf"), "crop=640:480:320:180,pad=ceil(iw/2)*2:ceil(ih/2)*2");
+        assert!(has(&args, "-map", "0:a"));
+    }
+
+    #[test]
+    fn macos_full_screen_only_pads() {
+        let args = build_macos_ffmpeg_args(1, None, None, "/tmp/out.mp4", None);
+        assert_eq!(value_of(&args, "-vf"), EVEN_PAD);
+    }
+
+    #[test]
+    fn screencapture_gets_the_absolute_rectangle() {
+        // It counts from the main display's corner, like the absolute fields.
+        assert_eq!(build_macos_screencapture_args("/tmp/out.mp4", Some(window_area())),
+                   words(&["-v", "-R", "320,180,640,480", "/tmp/out.mp4"]));
+    }
+
+    #[test]
+    fn screencapture_rectangle_is_in_points_on_retina() {
+        let retina = DesktopBounds::new(0, 0, 2880, 1800).with_scale(2.0);
+        let area = record_rect_from_selection((200, 100, 800, 600), retina).unwrap();
+        assert_eq!(build_macos_screencapture_args("/tmp/out.mp4", Some(area)),
+                   words(&["-v", "-R", "100,50,400,300", "/tmp/out.mp4"]));
+        // avfoundation's frame is in device pixels, so its crop is not halved.
+        let args = build_macos_ffmpeg_args(1, None, None, "/tmp/out.mp4", Some(area));
+        assert!(value_of(&args, "-vf").starts_with("crop=800:600:200:100,"));
+    }
+
+    #[test]
+    fn screencapture_full_screen_is_just_the_file() {
+        assert_eq!(build_macos_screencapture_args("/tmp/out.mp4", None), words(&["-v", "/tmp/out.mp4"]));
+    }
+
+    #[test]
+    fn avfoundation_table_is_split_into_video_and_audio() {
+        let table = "\
+[AVFoundation indev @ 0x600002d1c000] AVFoundation video devices:
+[AVFoundation indev @ 0x600002d1c000] [0] Studio Display Camera
+[AVFoundation indev @ 0x600002d1c000] [1] Capture screen 0
+[AVFoundation indev @ 0x600002d1c000] [2] Capture screen 1
+[AVFoundation indev @ 0x600002d1c000] AVFoundation audio devices:
+[AVFoundation indev @ 0x600002d1c000] [0] Studio Display Microphone
+[AVFoundation indev @ 0x600002d1c000] [1] Loopback Audio
+";
+        let (video, audio) = parse_avfoundation_devices(table);
+        let named = |list: &[(usize, &str)]| list.iter().map(|&(i, n)| (i, n.to_string())).collect::<Vec<_>>();
+        assert_eq!(video, named(&[(0, "Studio Display Camera"), (1, "Capture screen 0"), (2, "Capture screen 1")]));
+        assert_eq!(audio, named(&[(0, "Studio Display Microphone"), (1, "Loopback Audio")]));
+    }
+
+    #[test]
+    fn an_empty_avfoundation_table_has_no_devices() {
+        let (video, audio) = parse_avfoundation_devices("");
+        assert!(video.is_empty() && audio.is_empty());
+    }
+
+    #[test]
+    fn avfoundation_rows_outside_a_section_or_without_a_number_are_skipped() {
+        let table = "\
+[AVFoundation indev @ 0x1] [0] Before any heading
+[AVFoundation indev @ 0x1] AVFoundation audio devices:
+[AVFoundation indev @ 0x1] [x] Not a number
+[AVFoundation indev @ 0x1] [2]
+[AVFoundation indev @ 0x1] [3] Real Mic
+";
+        let (video, audio) = parse_avfoundation_devices(table);
+        assert!(video.is_empty());
+        assert_eq!(audio, vec![(3, "Real Mic".to_string())]);
+    }
+
+    #[test]
+    fn the_screen_device_is_found_by_name() {
+        let cameras = [(0, "USB Webcam".to_string()), (4, "Capture Screen 0".to_string()),
+                       (5, "Capture screen 1".to_string())];
+        assert_eq!(pick_macos_screen_index(&cameras).ok(), Some(4), "the first screen, any case");
+    }
+
+    #[test]
+    fn no_screen_device_points_at_the_permission() {
+        let Err(Error::Recording(message)) = pick_macos_screen_index(&[(0, "FaceTime HD Camera".to_string())])
+        else { panic!("expected a recording error") };
+        assert!(message.to_lowercase().contains("screen recording"), "{message}");
+    }
+
+    #[test]
+    fn a_mic_sounding_device_beats_the_first_one() {
+        let devices = [(0, "Aggregate Device".to_string()), (1, "Loopback Audio".to_string()),
+                       (2, "USB Headset".to_string())];
+        assert_eq!(pick_macos_mic_device(&devices), Some(2));
+    }
+
+    #[test]
+    fn with_no_mic_sounding_device_the_first_is_used() {
+        let devices = [(3, "Line In".to_string()), (7, "Aux".to_string())];
+        assert_eq!(pick_macos_mic_device(&devices), Some(3));
+    }
+
+    #[test]
+    fn no_sound_devices_means_no_mic() {
+        assert!(pick_macos_mic_device(&[]).is_none());
+    }
+
+    // ---- every backend
+
+    #[test]
+    fn an_odd_selection_reaches_every_backend_even() {
+        let area = record_rect_from_selection((11, 23, 401, 303), one_screen()).unwrap();
+        assert_eq!(area.video_size(), "400x302");
+        assert!(has(&build_linux_ffmpeg_args(":0", "/o.mp4", RecordingOptions::NONE, None, Some(area)),
+                    "-video_size", "400x302"));
+        assert!(has(&build_windows_ffmpeg_args("C:/o.mp4", &[], Some(area)), "-video_size", "400x302"));
+        assert!(build_macos_screencapture_args("/o.mp4", Some(area)).iter().any(|a| a == "11,23,400,302"));
+        let mac = build_macos_ffmpeg_args(1, None, None, "/o.mp4", Some(area));
+        assert!(value_of(&mac, "-vf").starts_with("crop=400:302:"));
+    }
+
+    #[test]
+    fn has_audio_is_true_for_any_source() {
         assert!(!RecordingOptions::NONE.has_audio());
-        assert!(RecordingOptions::MIC_ONLY.has_audio());
-        assert!(RecordingOptions::SYSTEM_ONLY.has_audio());
-        assert!(RecordingOptions::MIC_AND_SYS.has_audio());
+        for on in [RecordingOptions::MIC_ONLY, RecordingOptions::SYSTEM_ONLY, RecordingOptions::MIC_AND_SYS] {
+            assert!(on.has_audio(), "{on:?}");
+        }
+    }
+
+    // ---- stderr
+
+    #[test]
+    fn the_tail_keeps_only_the_newest_lines() {
+        let tail = RecentStderr::new();
+        for n in 0..KEPT_LINES + 20 {
+            tail.keep(format!("line {n}").as_bytes());
+        }
+        let text = tail.joined();
+        assert_eq!(KEPT_LINES, text.lines().count());
+        assert!(text.ends_with(&format!("line {}", KEPT_LINES + 19)), "{text}");
+        assert!(!text.lines().any(|l| l == "line 0"), "{text}");
     }
 
     #[test]
-    fn dropping_system_audio_keeps_the_mic() {
-        // Mirrors the Linux path when `pactl get-default-sink` names nothing:
-        // system audio goes, the mic and video stay.
-        let mut opt = RecordingOptions::MIC_AND_SYS;
-        opt.system_audio = false;
-        assert_eq!(opt, RecordingOptions::MIC_ONLY);
-        let a = build_linux_ffmpeg_args(":0", "/tmp/out.mp4", opt, None, None);
-        assert!(a.windows(2).any(|w| w == ["-i", "default"]), "mic must survive: {a:?}");
-        assert!(!a.iter().any(|s| s.ends_with(".monitor")),
-                "no monitor source should be passed: {a:?}");
-        assert!(!a.iter().any(|s| s == "-filter_complex"),
-                "single source needs no amix: {a:?}");
+    fn progress_and_blank_lines_are_not_kept() {
+        let tail = RecentStderr::new();
+        tail.keep(b"No space left on device");
+        for _ in 0..KEPT_LINES * 2 {
+            tail.keep(b"frame= 1234 fps= 30 q=28.0 size=   65536kB");
+            tail.keep(b"size=   65536kB time=00:00:10.00");
+            tail.keep(b"   ");
+        }
+        assert_eq!(tail.joined(), "No space left on device");
+    }
+
+    #[test]
+    fn kept_lines_are_printable_ascii() {
+        let tail = RecentStderr::new();
+        tail.keep("caf\u{e9}.mp4: \u{7} Invalid\targument".as_bytes());
+        assert_eq!(tail.joined(), "caf?.mp4: ? Invalid?argument");
+    }
+
+    #[test]
+    fn the_error_suffix_is_empty_until_something_is_said() {
+        let tail = RecentStderr::new();
+        assert_eq!(tail.as_suffix(), "");
+        tail.keep(b"Device or resource busy");
+        assert_eq!(tail.as_suffix(), "\n\nDevice or resource busy");
+    }
+
+    #[test]
+    fn startup_diagnosis_keeps_the_last_six_lines() {
+        let said = (1..=10).map(|n| format!("  line {n}  ")).collect::<Vec<_>>().join("\n\n");
+        assert_eq!(startup_diagnosis(&said), "line 5\nline 6\nline 7\nline 8\nline 9\nline 10");
+    }
+
+    #[test]
+    fn startup_diagnosis_gives_advice_when_nothing_was_said() {
+        let advice = startup_diagnosis(" \n \n");
+        assert!(advice.contains("capture device") && advice.is_ascii(), "{advice}");
     }
 }

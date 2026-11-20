@@ -1,4 +1,5 @@
-//! Anti-aliased icon glyphs for the overlay toolbar / action panel.
+//! The glyphs on the editor's buttons: the tool panel, the action panel and
+//! the color flyout's pipette.
 //!
 //! One set, drawn alike (Brandon 2026-11-20, "refined line"): every icon is
 //! laid out on a 36-unit grid, the size of a panel button, in a single 2 unit
@@ -10,8 +11,10 @@
 use framefang_core::tool::Tool;
 use tiny_skia::{FillRule, LineCap, LineJoin, Paint, Path, PathBuilder, Pixmap, Stroke, Transform};
 
+/// Which glyph to draw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IconKind {
+    /// The tool panel's button for an annotation tool.
     Tool(Tool),
     Undo,
     Redo,
@@ -19,8 +22,8 @@ pub enum IconKind {
     Copy,
     Save,
     Close,
-    /// Record: the universal filled dot, ringed so it still reads as a button
-    /// glyph rather than a stray pixel at 36 px.
+    /// A ring with a solid dot inside. The ring keeps it looking like a
+    /// button at 36 px instead of a lone speck.
     Record,
     /// The flyout's color picker: a pipette, bulb up and right, drawn to
     /// fit a swatch-sized button rather than the panels' 36 px ones.
@@ -35,178 +38,205 @@ const KAPPA: f32 = 0.552_284_8;
 /// Draw `icon` into the box `x0..x1`, `y0..y1` of the frame, in `fg_rgba`.
 /// `accent_rgba` colors Record's dot.
 #[allow(clippy::too_many_arguments)]
-pub fn render_icon(
-    buf: &mut [u32], stride: usize, height: usize,
-    x0: i32, y0: i32, x1: i32, y1: i32,
-    icon: IconKind,
-    fg_rgba:    [u8; 4],
-    accent_rgba: Option<[u8; 4]>,
-) {
-    let w = (x1 - x0).max(1) as u32;
-    let h = (y1 - y0).max(1) as u32;
-    let Some(mut pixmap) = Pixmap::new(w, h) else { return; };
-    let paint = paint_of(fg_rgba, 255);
-    let (cw, ch) = (w as f32, h as f32);
-    // The grid, centered in the box. The eyedropper's box is a swatch, a
-    // little over half a button: its own 21 unit grid.
-    let units = if icon == IconKind::Eyedropper { 21.0 } else { 36.0 };
-    let k = cw.min(ch) / units;
-    let ts = Transform::from_row(k, 0.0, 0.0, k, cw / 2.0 - units / 2.0 * k, ch / 2.0 - units / 2.0 * k);
-    let mut g = Glyph { pm: &mut pixmap, ts };
-    let line = stroke_of(LINE);
+pub fn render_icon(buf: &mut [u32], stride: usize, height: usize, x0: i32, y0: i32, x1: i32, y1: i32,
+                   icon: IconKind, fg_rgba: [u8; 4], accent_rgba: Option<[u8; 4]>) {
+    let (box_w, box_h) = ((x1 - x0).max(1) as u32, (y1 - y0).max(1) as u32);
+    let Some(mut canvas) = Pixmap::new(box_w, box_h) else { return };
+    {
+        let mut g = Glyph { pm: &mut canvas, ts: grid_transform(icon, box_w as f32, box_h as f32) };
+        let ink = Ink { solid: paint_of(fg_rgba, 255), fg: fg_rgba, line: stroke_of(LINE) };
+        match icon {
+            IconKind::Tool(tool) => draw_tool(&mut g, &ink, tool),
+            other => draw_action(&mut g, &ink, other, accent_rgba),
+        }
+    }
+    composite(buf, stride, height, (x0, y0), &canvas);
+}
 
-    match icon {
-        IconKind::Tool(Tool::Pen) => {
+/// Maps grid units onto the box: scaled to its shorter side and centred.
+fn grid_transform(icon: IconKind, w: f32, h: f32) -> Transform {
+    // The pipette sits in a swatch button, which is a bit over half a panel
+    // button, so it has its own 21 unit grid.
+    let units = if icon == IconKind::Eyedropper { 21.0 } else { 36.0 };
+    let scale = w.min(h) / units;
+    let half_span = units / 2.0 * scale;
+    Transform::from_row(scale, 0.0, 0.0, scale, w / 2.0 - half_span, h / 2.0 - half_span)
+}
+
+/// The paints and the standard line one glyph is drawn with.
+struct Ink {
+    solid: Paint<'static>,
+    fg: [u8; 4],
+    line: Stroke,
+}
+
+impl Ink {
+    /// The foreground at `alpha` (out of 255) of its own opacity.
+    fn faded(&self, alpha: u8) -> Paint<'static> { paint_of(self.fg, alpha) }
+}
+
+fn draw_tool(g: &mut Glyph, ink: &Ink, tool: Tool) {
+    let (paint, line) = (&ink.solid, &ink.line);
+    match tool {
+        Tool::Pen => {
             // A pen leaning right, with the squiggle it has just drawn
             // running into its tip (Brandon 2026-11-20, option A).
             let tip = (14.5, 21.5);
             if let Some((barrel, nib)) = pen(tip, 45.0, 11.5, 3.1, 4.8) {
-                g.stroke(&barrel, &paint, &line);
-                g.fill(&nib, &paint);
+                g.stroke(&barrel, paint, line);
+                g.fill(&nib, paint);
             }
-            g.stroke_opt(pen_band(tip, 45.0, 3.1, 13.0), &paint, &stroke_of(1.6));
-            g.stroke_opt(curve(&[(6.0, 27.5), (8.5, 24.0), (11.0, 28.0), (13.5, 23.5)]), &paint, &line);
+            g.stroke_opt(pen_band(tip, 45.0, 3.1, 13.0), paint, &stroke_of(1.6));
+            g.stroke_opt(curve(&[(6.0, 27.5), (8.5, 24.0), (11.0, 28.0), (13.5, 23.5)]), paint, line);
         }
-        IconKind::Tool(Tool::Line) => {
-            g.stroke_opt(poly(&[(10.0, 26.0), (26.0, 10.0)], false), &paint, &line);
+        Tool::Line => g.stroke_opt(poly(&[(10.0, 26.0), (26.0, 10.0)], false), paint, line),
+        Tool::Arrow => {
+            g.stroke_opt(poly(&[(10.0, 26.0), (26.0, 10.0)], false), paint, line);
+            g.stroke_opt(poly(&[(17.5, 10.0), (26.0, 10.0), (26.0, 18.5)], false), paint, line);
         }
-        IconKind::Tool(Tool::Arrow) => {
-            g.stroke_opt(poly(&[(10.0, 26.0), (26.0, 10.0)], false), &paint, &line);
-            g.stroke_opt(poly(&[(17.5, 10.0), (26.0, 10.0), (26.0, 18.5)], false), &paint, &line);
-        }
-        IconKind::Tool(Tool::Rectangle) => {
-            g.stroke_opt(round_rect(9.0, 10.5, 18.0, 15.0, 2.5), &paint, &line);
-        }
-        IconKind::Tool(Tool::Ellipse) => {
-            g.stroke_opt(oval(18.0, 18.0, 9.5, 8.0), &paint, &line);
-        }
-        IconKind::Tool(Tool::Marker) => {
+        Tool::Rectangle => g.stroke_opt(round_rect(9.0, 10.5, 18.0, 15.0, 2.5), paint, line),
+        Tool::Ellipse => g.stroke_opt(oval(18.0, 18.0, 9.5, 8.0), paint, line),
+        Tool::Marker => {
             // A chisel highlighter, wider than the pen, over the broad wash
             // it leaves.
             let tip = (12.5, 21.0);
             if let Some((barrel, nib)) = pen(tip, 45.0, 11.0, 4.3, 4.0) {
-                g.stroke(&barrel, &paint, &line);
-                g.fill(&nib, &paint);
+                g.stroke(&barrel, paint, line);
+                g.fill(&nib, paint);
             }
-            g.stroke_opt(poly(&[(8.5, 27.0), (27.5, 27.0)], false), &paint_of(fg_rgba, 110), &stroke_of(4.0));
+            g.stroke_opt(poly(&[(8.5, 27.0), (27.5, 27.0)], false), &ink.faded(110), &stroke_of(4.0));
         }
-        IconKind::Tool(Tool::Highlight) => {
+        Tool::Highlight => {
             // Three lines of text, the middle one highlighted.
-            g.fill_opt(round_rect(8.0, 14.0, 20.0, 8.0, 2.0), &paint_of(fg_rgba, 105));
-            g.stroke_opt(poly(&[(10.0, 10.0), (24.0, 10.0)], false), &paint, &line);
-            g.stroke_opt(poly(&[(11.0, 18.0), (25.0, 18.0)], false), &paint, &line);
-            g.stroke_opt(poly(&[(10.0, 26.0), (20.0, 26.0)], false), &paint, &line);
+            g.fill_opt(round_rect(8.0, 14.0, 20.0, 8.0, 2.0), &ink.faded(105));
+            g.stroke_opt(poly(&[(10.0, 10.0), (24.0, 10.0)], false), paint, line);
+            g.stroke_opt(poly(&[(11.0, 18.0), (25.0, 18.0)], false), paint, line);
+            g.stroke_opt(poly(&[(10.0, 26.0), (20.0, 26.0)], false), paint, line);
         }
-        IconKind::Tool(Tool::Text) => {
-            g.stroke_opt(poly(&[(10.5, 11.0), (25.5, 11.0)], false), &paint, &line);
-            g.stroke_opt(poly(&[(18.0, 11.0), (18.0, 26.0)], false), &paint, &line);
-            g.stroke_opt(poly(&[(15.0, 26.0), (21.0, 26.0)], false), &paint, &line);
+        Tool::Text => {
+            g.stroke_opt(poly(&[(10.5, 11.0), (25.5, 11.0)], false), paint, line);
+            g.stroke_opt(poly(&[(18.0, 11.0), (18.0, 26.0)], false), paint, line);
+            g.stroke_opt(poly(&[(15.0, 26.0), (21.0, 26.0)], false), paint, line);
         }
-        IconKind::Tool(Tool::Step) => {
-            g.stroke_opt(oval(18.0, 18.0, 9.5, 9.5), &paint, &line);
-            g.stroke_opt(poly(&[(15.8, 15.6), (18.6, 13.4), (18.6, 22.8)], false), &paint, &line);
+        Tool::Step => {
+            g.stroke_opt(oval(18.0, 18.0, 9.5, 9.5), paint, line);
+            g.stroke_opt(poly(&[(15.8, 15.6), (18.6, 13.4), (18.6, 22.8)], false), paint, line);
         }
-        IconKind::Tool(Tool::Pixelate) => {
+        Tool::Pixelate => {
             // A square cut in thirds, two of its cells filled: low-res.
-            g.stroke_opt(round_rect(9.0, 9.0, 18.0, 18.0, 2.5), &paint, &line);
-            g.stroke_opt(poly(&[(15.0, 9.0), (15.0, 27.0)], false), &paint_of(fg_rgba, 150), &stroke_of(1.4));
-            g.stroke_opt(poly(&[(21.0, 9.0), (21.0, 27.0)], false), &paint_of(fg_rgba, 150), &stroke_of(1.4));
-            g.stroke_opt(poly(&[(9.0, 15.0), (27.0, 15.0)], false), &paint_of(fg_rgba, 150), &stroke_of(1.4));
-            g.stroke_opt(poly(&[(9.0, 21.0), (27.0, 21.0)], false), &paint_of(fg_rgba, 150), &stroke_of(1.4));
-            g.fill_opt(rect(15.0, 9.0, 6.0, 6.0), &paint_of(fg_rgba, 200));
-            g.fill_opt(rect(9.0, 15.0, 6.0, 6.0), &paint_of(fg_rgba, 120));
-            g.fill_opt(rect(21.0, 21.0, 6.0, 6.0), &paint_of(fg_rgba, 200));
+            g.stroke_opt(round_rect(9.0, 9.0, 18.0, 18.0, 2.5), paint, line);
+            let (grid_paint, grid_line) = (ink.faded(150), stroke_of(1.4));
+            for at in [15.0, 21.0] {
+                g.stroke_opt(poly(&[(at, 9.0), (at, 27.0)], false), &grid_paint, &grid_line);
+            }
+            for at in [15.0, 21.0] {
+                g.stroke_opt(poly(&[(9.0, at), (27.0, at)], false), &grid_paint, &grid_line);
+            }
+            g.fill_opt(rect(15.0, 9.0, 6.0, 6.0), &ink.faded(200));
+            g.fill_opt(rect(9.0, 15.0, 6.0, 6.0), &ink.faded(120));
+            g.fill_opt(rect(21.0, 21.0, 6.0, 6.0), &ink.faded(200));
         }
-        IconKind::Tool(Tool::Spotlight) => {
+        Tool::Spotlight => {
             // A dimmed field, and the lit part of it bright and framed.
-            g.fill_opt(round_rect(8.0, 9.0, 20.0, 18.0, 3.0), &paint_of(fg_rgba, 70));
-            g.fill_opt(round_rect(13.5, 13.5, 9.0, 9.0, 1.5), &paint);
+            g.fill_opt(round_rect(8.0, 9.0, 20.0, 18.0, 3.0), &ink.faded(70));
+            g.fill_opt(round_rect(13.5, 13.5, 9.0, 9.0, 1.5), paint);
         }
-        IconKind::Tool(Tool::Magnify) => {
-            g.stroke_opt(oval(16.0, 16.0, 6.8, 6.8), &paint, &line);
-            g.stroke_opt(poly(&[(21.0, 21.0), (26.5, 26.5)], false), &paint, &stroke_of(2.6));
+        Tool::Magnify => {
+            g.stroke_opt(oval(16.0, 16.0, 6.8, 6.8), paint, line);
+            g.stroke_opt(poly(&[(21.0, 21.0), (26.5, 26.5)], false), paint, &stroke_of(2.6));
         }
-        IconKind::Tool(Tool::Crop) => {
-            g.stroke_opt(poly(&[(13.0, 8.5), (13.0, 23.0), (27.5, 23.0)], false), &paint, &line);
-            g.stroke_opt(poly(&[(8.5, 13.0), (23.0, 13.0), (23.0, 27.5)], false), &paint, &line);
+        Tool::Crop => {
+            g.stroke_opt(poly(&[(13.0, 8.5), (13.0, 23.0), (27.5, 23.0)], false), paint, line);
+            g.stroke_opt(poly(&[(8.5, 13.0), (23.0, 13.0), (23.0, 27.5)], false), paint, line);
         }
-        IconKind::Undo | IconKind::Redo => {
-            // A return arrow: out along the top, round the turn, back along
-            // the bottom; Redo is its mirror.
-            let m = |x: f32| if icon == IconKind::Undo { x } else { 36.0 - x };
-            let mut pb = PathBuilder::new();
-            pb.move_to(m(10.0), 14.0);
-            pb.line_to(m(21.0), 14.0);
-            pb.cubic_to(m(21.0 + 5.5 * KAPPA), 14.0, m(26.5), 19.5 - 5.5 * KAPPA, m(26.5), 19.5);
-            pb.cubic_to(m(26.5), 19.5 + 5.5 * KAPPA, m(21.0 + 5.5 * KAPPA), 25.0, m(21.0), 25.0);
-            pb.line_to(m(15.0), 25.0);
-            g.stroke_opt(pb.finish(), &paint, &line);
-            g.stroke_opt(poly(&[(m(14.5), 9.5), (m(10.0), 14.0), (m(14.5), 18.5)], false), &paint, &line);
-        }
+    }
+}
+
+/// Every glyph that is not a tool: undo and redo, the action panel's
+/// buttons and the pipette.
+fn draw_action(g: &mut Glyph, ink: &Ink, icon: IconKind, accent: Option<[u8; 4]>) {
+    let (paint, line) = (&ink.solid, &ink.line);
+    match icon {
+        IconKind::Tool(tool) => draw_tool(g, ink, tool),
+        IconKind::Undo => return_arrow(g, ink, false),
+        IconKind::Redo => return_arrow(g, ink, true),
         IconKind::Pin => {
             // A map pin, outlined, its center marked.
-            let mut pb = PathBuilder::new();
             let (hx, hy, r, tip) = (18.0, 15.5, 6.5, 28.0);
-            pb.move_to(hx, tip);
-            pb.cubic_to(hx - 2.0, tip - 3.5, hx - r, hy + r * 0.9, hx - r, hy);
-            pb.cubic_to(hx - r, hy - r * KAPPA * 1.0, hx - r * KAPPA, hy - r, hx, hy - r);
-            pb.cubic_to(hx + r * KAPPA, hy - r, hx + r, hy - r * KAPPA, hx + r, hy);
-            pb.cubic_to(hx + r, hy + r * 0.9, hx + 2.0, tip - 3.5, hx, tip);
-            pb.close();
-            g.stroke_opt(pb.finish(), &paint, &line);
-            g.fill_opt(oval(hx, hy, 2.2, 2.2), &paint);
+            let mut body = PathBuilder::new();
+            body.move_to(hx, tip);
+            body.cubic_to(hx - 2.0, tip - 3.5, hx - r, hy + r * 0.9, hx - r, hy);
+            body.cubic_to(hx - r, hy - r * KAPPA, hx - r * KAPPA, hy - r, hx, hy - r);
+            body.cubic_to(hx + r * KAPPA, hy - r, hx + r, hy - r * KAPPA, hx + r, hy);
+            body.cubic_to(hx + r, hy + r * 0.9, hx + 2.0, tip - 3.5, hx, tip);
+            body.close();
+            g.stroke_opt(body.finish(), paint, line);
+            g.fill_opt(oval(hx, hy, 2.2, 2.2), paint);
         }
         IconKind::Copy => {
             // The front sheet whole; of the one behind, only what shows.
-            g.stroke_opt(round_rect(9.0, 9.0, 13.5, 13.5, 2.5), &paint, &line);
-            let mut pb = PathBuilder::new();
-            pb.move_to(22.5, 13.5);
-            pb.line_to(24.5, 13.5);
-            pb.cubic_to(25.9, 13.5, 27.0, 14.6, 27.0, 16.0);
-            pb.line_to(27.0, 24.5);
-            pb.cubic_to(27.0, 25.9, 25.9, 27.0, 24.5, 27.0);
-            pb.line_to(16.0, 27.0);
-            pb.cubic_to(14.6, 27.0, 13.5, 25.9, 13.5, 24.5);
-            pb.line_to(13.5, 22.5);
-            g.stroke_opt(pb.finish(), &paint, &line);
+            g.stroke_opt(round_rect(9.0, 9.0, 13.5, 13.5, 2.5), paint, line);
+            let mut back = PathBuilder::new();
+            back.move_to(22.5, 13.5);
+            back.line_to(24.5, 13.5);
+            back.cubic_to(25.9, 13.5, 27.0, 14.6, 27.0, 16.0);
+            back.line_to(27.0, 24.5);
+            back.cubic_to(27.0, 25.9, 25.9, 27.0, 24.5, 27.0);
+            back.line_to(16.0, 27.0);
+            back.cubic_to(14.6, 27.0, 13.5, 25.9, 13.5, 24.5);
+            back.line_to(13.5, 22.5);
+            g.stroke_opt(back.finish(), paint, line);
         }
         IconKind::Save => {
             // A floppy disk: a rounded body with its corner cut, the shutter
             // at the top and the label at the bottom.
-            let mut pb = PathBuilder::new();
-            pb.move_to(11.5, 9.0);
-            pb.line_to(23.0, 9.0);
-            pb.line_to(27.0, 13.0);
-            pb.line_to(27.0, 24.5);
-            pb.cubic_to(27.0, 25.9, 25.9, 27.0, 24.5, 27.0);
-            pb.line_to(11.5, 27.0);
-            pb.cubic_to(10.1, 27.0, 9.0, 25.9, 9.0, 24.5);
-            pb.line_to(9.0, 11.5);
-            pb.cubic_to(9.0, 10.1, 10.1, 9.0, 11.5, 9.0);
-            pb.close();
-            g.stroke_opt(pb.finish(), &paint, &line);
-            g.stroke_opt(poly(&[(13.0, 9.0), (13.0, 13.5), (21.0, 13.5), (21.0, 9.0)], false), &paint, &line);
-            g.stroke_opt(poly(&[(12.5, 27.0), (12.5, 20.0), (23.5, 20.0), (23.5, 27.0)], false), &paint, &line);
+            let mut disk = PathBuilder::new();
+            disk.move_to(11.5, 9.0);
+            disk.line_to(23.0, 9.0);
+            disk.line_to(27.0, 13.0);
+            disk.line_to(27.0, 24.5);
+            disk.cubic_to(27.0, 25.9, 25.9, 27.0, 24.5, 27.0);
+            disk.line_to(11.5, 27.0);
+            disk.cubic_to(10.1, 27.0, 9.0, 25.9, 9.0, 24.5);
+            disk.line_to(9.0, 11.5);
+            disk.cubic_to(9.0, 10.1, 10.1, 9.0, 11.5, 9.0);
+            disk.close();
+            g.stroke_opt(disk.finish(), paint, line);
+            g.stroke_opt(poly(&[(13.0, 9.0), (13.0, 13.5), (21.0, 13.5), (21.0, 9.0)], false), paint, line);
+            g.stroke_opt(poly(&[(12.5, 27.0), (12.5, 20.0), (23.5, 20.0), (23.5, 27.0)], false), paint, line);
         }
         IconKind::Close => {
-            g.stroke_opt(poly(&[(11.0, 11.0), (25.0, 25.0)], false), &paint, &line);
-            g.stroke_opt(poly(&[(25.0, 11.0), (11.0, 25.0)], false), &paint, &line);
+            g.stroke_opt(poly(&[(11.0, 11.0), (25.0, 25.0)], false), paint, line);
+            g.stroke_opt(poly(&[(25.0, 11.0), (11.0, 25.0)], false), paint, line);
         }
         IconKind::Record => {
-            g.stroke_opt(oval(18.0, 18.0, 9.5, 9.5), &paint, &line);
-            g.fill_opt(oval(18.0, 18.0, 5.0, 5.0), &paint_of(accent_rgba.unwrap_or(fg_rgba), 255));
+            g.stroke_opt(oval(18.0, 18.0, 9.5, 9.5), paint, line);
+            g.fill_opt(oval(18.0, 18.0, 5.0, 5.0), &paint_of(accent.unwrap_or(ink.fg), 255));
         }
         IconKind::Eyedropper => {
             // On its own 21 unit grid: the glass tube with its tip at the
             // lower left, the collar across it, the bulb.
             let thin = stroke_of(1.8);
-            g.stroke_opt(poly(&[(5.0, 16.0), (12.5, 8.5)], false), &paint, &thin);
-            g.stroke_opt(poly(&[(10.0, 7.0), (14.0, 11.0)], false), &paint, &thin);
-            g.fill_opt(oval(14.5, 6.5, 2.8, 2.8), &paint);
+            g.stroke_opt(poly(&[(5.0, 16.0), (12.5, 8.5)], false), paint, &thin);
+            g.stroke_opt(poly(&[(10.0, 7.0), (14.0, 11.0)], false), paint, &thin);
+            g.fill_opt(oval(14.5, 6.5, 2.8, 2.8), paint);
         }
     }
+}
 
-    blit_pixmap(buf, stride, height, x0, y0, &pixmap);
+/// Undo's glyph, a return arrow: out along the top, round the turn, back
+/// along the bottom. `mirrored` flips it left to right for Redo.
+fn return_arrow(g: &mut Glyph, ink: &Ink, mirrored: bool) {
+    let x = |v: f32| if mirrored { 36.0 - v } else { v };
+    let bend = 5.5 * KAPPA;
+    let mut hook = PathBuilder::new();
+    hook.move_to(x(10.0), 14.0);
+    hook.line_to(x(21.0), 14.0);
+    hook.cubic_to(x(21.0 + bend), 14.0, x(26.5), 19.5 - bend, x(26.5), 19.5);
+    hook.cubic_to(x(26.5), 19.5 + bend, x(21.0 + bend), 25.0, x(21.0), 25.0);
+    hook.line_to(x(15.0), 25.0);
+    g.stroke_opt(hook.finish(), &ink.solid, &ink.line);
+    g.stroke_opt(poly(&[(x(14.5), 9.5), (x(10.0), 14.0), (x(14.5), 18.5)], false), &ink.solid, &ink.line);
 }
 
 /// A pixmap and the grid's transform onto it.
@@ -313,36 +343,35 @@ fn curve(pts: &[(f32, f32)]) -> Option<Path> {
     pb.finish()
 }
 
-/// Source-over blit of a tiny-skia premultiplied pixmap into the softbuffer
-/// u32 framebuffer. Premultiplied → straight blend formula:
-///   `dst = src + dst * (1 - src.a)` with src already in `(R*A, G*A, B*A)`.
-fn blit_pixmap(
-    buf: &mut [u32], stride: usize, height: usize,
-    x: i32, y: i32, pixmap: &Pixmap,
-) {
-    let pw = pixmap.width()  as i32;
-    let ph = pixmap.height() as i32;
-    let pixels = pixmap.pixels();
-    for py in 0..ph {
-        for px in 0..pw {
-            let pix = pixels[(py * pw + px) as usize];
-            let a = pix.alpha() as u32;
-            if a == 0 { continue; }
-            let dst_x = x + px;
-            let dst_y = y + py;
-            if dst_x < 0 || (dst_x as usize) >= stride { continue; }
-            if dst_y < 0 || (dst_y as usize) >= height { continue; }
-            let dst_idx = dst_y as usize * stride + dst_x as usize;
-            let dst = buf[dst_idx];
-            let dr = (dst >> 16) & 0xFF;
-            let dg = (dst >> 8)  & 0xFF;
-            let db =  dst        & 0xFF;
-            let inv = 255 - a;
-            // pix.red() etc. on PremultipliedColorU8 are already premultiplied.
-            let r = (pix.red()   as u32) + (dr * inv + 127) / 255;
-            let g = (pix.green() as u32) + (dg * inv + 127) / 255;
-            let b = (pix.blue()  as u32) + (db * inv + 127) / 255;
-            buf[dst_idx] = (r.min(255) << 16) | (g.min(255) << 8) | b.min(255);
+/// Lays the drawn glyph over the 0RGB frame with its top left corner at
+/// `origin`, clipped to the frame.
+///
+/// tiny-skia keeps its colors premultiplied by alpha, so "over" is simply
+/// the glyph's channel plus what shows through of the frame:
+/// `out = src + dst * (255 - alpha) / 255`, rounded to nearest.
+fn composite(frame: &mut [u32], stride: usize, height: usize, origin: (i32, i32), glyph: &Pixmap) {
+    let gw = glyph.width() as usize;
+    // Glyph columns and rows that land inside the frame.
+    let col_start = (-origin.0).max(0) as usize;
+    let row_start = (-origin.1).max(0) as usize;
+    let col_end = (stride as i64 - origin.0 as i64).clamp(0, gw as i64) as usize;
+    let row_end = (height as i64 - origin.1 as i64).clamp(0, glyph.height() as i64) as usize;
+    if col_start >= col_end { return; }
+
+    let over = |src: u8, dst: u32, keep: u32| (src as u32 + (dst * keep + 127) / 255).min(255);
+    for row in row_start..row_end {
+        let src_row = &glyph.pixels()[row * gw..(row + 1) * gw];
+        let dst_base = (origin.1 as i64 + row as i64) as usize * stride;
+        for col in col_start..col_end {
+            let px = src_row[col];
+            if px.alpha() == 0 { continue; }
+            let at = dst_base + (origin.0 as i64 + col as i64) as usize;
+            let old = frame[at];
+            let keep = 255 - px.alpha() as u32;
+            let red = over(px.red(), (old >> 16) & 0xFF, keep);
+            let green = over(px.green(), (old >> 8) & 0xFF, keep);
+            let blue = over(px.blue(), old & 0xFF, keep);
+            frame[at] = (red << 16) | (green << 8) | blue;
         }
     }
 }
@@ -409,6 +438,38 @@ mod tests {
             if a.abs_diff(b) > 90 { off += 1; }
         } }
         assert!(off < 12, "{off} pixels differ from the mirror");
+    }
+
+    #[test]
+    fn a_glyph_hanging_off_the_frame_is_clipped_not_wrapped() {
+        // A 10x10 frame and a 36 px icon placed so most of it falls off the
+        // left and top edges: nothing may panic, and the right-hand column
+        // of the frame must not pick up ink that belongs off the left edge.
+        let mut frame = vec![0u32; 100];
+        render_icon(&mut frame, 10, 10, -20, -20, 16, 16, IconKind::Close, [255, 255, 255, 255], None);
+        assert!(frame.iter().any(|&p| p != 0), "the on-frame corner of the cross is drawn");
+        for y in 0..10 {
+            assert_eq!(frame[y * 10 + 9], 0, "row {y} wrapped onto the right edge");
+        }
+        // Wholly outside: untouched.
+        let mut frame = vec![0x00_10_20_30u32; 100];
+        render_icon(&mut frame, 10, 10, 40, 40, 76, 76, IconKind::Save, [255, 255, 255, 255], None);
+        assert!(frame.iter().all(|&p| p == 0x00_10_20_30));
+    }
+
+    #[test]
+    fn half_covered_pixels_blend_with_the_frame_below() {
+        // White glyph over pure blue: where the line's edge is partly
+        // covered, the result mixes the two rather than replacing blue.
+        let side = 36;
+        let mut frame = vec![0x00_00_00_FFu32; (side * side) as usize];
+        render_icon(&mut frame, side as usize, side as usize, 0, 0, side, side,
+                    IconKind::Tool(Tool::Line), [255, 255, 255, 255], None);
+        let mixed = frame.iter().any(|&p| {
+            let (r, b) = ((p >> 16) & 0xFF, p & 0xFF);
+            r > 20 && r < 235 && b == 255
+        });
+        assert!(mixed, "no partly covered pixel kept the blue underneath");
     }
 
     /// Writes target/tool-icons.png: every icon, on the tool panel's colors,

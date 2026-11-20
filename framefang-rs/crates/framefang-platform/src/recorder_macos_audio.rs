@@ -1,343 +1,419 @@
-//! macOS system-audio capture via ScreenCaptureKit.
+//! Recording the system audio mix on macOS, through ScreenCaptureKit.
 //!
-//! avfoundation can only fold a *mic* into a recording — there's no driverless
-//! way to grab the system-audio mix, which is why the old path errored asking
-//! the user to install BlackHole. ScreenCaptureKit (macOS 13+) captures the
-//! system mix natively under the same Screen-Recording permission Framefang
-//! already holds, with no virtual-audio driver.
+//! ffmpeg's avfoundation input can add a microphone to a recording but has
+//! no way to hear what the Mac is playing without a virtual audio driver such
+//! as BlackHole. ScreenCaptureKit (macOS 13 and later) can, under the Screen
+//! Recording permission Frame Fang already needs, so system audio comes from
+//! here while video and the mic stay on avfoundation.
 //!
-//! We use SCK for **system audio only**: an `SCStream` with `capturesAudio`
-//! delivers Float32 PCM sample buffers to a delegate on a background queue. We
-//! pull the PCM out and write it to a 127.0.0.1 socket that ffmpeg reads as an
-//! extra raw-PCM input — the same transport the Windows WASAPI path uses, and
-//! the same role the Linux `<sink>.monitor` source plays. Video and mic stay
-//! on the existing avfoundation path; ffmpeg muxes/`amix`es everything.
+//! An `SCStream` with audio turned on hands Float32 sample buffers to our
+//! output object on a background queue. It writes the PCM to a socket on
+//! 127.0.0.1 that ffmpeg reads as one more raw input, the same arrangement as
+//! the Windows WASAPI sources, and ffmpeg mixes everything.
 //!
-//! SCK audio is delivered **non-interleaved** (one buffer per channel), so we
-//! interleave to plain `f32le` before handing it to ffmpeg. Unlike WASAPI
-//! loopback, SCK keeps delivering buffers (silence included) while the system
-//! is quiet, so no silence-fill clock is needed here.
+//! The samples arrive planar (one buffer per channel) and are interleaved into
+//! plain `f32le` on the way out. Unlike WASAPI loopback, ScreenCaptureKit keeps
+//! sending buffers (silent ones included) when nothing is playing, so there is
+//! no gap to fill.
 
-#![allow(non_snake_case)]
-
-use crate::{Error, Result};
-use std::io::Write;
-use std::net::{TcpListener, TcpStream};
-use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
-
-use block2::RcBlock;
-use objc2::rc::Retained;
-use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
-use objc2::{define_class, msg_send, AllocAnyThread, DefinedClass};
-use objc2_core_audio_types::{AudioBuffer, AudioBufferList};
-use objc2_core_foundation::CFRetained;
-use objc2_core_media::CMSampleBuffer;
-use objc2_foundation::{NSArray, NSError};
-use objc2_screen_capture_kit::{
-    SCContentFilter, SCShareableContent, SCStream, SCStreamConfiguration, SCStreamOutput,
-    SCStreamOutputType, SCWindow,
+use std::{
+    fmt::Display,
+    io::{ErrorKind, Write as _},
+    mem::size_of,
+    net::{TcpListener, TcpStream},
+    ptr::{self, NonNull},
+    sync::{atomic::{AtomicBool, Ordering::Relaxed}, mpsc, Arc, Mutex},
+    thread::{self, JoinHandle},
+    time::Duration,
 };
 
-/// System audio is always negotiated at this format (we set it on the config),
-/// so the ffmpeg input can be built without a runtime handshake.
-const SAMPLE_RATE: u32 = 48_000;
-const CHANNELS:    u16 = 2;
-pub(crate) const FFMPEG_FMT: &str = "f32le";
+use block2::RcBlock;
+use objc2::{
+    define_class, msg_send,
+    rc::Retained,
+    runtime::{NSObject, NSObjectProtocol, ProtocolObject},
+    AllocAnyThread, DefinedClass,
+};
+use objc2_core_audio_types::{AudioBuffer as Plane, AudioBufferList as PlaneList};
+use objc2_core_foundation::CFRetained;
+use objc2_core_media::{CMBlockBuffer, CMSampleBuffer};
+use objc2_foundation::{NSArray, NSError};
+use objc2_screen_capture_kit::{
+    SCContentFilter, SCDisplay, SCShareableContent, SCStream, SCStreamConfiguration,
+    SCStreamOutput, SCStreamOutputType, SCWindow,
+};
 
-/// A live SCK system-audio capture. Held in the `Process` backend alongside the
-/// ffmpeg child so it can be stopped when the recording stops.
+use crate::{Error, Result};
+
+/// The stream is configured for exactly this format, so ffmpeg's input can
+/// be described up front with no handshake: `build_macos_ffmpeg_args` in
+/// recorder.rs reads it as `f32le` at these numbers.
+const RATE_HZ: u32 = 48_000;
+const STEREO: u16 = 2;
+
+/// How long to wait for the display list.
+const DISPLAY_WAIT: Duration = Duration::from_secs(5);
+/// How long to wait for capture to start.
+const START_WAIT: Duration = Duration::from_secs(10);
+/// How long `stop` waits for capture to confirm it has stopped.
+const STOP_WAIT: Duration = Duration::from_secs(5);
+/// ffmpeg gets this many polls, `ACCEPT_POLL` apart, to connect.
+const ACCEPT_TRIES: u32 = 1000;
+const ACCEPT_POLL: Duration = Duration::from_millis(10);
+
+/// Room for a buffer list of up to this many channel planes.
+const MAX_PLANES: usize = 8;
+/// `kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment`.
+const ASSURE_16_BYTE_ALIGNMENT: u32 = 1;
+
+/// The connection to ffmpeg, once it has connected. The output object writes
+/// to it from the capture queue; `stop` closes it.
+type SharedSocket = Arc<Mutex<Option<TcpStream>>>;
+
+/// A recording error that reads "`what`: `cause`".
+fn failed<E: Display>(what: &'static str) -> impl FnOnce(E) -> Error {
+    move |cause| Error::Recording(format!("{what}: {cause}"))
+}
+
+/// A running system-audio capture. The recorder keeps it beside the ffmpeg
+/// child and calls [`stop`](SckSession::stop) when the recording ends.
 pub(crate) struct SckSession {
-    stream:   Retained<SCStream>,
-    _delegate: Retained<AudioDelegate>,
-    stop:     Arc<AtomicBool>,
-    socket:   Arc<Mutex<Option<TcpStream>>>,
-    acceptor: Option<JoinHandle<()>>,
+    stream: Retained<SCStream>,
+    _output: Retained<AudioOutput>,
+    halt: Arc<AtomicBool>,
+    socket: SharedSocket,
+    accept_thread: Option<JoinHandle<()>>,
     pub port: u16,
 }
 
 impl SckSession {
     pub fn stop(mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        // Stop the stream and wait for the completion handler so no more audio
-        // callbacks fire after we tear the socket down.
-        let (tx, rx) = mpsc::channel::<()>();
-        let handler = RcBlock::new(move |_err: *mut NSError| {
-            let _ = tx.send(());
+        self.halt.store(true, Relaxed);
+
+        // Wait for capture to confirm it stopped, so no audio callback can
+        // run after the socket below is gone.
+        let (done, stopped) = mpsc::channel::<()>();
+        let on_stopped = RcBlock::new(move |_error: *mut NSError| {
+            let _ = done.send(());
         });
-        unsafe { self.stream.stopCaptureWithCompletionHandler(Some(&handler)); }
-        let _ = rx.recv_timeout(Duration::from_secs(5));
-        // Drop the socket so ffmpeg sees EOF on this input.
-        if let Ok(mut g) = self.socket.lock() {
-            *g = None;
+        unsafe { self.stream.stopCaptureWithCompletionHandler(Some(&on_stopped)); }
+        let _ = stopped.recv_timeout(STOP_WAIT);
+
+        // Closing the socket ends this input for ffmpeg.
+        if let Ok(mut connection) = self.socket.lock() {
+            *connection = None;
         }
-        if let Some(h) = self.acceptor.take() {
-            let _ = h.join();
+        if let Some(waiter) = self.accept_thread.take() {
+            let _ = waiter.join();
         }
     }
 }
 
-/// Start capturing the system-audio mix. Returns the session (to stop later)
-/// and the loopback port ffmpeg should read from. The format is fixed
-/// (`f32le`, 48 kHz, stereo) by the configuration we set.
+/// Start capturing the system audio mix.
+///
+/// The session carries the port ffmpeg should read from; the format is the
+/// fixed `f32le`, 48 kHz stereo set on the stream.
 pub(crate) fn start_system_audio() -> Result<SckSession> {
-    // Listen first so the port exists before ffmpeg is spawned.
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .map_err(|e| Error::Recording(format!("could not open a loopback socket for system audio: {e}")))?;
-    let port = listener.local_addr()
-        .map_err(|e| Error::Recording(format!("could not read loopback port: {e}")))?
-        .port();
+    // Bound first, so the port exists before ffmpeg is started.
+    let server = TcpListener::bind(("127.0.0.1", 0))
+        .map_err(failed("no local socket could be opened for the system audio"))?;
+    let port = server.local_addr().map_err(failed("the local audio socket has no port"))?.port();
 
-    // First available display — SCContentFilter needs one even though we only
-    // consume audio. The display enumeration is async; block on it.
-    let display = first_display()?;
-
-    // Audio-only-oriented config: capture audio, tiny video (we never read the
-    // screen buffers), exclude our own output so Framefang's UI sounds aren't fed
-    // back into the recording.
-    let config = unsafe {
-        let c = SCStreamConfiguration::new();
-        c.setCapturesAudio(true);
-        c.setSampleRate(SAMPLE_RATE as isize);
-        c.setChannelCount(CHANNELS as isize);
-        c.setExcludesCurrentProcessAudio(true);
-        c.setWidth(2);
-        c.setHeight(2);
-        c
+    // A content filter needs a display even when only audio is wanted.
+    let screen = first_display()?;
+    let settings = audio_only_config();
+    let no_windows: Retained<NSArray<SCWindow>> = NSArray::new();
+    let content = unsafe {
+        SCContentFilter::initWithDisplay_excludingWindows(SCContentFilter::alloc(), &screen, &no_windows)
     };
 
-    let empty_windows: Retained<NSArray<SCWindow>> = NSArray::new();
-    let filter = unsafe {
-        SCContentFilter::initWithDisplay_excludingWindows(
-            SCContentFilter::alloc(),
-            &display,
-            &empty_windows,
-        )
+    let halt = Arc::<AtomicBool>::default();
+    let socket = SharedSocket::default();
+    let output = AudioOutput::new(socket.clone(), halt.clone());
+
+    let blank = SCStream::alloc();
+    let capture = unsafe { SCStream::initWithFilter_configuration_delegate(blank, &content, &settings, None) };
+    let as_output: &ProtocolObject<dyn SCStreamOutput> = ProtocolObject::from_ref(&*output);
+    // No queue given: ScreenCaptureKit calls us on a serial queue of its own.
+    let attached = unsafe {
+        capture.addStreamOutput_type_sampleHandlerQueue_error(as_output, SCStreamOutputType::Audio, None)
     };
+    attached.map_err(failed("the system audio could not be connected to the capture"))?;
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let socket: Arc<Mutex<Option<TcpStream>>> = Arc::new(Mutex::new(None));
-    let delegate = AudioDelegate::new(Arc::clone(&socket), Arc::clone(&stop));
-
-    let stream = unsafe {
-        SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &config, None)
-    };
-    let proto: &ProtocolObject<dyn SCStreamOutput> = ProtocolObject::from_ref(&*delegate);
-    // None queue → SCK uses its own internal serial queue for our callback.
-    unsafe {
-        stream
-            .addStreamOutput_type_sampleHandlerQueue_error(proto, SCStreamOutputType::Audio, None)
-            .map_err(|e| Error::Recording(format!("could not attach the system-audio output: {e}")))?;
-    }
-
-    // Start, blocking on the async completion handler.
-    let (tx, rx) = mpsc::channel::<Option<String>>();
-    let start_handler = RcBlock::new(move |err: *mut NSError| {
-        let msg = unsafe { err.as_ref() }.map(|e| e.localizedDescription().to_string());
-        let _ = tx.send(msg);
-    });
-    unsafe { stream.startCaptureWithCompletionHandler(Some(&start_handler)); }
-    match rx.recv_timeout(Duration::from_secs(10)) {
-        Ok(None) => {}
-        Ok(Some(msg)) => {
-            return Err(Error::Recording(format!(
-                "macOS could not start system-audio capture: {msg}. Grant Framefang \
-                 Screen Recording permission in System Settings → Privacy & \
-                 Security → Screen Recording, then retry."
-            )));
-        }
-        Err(_) => {
-            return Err(Error::Recording(
-                "macOS system-audio capture didn't start within 10s.".into()));
-        }
-    }
-
-    // Accept ffmpeg's connection on a small thread and stash the stream where
-    // the audio callback can find it.
-    let acc_socket = Arc::clone(&socket);
-    let acc_stop = Arc::clone(&stop);
-    let acceptor = thread::Builder::new()
-        .name("framefang-sck-accept".into())
-        .spawn(move || {
-            let _ = listener.set_nonblocking(true);
-            for _ in 0..1000 {
-                if acc_stop.load(Ordering::Relaxed) { return; }
-                match listener.accept() {
-                    Ok((s, _)) => {
-                        let _ = s.set_nodelay(true);
-                        if let Ok(mut g) = acc_socket.lock() { *g = Some(s); }
-                        return;
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(_) => return,
-                }
-            }
-        })
-        .map_err(|e| Error::Recording(format!("could not start system-audio acceptor: {e}")))?;
+    start_capture(&capture)?;
+    let accept_thread = spawn_acceptor(server, socket.clone(), halt.clone())?;
 
     Ok(SckSession {
-        stream,
-        _delegate: delegate,
-        stop,
+        stream: capture,
+        _output: output,
+        halt,
         socket,
-        acceptor: Some(acceptor),
+        accept_thread: Some(accept_thread),
         port,
     })
 }
 
-/// Block on the async `getShareableContentWithCompletionHandler` and return the
-/// first display. The objc objects are moved across the completion-handler
-/// thread boundary as raw pointers (their refcount is atomic), which keeps the
-/// `Send` checker happy without unsafe assertions on `Retained`.
-fn first_display() -> Result<Retained<objc2_screen_capture_kit::SCDisplay>> {
-    let (tx, rx) = mpsc::channel::<std::result::Result<usize, String>>();
-    let handler = RcBlock::new(move |content: *mut SCShareableContent, err: *mut NSError| {
-        if let Some(e) = unsafe { err.as_ref() } {
-            let _ = tx.send(Err(e.localizedDescription().to_string()));
-            return;
-        }
-        let Some(content) = (unsafe { content.as_ref() }) else {
-            let _ = tx.send(Err("no shareable content returned".into()));
-            return;
-        };
-        let displays = unsafe { content.displays() };
-        match displays.firstObject() {
-            Some(d) => { let _ = tx.send(Ok(Retained::into_raw(d) as usize)); }
-            None    => { let _ = tx.send(Err("no displays available to capture".into())); }
-        }
-    });
-    unsafe { SCShareableContent::getShareableContentWithCompletionHandler(&handler); }
-
-    match rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(Ok(raw)) => {
-            let ptr = raw as *mut objc2_screen_capture_kit::SCDisplay;
-            unsafe { Retained::from_raw(ptr) }
-                .ok_or_else(|| Error::Recording("display pointer was null".into()))
-        }
-        Ok(Err(msg)) => Err(Error::Recording(format!(
-            "macOS could not enumerate displays for system-audio capture: {msg}"))),
-        Err(_) => Err(Error::Recording(
-            "macOS display enumeration timed out.".into())),
+/// A configuration that captures audio in our fixed format. The video side
+/// is shrunk to 2x2 because its frames are never read, and Frame Fang's own
+/// sounds are left out of the mix.
+fn audio_only_config() -> Retained<SCStreamConfiguration> {
+    unsafe {
+        let config = SCStreamConfiguration::new();
+        config.setCapturesAudio(true);
+        config.setSampleRate(RATE_HZ as isize);
+        config.setChannelCount(STEREO as isize);
+        config.setExcludesCurrentProcessAudio(true);
+        config.setWidth(2);
+        config.setHeight(2);
+        config
     }
 }
 
-struct AudioDelegateIvars {
-    socket: Arc<Mutex<Option<TcpStream>>>,
-    stop:   Arc<AtomicBool>,
+/// Start the stream and block until its completion handler reports.
+fn start_capture(stream: &SCStream) -> Result<()> {
+    let (report, outcome) = mpsc::channel::<Option<String>>();
+    let on_started = RcBlock::new(move |error: *mut NSError| {
+        let failure = unsafe { error.as_ref() }.map(|e| e.localizedDescription().to_string());
+        let _ = report.send(failure);
+    });
+    unsafe { stream.startCaptureWithCompletionHandler(Some(&on_started)); }
+
+    match outcome.recv_timeout(START_WAIT) {
+        Ok(None) => Ok(()),
+        Ok(Some(why)) => Err(Error::Recording(format!(
+            "macOS would not start recording the system audio: {why}. Allow Framefang \
+             under System Settings, Privacy & Security, Screen Recording, and then \
+             try again."
+        ))),
+        Err(_) => Err(Error::Recording(
+            "macOS did not start recording the system audio within 10 seconds.".into())),
+    }
+}
+
+/// Wait on a small thread for ffmpeg to connect, then hand the connection to
+/// the output object. Gives up quietly on stop, on a socket error, or after
+/// `ACCEPT_TRIES` polls.
+fn spawn_acceptor(server: TcpListener, socket: SharedSocket, halt: Arc<AtomicBool>)
+    -> Result<JoinHandle<()>>
+{
+    let wait_for_ffmpeg = move || {
+        let _ = server.set_nonblocking(true);
+        for _ in 0..ACCEPT_TRIES {
+            if halt.load(Relaxed) {
+                break;
+            }
+            match server.accept() {
+                Ok((connection, _)) => {
+                    let _ = connection.set_nodelay(true);
+                    if let Ok(mut slot) = socket.lock() {
+                        *slot = Some(connection);
+                    }
+                    break;
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => thread::sleep(ACCEPT_POLL),
+                Err(_) => break,
+            }
+        }
+    };
+    thread::Builder::new()
+        .name(String::from("framefang-sck-accept"))
+        .spawn(wait_for_ffmpeg)
+        .map_err(failed("the system audio connection thread did not start"))
+}
+
+/// The first display ScreenCaptureKit offers, waiting on its asynchronous
+/// lookup.
+///
+/// The display crosses from the completion handler's thread as a raw pointer
+/// held in a `usize`. Its retain count is atomic, so this is sound, and it
+/// avoids asserting `Send` on a `Retained`.
+fn first_display() -> Result<Retained<SCDisplay>> {
+    let (report, found) = mpsc::channel::<std::result::Result<usize, String>>();
+    let on_content = RcBlock::new(move |content: *mut SCShareableContent, error: *mut NSError| {
+        let answer = if let Some(e) = unsafe { error.as_ref() } {
+            Err(e.localizedDescription().to_string())
+        } else if let Some(content) = unsafe { content.as_ref() } {
+            match unsafe { content.displays() }.firstObject() {
+                Some(display) => Ok(Retained::into_raw(display) as usize),
+                None => Err("there is no display to capture".to_string()),
+            }
+        } else {
+            Err("macOS returned nothing to capture".to_string())
+        };
+        let _ = report.send(answer);
+    });
+    unsafe { SCShareableContent::getShareableContentWithCompletionHandler(&on_content); }
+
+    match found.recv_timeout(DISPLAY_WAIT) {
+        Ok(Ok(address)) => unsafe { Retained::from_raw(address as *mut SCDisplay) }
+            .ok_or_else(|| Error::Recording("macOS handed back an empty display".into())),
+        Ok(Err(why)) => Err(Error::Recording(format!(
+            "macOS could not list the displays needed for system audio: {why}"))),
+        Err(_) => Err(Error::Recording("macOS took too long to list the displays.".into())),
+    }
+}
+
+/// What the output object shares with the session.
+struct OutputState {
+    socket: SharedSocket,
+    halt: Arc<AtomicBool>,
 }
 
 define_class!(
     #[unsafe(super(NSObject))]
-    #[name = "FramefangSCKAudioDelegate"]
-    #[ivars = AudioDelegateIvars]
-    struct AudioDelegate;
+    #[name = "FrameFangSystemAudioOutput"]
+    #[ivars = OutputState]
+    struct AudioOutput;
 
-    unsafe impl NSObjectProtocol for AudioDelegate {}
+    unsafe impl NSObjectProtocol for AudioOutput {}
 
-    unsafe impl SCStreamOutput for AudioDelegate {
+    unsafe impl SCStreamOutput for AudioOutput {
         #[unsafe(method(stream:didOutputSampleBuffer:ofType:))]
-        fn stream_didOutputSampleBuffer_ofType(
-            &self,
-            _stream: &SCStream,
-            sample_buffer: &CMSampleBuffer,
-            ty: SCStreamOutputType,
-        ) {
-            if ty != SCStreamOutputType::Audio { return; }
-            if self.ivars().stop.load(Ordering::Relaxed) { return; }
-            self.forward_audio(sample_buffer);
+        fn on_sample_buffer(&self, _from: &SCStream, buffer: &CMSampleBuffer, kind: SCStreamOutputType) {
+            let wanted = kind == SCStreamOutputType::Audio && !self.ivars().halt.load(Relaxed);
+            if wanted {
+                self.send_audio(buffer);
+            }
         }
     }
 );
 
-impl AudioDelegate {
-    fn new(socket: Arc<Mutex<Option<TcpStream>>>, stop: Arc<AtomicBool>) -> Retained<Self> {
-        let this = Self::alloc().set_ivars(AudioDelegateIvars { socket, stop });
-        unsafe { msg_send![super(this), init] }
+impl AudioOutput {
+    fn new(socket: SharedSocket, halt: Arc<AtomicBool>) -> Retained<Self> {
+        let allocated = Self::alloc().set_ivars(OutputState { socket, halt });
+        unsafe { msg_send![super(allocated), init] }
     }
 
-    /// Pull the PCM out of one audio sample buffer, interleave the per-channel
-    /// planes, and write `f32le` to the socket (once ffmpeg has connected).
-    fn forward_audio(&self, sbuf: &CMSampleBuffer) {
-        // Storage for an AudioBufferList with up to 8 channel buffers.
-        const MAX_BUFFERS: usize = 8;
-        let mut storage = vec![
-            0u8;
-            std::mem::size_of::<AudioBufferList>()
-                + (MAX_BUFFERS - 1) * std::mem::size_of::<AudioBuffer>()
-        ];
-        let abl = storage.as_mut_ptr() as *mut AudioBufferList;
-        let mut size_needed: usize = 0;
-        let mut block_buffer: *mut objc2_core_media::CMBlockBuffer = ptr::null_mut();
+    /// Take the PCM out of one sample buffer, interleave it, and write it to
+    /// ffmpeg. Before ffmpeg connects the buffer is simply dropped, which
+    /// loses at most a few milliseconds at the start.
+    fn send_audio(&self, sample_buffer: &CMSampleBuffer) {
+        // The list type declares one plane; room for the rest follows it.
+        let list_bytes = size_of::<PlaneList>() + (MAX_PLANES - 1) * size_of::<Plane>();
+        let mut list_storage = vec![0u8; list_bytes];
+        let list = list_storage.as_mut_ptr().cast::<PlaneList>();
+        let mut needed = 0usize;
+        let mut block: *mut CMBlockBuffer = ptr::null_mut();
 
-        // flag 1 = kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment
-        let status = unsafe {
-            sbuf.audio_buffer_list_with_retained_block_buffer(
-                &mut size_needed,
-                abl,
-                storage.len(),
-                None,
-                None,
-                1,
-                &mut block_buffer,
+        let result = unsafe {
+            sample_buffer.audio_buffer_list_with_retained_block_buffer(
+                &mut needed,
+                list,
+                list_bytes,
+                None, None,
+                ASSURE_16_BYTE_ALIGNMENT,
+                &mut block,
             )
         };
-        if status != 0 { return; }
-        // Own the returned (+1) block buffer so it's released when we're done.
-        let _owned_block = NonNull::new(block_buffer).map(|nn| unsafe { CFRetained::from_raw(nn) });
+        if result != 0 {
+            return;
+        }
+        // We are handed the block buffer already retained; wrapping it means
+        // it is released when this function returns.
+        let _block = NonNull::new(block).map(|b| unsafe { CFRetained::from_raw(b) });
 
-        let interleaved = unsafe { interleave_pcm(abl) };
-        if interleaved.is_empty() { return; }
-
-        if let Ok(mut guard) = self.ivars().socket.lock() {
-            if let Some(stream) = guard.as_mut() {
-                if stream.write_all(&interleaved).is_err() {
-                    // ffmpeg closed the socket → recording is stopping.
-                    *guard = None;
-                }
-            }
-            // If ffmpeg hasn't connected yet (guard is None) we drop this buffer;
-            // that's at most a few ms of leading audio.
+        let pcm = unsafe { interleave_pcm(list) };
+        if pcm.is_empty() {
+            return;
+        }
+        let Ok(mut slot) = self.ivars().socket.lock() else { return };
+        let ffmpeg_gone = slot.as_mut().is_some_and(|connection| connection.write_all(&pcm).is_err());
+        if ffmpeg_gone {
+            // ffmpeg closed its end, so the recording is stopping.
+            *slot = None;
         }
     }
 }
 
-/// Interleave the (possibly multi-plane) Float32 audio in `abl` into one
-/// little-endian interleaved `f32` byte buffer. A single buffer is already
-/// interleaved (or mono) and is copied as-is.
-unsafe fn interleave_pcm(abl: *mut AudioBufferList) -> Vec<u8> {
-    let nbuf = unsafe { (*abl).mNumberBuffers } as usize;
-    if nbuf == 0 { return Vec::new(); }
-    let first = unsafe { (*abl).mBuffers.as_ptr() };
+/// The audio in `list` as interleaved little-endian `f32` bytes.
+///
+/// One buffer is already interleaved (or mono) and is copied unchanged. More
+/// than one means one Float32 plane per channel.
+///
+/// # Safety
+///
+/// `list` must point at a filled-in buffer list whose planes, up to
+/// `mNumberBuffers`, are all inside the allocation and point at live data.
+unsafe fn interleave_pcm(list: *mut PlaneList) -> Vec<u8> {
+    let count = unsafe { (*list).mNumberBuffers } as usize;
+    // Taken through a raw pointer so the planes past the first, which live
+    // beyond the declared one-element array, stay in bounds of `list`.
+    let first = unsafe { ptr::addr_of!((*list).mBuffers) }.cast::<Plane>();
+    let planes = unsafe { std::slice::from_raw_parts(first, count) };
 
-    if nbuf == 1 {
-        let b = unsafe { &*first };
-        if b.mData.is_null() { return Vec::new(); }
-        let bytes = unsafe { std::slice::from_raw_parts(b.mData as *const u8, b.mDataByteSize as usize) };
-        return bytes.to_vec();
-    }
-
-    // Planar: one f32 plane per channel. Interleave frame-by-frame.
-    let planes: Vec<&[f32]> = (0..nbuf)
-        .map(|i| {
-            let b = unsafe { &*first.add(i) };
-            if b.mData.is_null() {
-                &[][..]
-            } else {
-                unsafe { std::slice::from_raw_parts(b.mData as *const f32, (b.mDataByteSize as usize) / 4) }
-            }
-        })
-        .collect();
-    let frames = planes.iter().map(|p| p.len()).min().unwrap_or(0);
-    let mut out = Vec::with_capacity(frames * nbuf * 4);
-    for f in 0..frames {
-        for plane in &planes {
-            out.extend_from_slice(&plane[f].to_le_bytes());
+    match planes {
+        [] => Vec::new(),
+        [only] => unsafe { plane_bytes(only) }.to_vec(),
+        several => {
+            let channels: Vec<&[f32]> = several.iter().map(|p| unsafe { plane_samples(p) }).collect();
+            interleave_planes(&channels)
         }
     }
-    out
+}
+
+/// The bytes of one plane, or nothing if it has no data.
+unsafe fn plane_bytes(plane: &Plane) -> &[u8] {
+    match plane.mData.is_null() {
+        true => &[],
+        false => unsafe { std::slice::from_raw_parts(plane.mData.cast::<u8>(), plane.mDataByteSize as usize) },
+    }
+}
+
+/// The Float32 samples of one plane, or nothing if it has no data.
+unsafe fn plane_samples(plane: &Plane) -> &[f32] {
+    let samples = plane.mDataByteSize as usize / size_of::<f32>();
+    match plane.mData.is_null() {
+        true => &[],
+        false => unsafe { std::slice::from_raw_parts(plane.mData.cast::<f32>(), samples) },
+    }
+}
+
+/// Weave per-channel planes into one frame-ordered byte stream. If the planes
+/// differ in length, only the frames every plane has are kept.
+fn interleave_planes(channels: &[&[f32]]) -> Vec<u8> {
+    let shared_frames = channels.iter().map(|samples| samples.len()).min().unwrap_or(0);
+    let mut woven = Vec::with_capacity(shared_frames * channels.len() * size_of::<f32>());
+    for frame in 0..shared_frames {
+        for samples in channels {
+            woven.extend_from_slice(&samples[frame].to_le_bytes());
+        }
+    }
+    woven
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn floats(bytes: &[u8]) -> Vec<f32> {
+        bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    }
+
+    #[test]
+    fn stereo_planes_alternate_left_and_right() {
+        let left = [1.0f32, 2.0, 3.0];
+        let right = [-1.0f32, -2.0, -3.0];
+        let out = interleave_planes(&[&left[..], &right[..]]);
+        assert_eq!(floats(&out), [1.0, -1.0, 2.0, -2.0, 3.0, -3.0]);
+    }
+
+    #[test]
+    fn uneven_planes_keep_only_shared_frames() {
+        let a = [0.5f32, 0.25, 0.125];
+        let b = [9.0f32];
+        assert_eq!(floats(&interleave_planes(&[&a[..], &b[..]])), [0.5, 9.0]);
+    }
+
+    #[test]
+    fn an_empty_plane_means_no_output() {
+        let a = [1.0f32, 2.0];
+        assert!(interleave_planes(&[&a[..], &[]]).is_empty());
+        assert!(interleave_planes(&[]).is_empty());
+    }
+
+    #[test]
+    fn the_fixed_format_matches_what_ffmpeg_is_told() {
+        // build_macos_ffmpeg_args hard-codes these for the socket input.
+        assert_eq!((RATE_HZ, STEREO), (48_000, 2));
+    }
 }

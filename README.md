@@ -220,7 +220,5 @@ reports are welcome.
 
 ## License
 
-[Apache License 2.0](LICENSE). Frame Fang began as a fork of
-[Kashot](https://github.com/singhpratech/kashot) by Prateek Singh. See
-[NOTICE](NOTICE) for what changed and
-[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) for bundled components.
+[Apache License 2.0](LICENSE). Bundled components and their licenses are
+listed in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).

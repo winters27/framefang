@@ -1,404 +1,432 @@
-//! Make the recorder child process die with Framefang, on every platform.
+//! Keeping the recorder process from outliving Frame Fang.
 //!
-//! A screen recording is a long-lived `ffmpeg` (or `screencapture`) child.
-//! Nothing tied its lifetime to ours: if Framefang crashed, was `kill -9`d, or
-//! was killed by the session on logout, the encoder kept running — forever,
-//! holding the camera or the display grab, filling the disk with a clip
-//! nobody would ever stop, and with no UI left to stop it from. The user's
-//! only recourse was Task Manager / `pkill`.
+//! A recording is a long-running child (`ffmpeg`, or `screencapture` on
+//! macOS). If Frame Fang crashed, was killed, or was taken down at logout,
+//! nothing stopped that child: it kept the screen grab or camera open and kept
+//! writing a file that no window could stop any more. So there are two
+//! defences.
 //!
-//! Two layers, because no single mechanism covers all three OSes:
+//! **While we run, the child is tied to us.** Each OS gets the strongest tie
+//! it offers:
 //!
-//! 1. **Die-with-parent, at spawn time.** Kernel-enforced where the kernel
-//!    offers it:
-//!    * Linux   — `prctl(PR_SET_PDEATHSIG, SIGTERM)` in `pre_exec`, so the
-//!                kernel signals the child the moment we die. ffmpeg handles
-//!                SIGTERM by finalizing the container, so the clip is usually
-//!                still playable.
-//!    * Windows — a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
-//!                Our handle to the job is the only one; the kernel closes it
-//!                when our process ends, however it ends, and terminates
-//!                every process in the job.
-//!    * macOS   — has no pdeathsig and no job objects, so a detached
-//!                `/bin/sh` watchdog polls both pids and interrupts the
-//!                encoder once we're gone.
+//! * Linux: `PR_SET_PDEATHSIG` set to SIGTERM just before exec, so the kernel
+//!   signals the child the moment we die. ffmpeg finalizes the file on
+//!   SIGTERM, so the clip usually still plays.
+//! * Windows: the child joins a Job Object marked kill-on-close. Only we hold
+//!   a handle to the job, the kernel closes it when we exit for any reason,
+//!   and that kills everything inside.
+//! * macOS: neither exists, so a small detached shell loop watches both pids
+//!   and interrupts the child once we are gone.
 //!
-//! 2. **Reap-on-next-launch.** The live recorder's pid is written to a file
-//!    next to the settings and removed when the recording ends. If a record
-//!    is still there at startup, the previous run didn't get to clean up:
-//!    verify the pid still belongs to a recorder we know (never blind-kill a
-//!    recycled pid), stop it, and drop the record. This is the backstop for
-//!    the cases layer 1 can't reach — a watchdog that was itself killed, a
-//!    machine that lost power mid-recording — and it is what makes the macOS
-//!    story equivalent to the other two rather than merely similar.
+//! **On the next launch, leftovers are stopped.** The running recorder's pid
+//! and program name are written to a file in the config directory and removed
+//! when the recording ends normally. A file still present at startup means the
+//! last run never cleaned up (the watchdog was killed too, the power went).
+//! The pid is stopped only if it is still running a recorder program we know,
+//! since the OS may have handed that number to something else since.
 
-use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::{path::{Path, PathBuf}, process::{Child, Command}};
+#[cfg(any(windows, target_os = "macos", test))]
+use std::process::Stdio;
 
-use framefang_core::AppSettings;
+/// File in the config directory that describes the live recorder. Older and
+/// newer builds must agree on it, since a record can outlive an update.
+const RECORD_FILE: &str = "recorder.pid";
 
-/// Name of the live-recorder record inside the per-app config directory.
-const PIDFILE: &str = "recorder.pid";
+/// Program names a leftover record may point at. Anything else under that pid
+/// is an unrelated process that inherited the number, and leaving an encoder
+/// running is far better than killing it.
+const REAPABLE_PROGRAMS: &[&str] = &["ffmpeg", "ffmpeg.exe", "screencapture"];
 
-/// Recorder programs we are willing to kill during a reap. A pid whose image
-/// isn't one of these has been recycled by the OS and belongs to someone
-/// else — killing it would be far worse than leaking an encoder.
-const RECORDER_IMAGES: [&str; 3] = ["ffmpeg", "ffmpeg.exe", "screencapture"];
-
-fn pidfile_path() -> Option<PathBuf> {
-    AppSettings::config_dir().map(|d| d.join(PIDFILE))
+fn record_path() -> Option<PathBuf> {
+    framefang_core::AppSettings::config_dir().map(|dir| dir.join(RECORD_FILE))
 }
 
-/// Spawn a recorder child that won't outlive us.
+fn is_reapable(image: &str) -> bool {
+    REAPABLE_PROGRAMS.iter().any(|known| *known == image)
+}
+
+/// Spawn `cmd` (already set up by the recorder with its arguments and stdio)
+/// so that it cannot outlive this process, and note it as the live recorder.
 ///
-/// Takes the `Command` already fully configured by the caller (argv, stdio):
-/// this only adds the die-with-parent plumbing, so the recorder module keeps
-/// owning every decision about *what* to run.
+/// This only adds lifetime plumbing; every choice about what runs stays with
+/// the caller.
 pub(crate) fn spawn_guarded(cmd: &mut Command) -> std::io::Result<Child> {
-    let image = program_basename(cmd);
-    prepare(cmd);
-    let child = cmd.spawn()?;
-    adopt(&child);
-    record_live(child.id(), &image);
-    Ok(child)
-}
-
-/// Forget the live-recorder record. Called from every recorder teardown path,
-/// so a record left behind can only mean the process died without one.
-pub(crate) fn clear_live() {
-    if let Some(p) = pidfile_path() {
-        let _ = std::fs::remove_file(p);
-    }
-}
-
-fn record_live(pid: u32, image: &str) {
-    let Some(path) = pidfile_path() else { return };
-    if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
-    let _ = framefang_core::atomic_file::write_atomic(&path, format_record(pid, image).as_bytes());
-}
-
-/// Basename of the program a `Command` will run, lowercased so the Windows
-/// image-name comparison isn't case-sensitive.
-fn program_basename(cmd: &Command) -> String {
-    std::path::Path::new(cmd.get_program())
-        .file_name()
-        .map(|n| n.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default()
-}
-
-// ── pidfile format (pure, so it can be tested anywhere) ─────────────────────
-
-/// `<pid>\n<image basename>\n`. Deliberately not JSON: framefang-platform has no
-/// serde dependency, and two lines need none.
-fn format_record(pid: u32, image: &str) -> String {
-    format!("{pid}\n{image}\n")
-}
-
-/// Parse a record written by [`format_record`]. `None` for anything we don't
-/// fully understand — a partially-written or hand-edited file must not send
-/// us hunting for a pid to kill.
-fn parse_record(text: &str) -> Option<(u32, String)> {
-    let mut lines = text.lines();
-    let pid: u32 = lines.next()?.trim().parse().ok()?;
-    if pid == 0 { return None; }
-    let image = lines.next()?.trim().to_ascii_lowercase();
-    if image.is_empty() { return None; }
-    Some((pid, image))
-}
-
-// ── reap ────────────────────────────────────────────────────────────────────
-
-/// Stop a recorder left running by a previous Framefang, if there is one.
-///
-/// Returns the pid it stopped, for logging. Safe to call unconditionally at
-/// startup; the common case is one failed `read` of a file that isn't there.
-///
-/// Only ever called by the instance that owns the single-instance lock, so it
-/// can't race a *live* sibling's recording.
-pub fn reap_orphaned_recorder() -> Option<u32> {
-    let path = pidfile_path()?;
-    let text = std::fs::read_to_string(&path).ok();
-    // Drop the record either way: it describes a session that is over, and a
-    // record we couldn't act on must not be retried on every future launch.
-    let _ = std::fs::remove_file(&path);
-
-    let (pid, image) = parse_record(&text?)?;
-    if !RECORDER_IMAGES.contains(&image.as_str()) { return None; }
-    if terminate_if_matching(pid, &image) { Some(pid) } else { None }
-}
-
-/// Stop `pid` if it is still alive *and* still running `image`. The image
-/// check is what makes this safe against pid reuse.
-#[cfg(unix)]
-fn terminate_if_matching(pid: u32, image: &str) -> bool {
-    if running_image(pid).as_deref() != Some(image) { return false; }
-
-    let raw = pid as libc::pid_t;
-    // SIGINT rather than SIGKILL: both ffmpeg and screencapture treat it as
-    // "stop and finalize", so an orphan reaped here usually leaves a playable
-    // clip behind instead of a truncated one.
-    unsafe { libc::kill(raw, libc::SIGINT) };
-    for _ in 0..10 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        if unsafe { libc::kill(raw, 0) } != 0 { return true; }
-    }
-    // Wouldn't go quietly. It has had a second; the point of this function is
-    // that nothing survives it.
-    unsafe { libc::kill(raw, libc::SIGKILL) };
-    true
-}
-
-/// Image basename of a running process, lowercased, or `None` if the pid is
-/// dead or unreadable.
-#[cfg(target_os = "linux")]
-fn running_image(pid: u32) -> Option<String> {
-    // `comm` is the kernel's own record and needs no subprocess. It is capped
-    // at 15 characters, which comfortably fits every name in RECORDER_IMAGES.
-    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
-    Some(comm.trim().to_ascii_lowercase())
-}
-
-#[cfg(target_os = "macos")]
-fn running_image(pid: u32) -> Option<String> {
-    // No /proc on macOS. `ps -o comm=` prints the executable path with no
-    // header; an exited pid prints nothing and exits non-zero.
-    let out = Command::new("/bin/ps")
-        .args(["-p", &pid.to_string(), "-o", "comm="])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() { return None; }
-    let path = String::from_utf8(out.stdout).ok()?;
-    let path = path.trim();
-    if path.is_empty() { return None; }
-    Some(std::path::Path::new(path).file_name()?.to_string_lossy().to_ascii_lowercase())
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn running_image(_pid: u32) -> Option<String> { None }
-
-#[cfg(windows)]
-fn terminate_if_matching(pid: u32, image: &str) -> bool {
-    // One command does both halves: the two filters mean taskkill only acts
-    // when that pid is still running that image, so pid reuse can't turn this
-    // into a kill of an unrelated process. There is no graceful stop for a
-    // console-less child on Windows, so an orphan reaped here leaves an
-    // unfinalized file — the job object above is what normally prevents the
-    // orphan in the first place.
-    use std::os::windows::process::CommandExt;
-    let status = Command::new("taskkill")
-        .args([
-            "/F",
-            "/FI", &format!("PID eq {pid}"),
-            "/FI", &format!("IMAGENAME eq {image}"),
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        // CREATE_NO_WINDOW — taskkill is a console app and would otherwise
-        // flash a black window on every launch that reaps something.
-        .creation_flags(0x0800_0000)
-        .status();
-    matches!(status, Ok(s) if s.success())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn terminate_if_matching(_pid: u32, _image: &str) -> bool { false }
-
-// ── layer 1: die with the parent ────────────────────────────────────────────
-
-/// Linux: ask the kernel to signal the child when we die.
-#[cfg(target_os = "linux")]
-fn prepare(cmd: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    let parent = std::process::id() as libc::pid_t;
-    // SAFETY: the closure runs between fork and exec, where only
-    // async-signal-safe calls are allowed. prctl, getppid and _exit all are.
-    unsafe {
-        cmd.pre_exec(move || {
-            // The second prctl argument is read as an unsigned long, so the
-            // signal number has to be widened explicitly — passing a bare
-            // c_int through the variadic leaves the top half undefined.
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong);
-            // Close the fork/prctl race: if the parent died in that window the
-            // death signal has already been and gone, and would never fire.
-            if libc::getppid() != parent {
-                libc::_exit(0);
-            }
-            Ok(())
-        });
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn prepare(_cmd: &mut Command) {}
-
-/// Windows: put the child in a job that dies with our process.
-#[cfg(windows)]
-fn adopt(child: &Child) {
-    use std::os::windows::io::AsRawHandle;
-    use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::System::JobObjects::AssignProcessToJobObject;
-
-    let Some(job) = kill_on_close_job() else { return };
-    // SAFETY: both handles are live — ours is the leaked job handle, the
-    // child's is owned by `child` for the duration of this call.
-    unsafe {
-        let _ = AssignProcessToJobObject(
-            HANDLE(job as *mut core::ffi::c_void),
-            HANDLE(child.as_raw_handle() as *mut core::ffi::c_void),
-        );
-    }
-}
-
-/// The process-wide job, created on first use and then deliberately leaked:
-/// the handle staying open for our whole lifetime is the mechanism. When the
-/// process ends — cleanly, by crash, or by Task Manager — the kernel closes
-/// it and terminates everything in the job.
-#[cfg(windows)]
-fn kill_on_close_job() -> Option<usize> {
-    use std::sync::OnceLock;
-    use windows::core::PCWSTR;
-    use windows::Win32::System::JobObjects::{
-        CreateJobObjectW, SetInformationJobObject, JobObjectExtendedLimitInformation,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    };
-
-    static JOB: OnceLock<Option<usize>> = OnceLock::new();
-    *JOB.get_or_init(|| unsafe {
-        // Unnamed: a named job would be shared with any other process that
-        // guessed the name, and we want exactly our own children in it.
-        let job = CreateJobObjectW(None, PCWSTR::null()).ok()?;
-        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        SetInformationJobObject(
-            job,
-            JobObjectExtendedLimitInformation,
-            &info as *const _ as *const core::ffi::c_void,
-            core::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        )
-        .ok()?;
-        Some(job.0 as usize)
+    let image = image_name(Path::new(cmd.get_program()));
+    tie_before_exec(cmd);
+    cmd.spawn().map(|recorder| {
+        tie_after_spawn(&recorder);
+        write_live_record(&LiveRecord { pid: recorder.id(), image });
+        recorder
     })
 }
 
-/// macOS: no pdeathsig, no job objects. Leave a tiny detached shell watching
-/// both pids; it interrupts the encoder as soon as we're gone.
+/// Remove the live-recorder record. Every recorder shutdown path calls this,
+/// so a record that survives means the process died without shutting down.
+pub(crate) fn clear_live() {
+    let _ = record_path().map(std::fs::remove_file);
+}
+
+/// Stop a recorder that a previous run of Frame Fang left behind, returning
+/// its pid if one was stopped.
+///
+/// Cheap to call on every startup: normally the file is not there. Only the
+/// instance that won the single-instance lock calls it, so it never sees a
+/// recording that is still legitimately running.
+pub fn reap_orphaned_recorder() -> Option<u32> {
+    let record_file = record_path()?;
+    let contents = std::fs::read_to_string(&record_file).ok();
+    // The record is deleted whatever happens next. It describes a run that is
+    // over, and one we cannot act on should not be retried on every launch.
+    let _ = std::fs::remove_file(&record_file);
+
+    let LiveRecord { pid, image } = LiveRecord::decode(&contents?)?;
+    (is_reapable(&image) && stop_if_still_running(pid, &image)).then_some(pid)
+}
+
+fn write_live_record(record: &LiveRecord) {
+    let Some(target) = record_path() else { return };
+    if let Some(folder) = target.parent() {
+        let _ = std::fs::create_dir_all(folder);
+    }
+    let _ = framefang_core::atomic_file::write_atomic(&target, record.encode().as_bytes());
+}
+
+/// The file name of `program`, lowercased so that Windows image names compare
+/// the way Windows itself compares them.
+fn image_name(program: &Path) -> String {
+    match program.file_name() {
+        Some(name) => name.to_string_lossy().to_ascii_lowercase(),
+        None => String::new(),
+    }
+}
+
+/// What the pidfile holds: which process, and which program it was running.
+#[derive(Debug, PartialEq, Eq)]
+struct LiveRecord {
+    pid: u32,
+    image: String,
+}
+
+impl LiveRecord {
+    /// Two lines, pid then program name. Plain text keeps this crate free of
+    /// a serde dependency.
+    fn encode(&self) -> String {
+        format!("{}\n{}\n", self.pid, self.image)
+    }
+
+    /// Read back what [`encode`](Self::encode) wrote. Anything incomplete or
+    /// odd (a half-written file, a hand edit, pid 0) yields `None`, because a
+    /// guess here would end with us signalling the wrong process.
+    fn decode(text: &str) -> Option<Self> {
+        let mut lines = text.lines().map(str::trim);
+        let pid = lines.next()?.parse::<u32>().ok().filter(|&p| p != 0)?;
+        let image = lines.next()?.to_ascii_lowercase();
+        (!image.is_empty()).then_some(LiveRecord { pid, image })
+    }
+}
+
+// ---- stopping a leftover recorder ----
+
+/// Unix: interrupt the process if it still runs `image`, give it a second to
+/// finish its file, then force it.
+#[cfg(unix)]
+fn stop_if_still_running(pid: u32, image: &str) -> bool {
+    use std::time::Duration;
+
+    if process_image(pid).as_deref() != Some(image) {
+        return false;
+    }
+    let target = pid as libc::pid_t;
+    let is_alive = || unsafe { libc::kill(target, 0) } == 0;
+
+    // ffmpeg and screencapture both treat SIGINT as "stop and write the file
+    // out properly", so a reaped recording is usually still playable. It gets
+    // ten checks, 100 ms apart, to exit.
+    unsafe { libc::kill(target, libc::SIGINT) };
+    let exited = (0..10).any(|_| {
+        std::thread::sleep(Duration::from_millis(100));
+        !is_alive()
+    });
+    if !exited {
+        // A second was its chance to go quietly. Nothing is meant to
+        // survive this.
+        unsafe { libc::kill(target, libc::SIGKILL) };
+    }
+    true
+}
+
+/// Linux: the kernel keeps the program name in `/proc/<pid>/comm`, no
+/// subprocess needed. It is cut at 15 characters, which every name in
+/// [`REAPABLE_PROGRAMS`] fits inside.
+#[cfg(target_os = "linux")]
+fn process_image(pid: u32) -> Option<String> {
+    let comm_file = format!("/proc/{pid}/comm");
+    let name = std::fs::read_to_string(comm_file).ok()?;
+    Some(name.trim().to_ascii_lowercase())
+}
+
+/// macOS: no `/proc`, so ask `ps` for the executable path (no header line).
+/// A pid that has exited prints nothing and fails.
 #[cfg(target_os = "macos")]
-fn adopt(child: &Child) {
-    let script = watchdog_script(std::process::id(), child.id());
-    // The outer shell backgrounds the loop and exits immediately, so `wait`
-    // returns at once and reaps it — no zombie per recording — while the
-    // subshell is reparented to launchd and keeps watching.
-    let _ = Command::new("/bin/sh")
-        .arg("-c")
-        .arg(script)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .and_then(|mut c| c.wait());
+fn process_image(pid: u32) -> Option<String> {
+    let output = Command::new("/bin/ps")
+        .arg("-p")
+        .arg(pid.to_string())
+        .args(["-o", "comm="])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|finished| finished.status.success())?;
+    let printed = String::from_utf8(output.stdout).ok()?;
+    let exe = printed.trim();
+    if exe.is_empty() {
+        return None;
+    }
+    Some(image_name(Path::new(exe))).filter(|name| !name.is_empty())
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn process_image(_pid: u32) -> Option<String> {
+    None
+}
+
+/// Windows: `taskkill` filtered on both the pid and the image name, so it
+/// only acts if that pid still runs that program. Windows offers no gentle
+/// stop for a child without a console, so the file is left unfinished; the
+/// job object normally means there is no orphan to reap.
+#[cfg(windows)]
+fn stop_if_still_running(pid: u32, image: &str) -> bool {
+    use std::os::windows::process::CommandExt as _;
+
+    /// Keeps the console program from flashing a window at startup.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let pid_filter = format!("PID eq {pid}");
+    let image_filter = format!("IMAGENAME eq {image}");
+    Command::new("taskkill")
+        .args(["/F", "/FI", &pid_filter, "/FI", &image_filter])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn stop_if_still_running(_pid: u32, _image: &str) -> bool {
+    false
+}
+
+// ---- tying the child to our lifetime ----
+
+/// Linux: have the kernel send SIGTERM to the child when we die.
+#[cfg(target_os = "linux")]
+fn tie_before_exec(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+
+    let our_pid = std::process::id() as libc::pid_t;
+    // prctl reads the signal as an unsigned long through varargs, so it is
+    // widened here rather than passed as a c_int with an undefined upper half.
+    let death_signal = libc::SIGTERM as libc::c_ulong;
+    let in_child = move || -> std::io::Result<()> {
+        unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, death_signal) };
+        // If we died between the fork and the prctl, the death signal has
+        // already been missed. A changed parent pid gives that away.
+        if unsafe { libc::getppid() } != our_pid {
+            unsafe { libc::_exit(0) };
+        }
+        Ok(())
+    };
+    // SAFETY: this runs in the child between fork and exec, where only
+    // async-signal-safe functions may be called; prctl, getppid and _exit are.
+    unsafe { cmd.pre_exec(in_child) };
+}
+
+#[cfg(not(target_os = "linux"))]
+fn tie_before_exec(_cmd: &mut Command) {}
+
+/// Windows: place the child in our kill-on-close job.
+#[cfg(windows)]
+fn tie_after_spawn(child: &Child) {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows::Win32::Foundation::HANDLE as Handle;
+
+    let as_handle = |raw: *mut core::ffi::c_void| Handle(raw);
+    let Some(job_address) = process_job() else { return };
+    let child_handle = as_handle(child.as_raw_handle() as *mut _);
+    // SAFETY: the job handle is never closed, and `child` owns its process
+    // handle for at least as long as this call.
+    let _ = unsafe {
+        windows::Win32::System::JobObjects::AssignProcessToJobObject(
+            as_handle(job_address as *mut _),
+            child_handle,
+        )
+    };
+}
+
+/// The one job for this process, made on first use and never closed: the
+/// open handle is the whole mechanism. When the process ends, however it
+/// ends, the kernel closes the handle and kills every process in the job.
+/// Stored as an address because a raw handle is not `Sync`.
+#[cfg(windows)]
+fn process_job() -> Option<usize> {
+    use windows::Win32::System::JobObjects as jobs;
+
+    type Limits = jobs::JOBOBJECT_EXTENDED_LIMIT_INFORMATION;
+    static JOB_ADDRESS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+
+    let create = || unsafe {
+        // No name, so no other process can open the same job by guessing it.
+        let handle = jobs::CreateJobObjectW(None, windows::core::PCWSTR::null()).ok()?;
+        let mut limits = Limits::default();
+        limits.BasicLimitInformation.LimitFlags = jobs::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let limits_size = std::mem::size_of::<Limits>() as u32;
+        let limits_ptr: *const core::ffi::c_void = (&limits as *const Limits).cast();
+        let class = jobs::JobObjectExtendedLimitInformation;
+        jobs::SetInformationJobObject(handle, class, limits_ptr, limits_size).ok()?;
+        Some(handle.0 as usize)
+    };
+    *JOB_ADDRESS.get_or_init(create)
+}
+
+/// macOS: start a detached watchdog shell for this child.
+#[cfg(target_os = "macos")]
+fn tie_after_spawn(child: &Child) {
+    // The shell we start puts the loop in the background and exits straight
+    // away, so waiting on it is instant and leaves no zombie, while the loop
+    // itself is adopted by launchd and keeps watching.
+    let watchdog = watchdog_command(std::process::id(), child.id());
+    let launched = Command::new("/bin/sh")
+        .args(["-c", watchdog.as_str()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    if let Ok(mut shell) = launched {
+        let _ = shell.wait();
+    }
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
-fn adopt(_child: &Child) {}
+fn tie_after_spawn(_child: &Child) {}
 
-/// Body of the macOS watchdog. Pure, so its shape can be asserted on any host.
+/// The macOS watchdog, as one shell command line.
 ///
-/// Polls once a second until either process is gone, then — only if it was the
-/// *parent* that went — interrupts the encoder so it finalizes the container,
-/// and hard-kills it if it hasn't exited a few seconds later. When the encoder
-/// exits first (the normal case) the loop simply ends and the watchdog does
-/// nothing.
+/// Once a second it checks that both processes are alive. When one of them
+/// is gone it looks at why: if the recorder ended first (the normal case) it
+/// simply stops; if we are the one that vanished, it interrupts the recorder
+/// so the file gets finalized, and kills it outright five seconds later if it
+/// is still there. Built as a plain string so tests can inspect it anywhere.
 #[cfg(any(target_os = "macos", test))]
-fn watchdog_script(parent: u32, child: u32) -> String {
-    format!(
-        "( while /bin/kill -0 {parent} 2>/dev/null && /bin/kill -0 {child} 2>/dev/null; \
-         do sleep 1; done; \
-         /bin/kill -0 {parent} 2>/dev/null || \
-         {{ /bin/kill -INT {child} 2>/dev/null; sleep 5; /bin/kill -9 {child} 2>/dev/null; }} \
-         ) >/dev/null 2>&1 &"
-    )
+fn watchdog_command(parent_pid: u32, recorder_pid: u32) -> String {
+    let alive = |pid: u32| format!("/bin/kill -0 {pid} 2>/dev/null");
+    let watch = format!("while {} && {}; do sleep 1; done", alive(parent_pid), alive(recorder_pid));
+    let stop = format!(
+        "{{ /bin/kill -INT {recorder_pid} 2>/dev/null; sleep 5; /bin/kill -9 {recorder_pid} 2>/dev/null; }}"
+    );
+    format!("( {watch}; {} || {stop} ) >/dev/null 2>&1 &", alive(parent_pid))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn record_round_trips() {
-        let text = format_record(4321, "ffmpeg");
-        assert_eq!(parse_record(&text), Some((4321, "ffmpeg".to_owned())));
+    fn record(pid: u32, image: &str) -> LiveRecord {
+        LiveRecord { pid, image: image.to_owned() }
     }
 
     #[test]
-    fn record_is_case_insensitive_on_the_image() {
-        let text = format_record(7, "FFmpeg.EXE");
-        assert_eq!(parse_record(&text), Some((7, "ffmpeg.exe".to_owned())));
+    fn a_record_reads_back_as_written() {
+        let written = record(4321, "ffmpeg").encode();
+        assert_eq!(written, "4321\nffmpeg\n");
+        assert_eq!(LiveRecord::decode(&written), Some(record(4321, "ffmpeg")));
     }
 
-    /// A truncated or garbled record must parse to nothing rather than to a
-    /// pid we would then go and signal.
     #[test]
-    fn malformed_records_are_rejected() {
-        for text in ["", "\n", "notapid\nffmpeg\n", "1234", "1234\n", "1234\n\n", "0\nffmpeg\n"] {
-            assert_eq!(parse_record(text), None, "should reject {text:?}");
+    fn the_image_is_read_back_lowercase() {
+        let written = record(7, "FFmpeg.EXE").encode();
+        assert_eq!(LiveRecord::decode(&written), Some(record(7, "ffmpeg.exe")));
+    }
+
+    #[test]
+    fn whitespace_and_extra_lines_are_tolerated() {
+        assert_eq!(LiveRecord::decode(" 99 \r\n ffmpeg \r\nleftover\n"), Some(record(99, "ffmpeg")));
+    }
+
+    /// Anything incomplete must decode to nothing, never to a pid we would
+    /// then go and signal.
+    #[test]
+    fn broken_records_decode_to_nothing() {
+        let broken = ["", "\n", "notapid\nffmpeg\n", "1234", "1234\n", "1234\n\n", "0\nffmpeg\n", "-5\nffmpeg\n"];
+        for text in broken {
+            assert_eq!(LiveRecord::decode(text), None, "{text:?} should not decode");
         }
     }
 
-    /// Only recorder images may be killed — pid reuse would otherwise let a
-    /// stale record point at an unrelated process.
     #[test]
-    fn only_known_recorder_images_are_reapable() {
-        for ok in ["ffmpeg", "ffmpeg.exe", "screencapture"] {
-            assert!(RECORDER_IMAGES.contains(&ok));
+    fn only_recorder_programs_may_be_stopped() {
+        for name in ["ffmpeg", "ffmpeg.exe", "screencapture"] {
+            assert!(is_reapable(name), "{name} should be reapable");
         }
-        for bad in ["bash", "explorer.exe", "framefang", ""] {
-            assert!(!RECORDER_IMAGES.contains(&bad), "{bad} must not be reapable");
+        for name in ["bash", "explorer.exe", "framefang", "FFMPEG", ""] {
+            assert!(!is_reapable(name), "{name:?} must never be reapable");
         }
     }
 
-    /// Every image a recorder is actually spawned with has to be in the
-    /// reapable set, or the pidfile records a name the reaper will refuse.
-    /// Paths are written in the host's own syntax — `Path::file_name` only
-    /// splits on backslashes when it is compiled for Windows.
+    /// The name recorded at spawn time must be one the reaper accepts, or a
+    /// leftover would be recorded and then refused. Paths use the host's own
+    /// separators, since `Path::file_name` only splits on `\` on Windows.
     #[test]
-    fn spawned_program_names_are_reapable() {
+    fn recorder_programs_record_reapable_names() {
         #[cfg(windows)]
-        let progs = ["ffmpeg.exe", r"C:\Program Files\Framefang\ffmpeg.exe"];
+        let programs = ["ffmpeg.exe", "FFMPEG.EXE", r"C:\Program Files\Framefang\ffmpeg.exe"];
         #[cfg(not(windows))]
-        let progs = ["ffmpeg", "/usr/bin/ffmpeg", "screencapture",
-                     "/Applications/Frame Fang.app/Contents/Resources/ffmpeg"];
-        for prog in progs {
-            let name = program_basename(&Command::new(prog));
-            assert!(RECORDER_IMAGES.contains(&name.as_str()),
-                "{prog} -> {name:?} is not in RECORDER_IMAGES");
+        let programs = [
+            "ffmpeg",
+            "/usr/bin/ffmpeg",
+            "screencapture",
+            "/Applications/Frame Fang.app/Contents/Resources/ffmpeg",
+        ];
+        for program in programs {
+            let name = image_name(Command::new(program).get_program().as_ref());
+            assert!(is_reapable(&name), "{program} gave {name:?}");
         }
     }
 
     #[test]
-    fn watchdog_script_names_both_pids_and_backgrounds_itself() {
-        let s = watchdog_script(111, 222);
-        assert!(s.contains("111") && s.contains("222"), "{s}");
-        assert!(s.trim_end().ends_with('&'), "watchdog must detach: {s}");
-        // Graceful first, hard kill only as a fallback.
-        assert!(s.find("-INT").unwrap() < s.find("-9").unwrap(), "{s}");
+    fn a_path_with_no_file_name_gives_an_empty_image() {
+        assert_eq!(image_name(Path::new("")), "");
+        assert!(!is_reapable(&image_name(Path::new(".."))));
     }
 
-    /// The watchdog must be valid shell. `sh -n` parses without executing.
+    #[test]
+    fn the_watchdog_watches_both_and_detaches() {
+        let script = watchdog_command(111, 222);
+        assert!(script.contains("-0 111") && script.contains("-0 222"), "{script}");
+        assert!(script.trim_end().ends_with('&'), "the watchdog must run detached: {script}");
+        let interrupt = script.find("-INT 222").expect(&script);
+        let kill = script.find("-9 222").expect(&script);
+        assert!(interrupt < kill, "interrupt first, force only after: {script}");
+    }
+
+    /// `sh -n` parses the script without running it.
     #[cfg(unix)]
     #[test]
-    fn watchdog_script_is_syntactically_valid_shell() {
-        use std::io::Write;
-        let mut c = Command::new("/bin/sh")
-            .args(["-n"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+    fn the_watchdog_is_valid_shell() {
+        use std::io::Write as _;
+
+        let mut sh = Command::new("/bin/sh")
+            .arg("-n")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
-            .unwrap();
-        c.stdin.take().unwrap().write_all(watchdog_script(1, 2).as_bytes()).unwrap();
-        assert!(c.wait().unwrap().success(), "watchdog script is not valid shell");
+            .expect("/bin/sh should start");
+        let script = watchdog_command(1, 2);
+        sh.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+        assert!(sh.wait().unwrap().success(), "not valid shell: {script}");
     }
 }

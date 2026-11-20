@@ -1,108 +1,136 @@
-//! Undo/redo log for the annotation canvas.
+//! The editor's undo and redo.
 //!
-//! The editor used to keep two plain `Vec<Annotation>` stacks, which can
-//! only express "an annotation was appended". Moving and deleting existing
-//! annotations need an operation log, so the stacks now hold `EditOp`s.
+//! Undo has to cover more than "a mark was drawn": marks can be moved,
+//! deleted, wiped all at once, and the picture can be cropped. So instead of
+//! snapshots of the mark list, history keeps a log of the changes made to it.
 //!
-//! Contract: every op is recorded *after* the caller has already applied it
-//! to the annotation vector. `undo` inverts the op, `redo` re-applies it.
+//! The caller changes the mark list first and then calls [`History::record`]
+//! with what it did. Undo plays a change backwards and redo plays it forwards
+//! again, both against the caller's own list.
 
 use serde::{Deserialize, Serialize};
 
-use crate::annotation::Annotation;
-use crate::edit;
+use crate::{annotation::Annotation, edit};
 
-/// One reversible change to the annotation list.
+/// A single change to the mark list that can be played either way.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum EditOp {
-    /// A new annotation was inserted at `index` (always the end, today).
+    /// `annotation` went into the list at `index` (new marks go on the end).
     Add { index: usize, annotation: Annotation },
-    /// The annotation at `index` was removed.
+    /// `annotation` was taken out of the list from `index`.
     Delete { index: usize, annotation: Annotation },
-    /// The annotation at `index` was shifted by (dx, dy).
+    /// The mark at `index` was dragged by (dx, dy).
     Move { index: usize, dx: f32, dy: f32 },
-    /// The whole canvas was cleared — Esc on a live selection. Carries the
-    /// annotations so one Ctrl+Z brings the entire session back.
+    /// Every mark was wiped at once (Esc while a selection is live). The
+    /// wiped marks travel with it, so a single undo restores all of them.
     Clear { annotations: Vec<Annotation> },
-    /// The picture was cropped from `before` to `after` (`x, y, w, h` in the
-    /// editor's canvas). Changes no annotation; the editor applies the rect
-    /// `undo` or `redo` hands back.
+    /// The picture was cropped from `before` to `after`, each `(x, y, w, h)`
+    /// on the editor canvas. The marks are untouched; the editor applies
+    /// whichever rectangle undo or redo returns.
     Crop { before: (i32, i32, i32, i32), after: (i32, i32, i32, i32) },
 }
 
-/// Undo/redo stacks over an externally-owned `Vec<Annotation>`.
+/// Which way a change is being played.
+#[derive(Clone, Copy, PartialEq)]
+enum Way {
+    Forward,
+    Backward,
+}
+
+/// Put `mark` back at `index`, or on the end if the list has since shrunk.
+fn reinsert(marks: &mut Vec<Annotation>, index: usize, mark: &Annotation) {
+    marks.insert(index.min(marks.len()), mark.clone());
+}
+
+/// Take out the mark at `index`; an index that no longer exists is ignored
+/// so a stale entry can never bring the editor down.
+fn take_out(marks: &mut Vec<Annotation>, index: usize) {
+    if index < marks.len() {
+        marks.remove(index);
+    }
+}
+
+impl EditOp {
+    /// Apply this change to `marks` in the given direction.
+    fn play(&self, marks: &mut Vec<Annotation>, way: Way) {
+        let forward = way == Way::Forward;
+        match self {
+            EditOp::Add { index, annotation } if forward => reinsert(marks, *index, annotation),
+            EditOp::Add { index, .. } => take_out(marks, *index),
+            EditOp::Delete { index, .. } if forward => take_out(marks, *index),
+            EditOp::Delete { index, annotation } => reinsert(marks, *index, annotation),
+            EditOp::Move { index, dx, dy } => {
+                let sign = if forward { 1.0 } else { -1.0 };
+                if let Some(mark) = marks.get_mut(*index) {
+                    edit::translate(mark, sign * dx, sign * dy);
+                }
+            }
+            EditOp::Clear { .. } if forward => marks.clear(),
+            EditOp::Clear { annotations } => marks.clone_from(annotations),
+            EditOp::Crop { .. } => {}
+        }
+    }
+
+    /// Whether this change, if lost, would lose something the user made.
+    fn is_work(&self) -> bool {
+        match self {
+            EditOp::Clear { annotations } => !annotations.is_empty(),
+            _ => true,
+        }
+    }
+}
+
+/// The undo and redo stacks. The mark list itself belongs to the caller and
+/// is passed in to each call.
 #[derive(Debug, Default, Clone)]
 pub struct History {
-    undo: Vec<EditOp>,
-    redo: Vec<EditOp>,
+    /// Changes in the order they were made; undo takes from the end.
+    done: Vec<EditOp>,
+    /// Changes undone, latest last; redo takes from the end.
+    undone: Vec<EditOp>,
 }
 
 impl History {
     pub fn new() -> Self { Self::default() }
 
-    /// Log an op the caller has already applied. Clears the redo stack —
-    /// same convention as every other editor on the planet.
+    /// Log a change the caller has already made. Anything that was undone
+    /// can no longer be redone once a fresh change is made.
     pub fn record(&mut self, op: EditOp) {
-        self.undo.push(op);
-        self.redo.clear();
+        self.undone.clear();
+        self.done.push(op);
     }
 
-    pub fn can_undo(&self) -> bool { !self.undo.is_empty() }
-    pub fn can_redo(&self) -> bool { !self.redo.is_empty() }
+    pub fn can_undo(&self) -> bool { !self.done.is_empty() }
+    pub fn can_redo(&self) -> bool { !self.undone.is_empty() }
 
-    /// True when either stack still holds annotations the user could get
-    /// back. Closing the editor while this is true throws work away, so the
-    /// overlay asks for confirmation first.
+    /// Whether undo or redo could still bring back something the user made.
+    /// The editor asks before closing while this holds, since closing would
+    /// throw that work away.
     pub fn holds_recoverable_work(&self) -> bool {
-        self.undo.iter().chain(self.redo.iter()).any(|op| match op {
-            EditOp::Add { .. } | EditOp::Delete { .. } | EditOp::Move { .. } | EditOp::Crop { .. } => true,
-            EditOp::Clear { annotations } => !annotations.is_empty(),
-        })
+        self.done.iter().chain(&self.undone).any(EditOp::is_work)
     }
 
-    /// Invert the most recent op. Returns it so the caller can react (step
-    /// numbering, clearing the current selection highlight).
+    /// Play the latest change backwards and hand it back, so the caller can
+    /// renumber steps or drop a selection highlight.
     pub fn undo(&mut self, annotations: &mut Vec<Annotation>) -> Option<EditOp> {
-        let op = self.undo.pop()?;
-        match &op {
-            EditOp::Add { index, .. } => {
-                if *index < annotations.len() { annotations.remove(*index); }
-            }
-            EditOp::Delete { index, annotation } => {
-                let at = (*index).min(annotations.len());
-                annotations.insert(at, annotation.clone());
-            }
-            EditOp::Move { index, dx, dy } => {
-                if let Some(a) = annotations.get_mut(*index) { edit::translate(a, -dx, -dy); }
-            }
-            EditOp::Clear { annotations: saved } => {
-                annotations.clear();
-                annotations.extend(saved.iter().cloned());
-            }
-            EditOp::Crop { .. } => {}
-        }
-        self.redo.push(op.clone());
-        Some(op)
+        Self::shift(&mut self.done, &mut self.undone, annotations, Way::Backward)
     }
 
-    /// Re-apply the most recently undone op.
+    /// Play the latest undone change forwards again and hand it back.
     pub fn redo(&mut self, annotations: &mut Vec<Annotation>) -> Option<EditOp> {
-        let op = self.redo.pop()?;
-        match &op {
-            EditOp::Add { index, annotation } => {
-                let at = (*index).min(annotations.len());
-                annotations.insert(at, annotation.clone());
-            }
-            EditOp::Delete { index, .. } => {
-                if *index < annotations.len() { annotations.remove(*index); }
-            }
-            EditOp::Move { index, dx, dy } => {
-                if let Some(a) = annotations.get_mut(*index) { edit::translate(a, *dx, *dy); }
-            }
-            EditOp::Clear { .. } => annotations.clear(),
-            EditOp::Crop { .. } => {}
-        }
-        self.undo.push(op.clone());
+        Self::shift(&mut self.undone, &mut self.done, annotations, Way::Forward)
+    }
+
+    /// Move the top change of `from` onto `to`, playing it on the way.
+    fn shift(
+        from: &mut Vec<EditOp>,
+        to: &mut Vec<EditOp>,
+        marks: &mut Vec<Annotation>,
+        way: Way,
+    ) -> Option<EditOp> {
+        let op = from.pop()?;
+        op.play(marks, way);
+        to.push(op.clone());
         Some(op)
     }
 }
@@ -110,122 +138,137 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::annotation::{Point2, Stroke};
-    use crate::color::Rgba;
+    use crate::{annotation::{Point2, Stroke}, color::Rgba};
 
-    fn p(x: f32, y: f32) -> Point2 { Point2::new(x, y) }
+    fn at(x: f32, y: f32) -> Point2 { Point2::new(x, y) }
 
-    fn add(h: &mut History, anns: &mut Vec<Annotation>, a: Annotation) {
-        anns.push(a.clone());
-        h.record(EditOp::Add { index: anns.len() - 1, annotation: a });
+    fn scribble(x: f32) -> Annotation { Annotation::pen(Stroke::default(), at(x, x)) }
+
+    fn label(words: &str) -> Annotation { Annotation::text(Rgba::RED, at(0.0, 0.0), words) }
+
+    /// Draw `mark` the way the editor does: append it, then log it.
+    fn draw(log: &mut History, marks: &mut Vec<Annotation>, mark: Annotation) {
+        marks.push(mark.clone());
+        log.record(EditOp::Add { index: marks.len() - 1, annotation: mark });
     }
 
     #[test]
-    fn add_undo_redo_round_trip() {
-        let (mut h, mut anns) = (History::new(), Vec::new());
-        add(&mut h, &mut anns, Annotation::pen(Stroke::default(), p(1.0, 1.0)));
-        add(&mut h, &mut anns, Annotation::step(Rgba::RED, p(5.0, 5.0), 1));
-        assert_eq!(anns.len(), 2);
-        h.undo(&mut anns);
-        assert_eq!(anns.len(), 1);
-        h.undo(&mut anns);
-        assert!(anns.is_empty());
-        assert!(h.undo(&mut anns).is_none(), "undo past the bottom is a no-op");
-        h.redo(&mut anns);
-        h.redo(&mut anns);
-        assert_eq!(anns.len(), 2);
-        assert!(h.redo(&mut anns).is_none());
+    fn drawn_marks_undo_and_redo_in_order() {
+        let mut log = History::new();
+        let mut marks = Vec::new();
+        draw(&mut log, &mut marks, scribble(1.0));
+        draw(&mut log, &mut marks, Annotation::step(Rgba::RED, at(5.0, 5.0), 1));
+        assert!(log.undo(&mut marks).is_some());
+        assert_eq!(marks, vec![scribble(1.0)]);
+        assert!(log.undo(&mut marks).is_some());
+        assert!(marks.is_empty());
+        assert_eq!(log.undo(&mut marks), None, "nothing left to undo");
+        log.redo(&mut marks);
+        log.redo(&mut marks);
+        assert_eq!(marks.len(), 2);
+        assert_eq!(log.redo(&mut marks), None, "nothing left to redo");
+        assert!(log.can_undo() && !log.can_redo());
     }
 
     #[test]
-    fn delete_is_undoable_at_its_original_index() {
-        let (mut h, mut anns) = (History::new(), Vec::new());
-        add(&mut h, &mut anns, Annotation::text(Rgba::RED, p(0.0, 0.0), "first"));
-        add(&mut h, &mut anns, Annotation::text(Rgba::RED, p(0.0, 0.0), "second"));
-        add(&mut h, &mut anns, Annotation::text(Rgba::RED, p(0.0, 0.0), "third"));
-        let removed = anns.remove(1);
-        h.record(EditOp::Delete { index: 1, annotation: removed.clone() });
-        assert_eq!(anns.len(), 2);
-        h.undo(&mut anns);
-        assert_eq!(anns.len(), 3);
-        assert_eq!(anns[1], removed, "the annotation comes back where it was");
-        h.redo(&mut anns);
-        assert_eq!(anns.len(), 2);
-        assert_eq!(anns[1], Annotation::text(Rgba::RED, p(0.0, 0.0), "third"));
+    fn an_undone_delete_returns_to_its_old_slot() {
+        let mut log = History::new();
+        let mut marks = Vec::new();
+        for words in ["one", "two", "three"] {
+            draw(&mut log, &mut marks, label(words));
+        }
+        let gone = marks.remove(1);
+        log.record(EditOp::Delete { index: 1, annotation: gone.clone() });
+        log.undo(&mut marks);
+        assert_eq!(marks, vec![label("one"), gone, label("three")]);
+        log.redo(&mut marks);
+        assert_eq!(marks, vec![label("one"), label("three")]);
     }
 
     #[test]
-    fn move_is_undoable_and_redoable() {
-        let (mut h, mut anns) = (History::new(), Vec::new());
-        add(&mut h, &mut anns, Annotation::step(Rgba::RED, p(10.0, 10.0), 1));
-        let original = anns[0].clone();
-        edit::translate(&mut anns[0], 30.0, -12.0);
-        h.record(EditOp::Move { index: 0, dx: 30.0, dy: -12.0 });
-        let moved = anns[0].clone();
-        h.undo(&mut anns);
-        assert_eq!(anns[0], original, "undo puts the annotation back");
-        h.redo(&mut anns);
-        assert_eq!(anns[0], moved, "redo moves it again");
+    fn a_drag_undoes_back_to_the_start_and_redoes_to_the_end() {
+        let mut log = History::new();
+        let mut marks = Vec::new();
+        draw(&mut log, &mut marks, Annotation::step(Rgba::RED, at(10.0, 10.0), 1));
+        let start = marks[0].clone();
+        edit::translate(&mut marks[0], 30.0, -12.0);
+        let end = marks[0].clone();
+        log.record(EditOp::Move { index: 0, dx: 30.0, dy: -12.0 });
+        log.undo(&mut marks);
+        assert_eq!(marks[0], start);
+        log.redo(&mut marks);
+        assert_eq!(marks[0], end);
     }
 
     #[test]
-    fn clear_restores_the_whole_canvas_in_one_undo() {
-        let (mut h, mut anns) = (History::new(), Vec::new());
-        add(&mut h, &mut anns, Annotation::pen(Stroke::default(), p(1.0, 1.0)));
-        add(&mut h, &mut anns, Annotation::pen(Stroke::default(), p(2.0, 2.0)));
-        let saved = std::mem::take(&mut anns);
-        h.record(EditOp::Clear { annotations: saved.clone() });
-        assert!(anns.is_empty());
-        h.undo(&mut anns);
-        assert_eq!(anns, saved, "one Ctrl+Z brings back everything Esc cleared");
-        h.redo(&mut anns);
-        assert!(anns.is_empty());
+    fn one_undo_restores_everything_a_clear_wiped() {
+        let mut log = History::new();
+        let mut marks = Vec::new();
+        draw(&mut log, &mut marks, scribble(1.0));
+        draw(&mut log, &mut marks, scribble(2.0));
+        let wiped = std::mem::take(&mut marks);
+        log.record(EditOp::Clear { annotations: wiped.clone() });
+        log.undo(&mut marks);
+        assert_eq!(marks, wiped);
+        log.redo(&mut marks);
+        assert!(marks.is_empty());
     }
 
     #[test]
-    fn recording_clears_the_redo_stack() {
-        let (mut h, mut anns) = (History::new(), Vec::new());
-        add(&mut h, &mut anns, Annotation::pen(Stroke::default(), p(1.0, 1.0)));
-        h.undo(&mut anns);
-        assert!(h.can_redo());
-        add(&mut h, &mut anns, Annotation::pen(Stroke::default(), p(9.0, 9.0)));
-        assert!(!h.can_redo(), "a new edit forks the timeline");
-        assert_eq!(anns.len(), 1);
+    fn a_new_change_throws_away_the_redo_stack() {
+        let mut log = History::new();
+        let mut marks = Vec::new();
+        draw(&mut log, &mut marks, scribble(1.0));
+        log.undo(&mut marks);
+        assert!(log.can_redo());
+        draw(&mut log, &mut marks, scribble(9.0));
+        assert!(!log.can_redo());
+        assert_eq!(marks, vec![scribble(9.0)]);
     }
 
     #[test]
-    fn recoverable_work_tracks_both_stacks() {
-        let (mut h, mut anns) = (History::new(), Vec::new());
-        assert!(!h.holds_recoverable_work(), "a fresh session has nothing to lose");
-        add(&mut h, &mut anns, Annotation::pen(Stroke::default(), p(1.0, 1.0)));
-        assert!(h.holds_recoverable_work());
-        h.undo(&mut anns);
-        assert!(anns.is_empty());
-        assert!(h.holds_recoverable_work(), "undone work is still recoverable with Ctrl+Y");
+    fn work_counts_on_either_stack() {
+        let mut log = History::new();
+        let mut marks = Vec::new();
+        assert!(!log.holds_recoverable_work(), "nothing made yet");
+        draw(&mut log, &mut marks, scribble(1.0));
+        assert!(log.holds_recoverable_work());
+        log.undo(&mut marks);
+        assert!(marks.is_empty());
+        assert!(log.holds_recoverable_work(), "redo can still bring it back");
     }
 
     #[test]
-    fn a_crop_is_work_and_comes_back_from_undo_and_redo() {
-        let (mut h, mut anns) = (History::new(), Vec::<Annotation>::new());
-        let op = EditOp::Crop { before: (0, 0, 100, 100), after: (10, 10, 50, 50) };
-        h.record(op.clone());
-        assert!(h.holds_recoverable_work(), "closing after a crop asks first");
-        assert_eq!(h.undo(&mut anns), Some(op.clone()), "the editor gets the rects back");
-        assert_eq!(h.redo(&mut anns), Some(op));
-        assert!(anns.is_empty());
+    fn clearing_an_empty_canvas_is_not_work() {
+        let mut log = History::new();
+        log.record(EditOp::Clear { annotations: Vec::new() });
+        assert!(!log.holds_recoverable_work());
+        log.record(EditOp::Move { index: 0, dx: 1.0, dy: 0.0 });
+        assert!(log.holds_recoverable_work());
     }
 
     #[test]
-    fn stale_indices_never_panic() {
-        // Defensive: an op whose index no longer exists must be dropped, not
-        // panic the editor mid-session.
-        let mut h = History::new();
-        let mut anns: Vec<Annotation> = Vec::new();
-        h.record(EditOp::Add { index: 7, annotation: Annotation::pen(Stroke::default(), p(0.0, 0.0)) });
-        h.undo(&mut anns);
-        assert!(anns.is_empty());
-        h.record(EditOp::Move { index: 42, dx: 1.0, dy: 1.0 });
-        h.undo(&mut anns);
-        assert!(anns.is_empty());
+    fn a_crop_counts_as_work_and_returns_its_rectangles() {
+        let mut log = History::new();
+        let mut marks: Vec<Annotation> = Vec::new();
+        let crop = EditOp::Crop { before: (0, 0, 100, 100), after: (10, 10, 50, 50) };
+        log.record(crop.clone());
+        assert!(log.holds_recoverable_work());
+        assert_eq!(log.undo(&mut marks).as_ref(), Some(&crop));
+        assert_eq!(log.redo(&mut marks).as_ref(), Some(&crop));
+        assert!(marks.is_empty());
+    }
+
+    #[test]
+    fn out_of_range_indices_are_skipped_without_panicking() {
+        let mut log = History::new();
+        let mut marks: Vec<Annotation> = Vec::new();
+        log.record(EditOp::Add { index: 7, annotation: scribble(0.0) });
+        log.undo(&mut marks);
+        assert!(marks.is_empty());
+        log.record(EditOp::Move { index: 42, dx: 1.0, dy: 1.0 });
+        log.undo(&mut marks);
+        log.redo(&mut marks);
+        assert!(marks.is_empty());
     }
 }

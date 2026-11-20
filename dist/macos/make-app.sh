@@ -1,83 +1,90 @@
-#!/bin/sh
-# Assemble "Frame Fang.app" from an already-built `framefang` binary.
+#!/usr/bin/env sh
+# Builds "Frame Fang.app" around a framefang binary that is already compiled.
 #
-# The one definition of the macOS bundle: the release workflow
-# (.github/workflows/release.yml) calls this script, so a local run produces
-# the same layout and the same Info.plist as the released .dmg. The plist
-# lives next to this script in Info.plist.in, with @VERSION@ filled in.
+# The release workflow runs this same script, so a bundle made by hand has
+# exactly the layout and Info.plist of the one inside the published .dmg.
+# Info.plist.in, next to this script, is the plist with @VERSION@ left blank.
 #
-#   dist/macos/make-app.sh \
-#     --binary framefang-rs/target/release/framefang \
-#     --version 1.3.1 \
-#     --arch arm64 \
-#     --out-dir framefang-rs/dist
-#
-# Optional:
-#   --icns PATH      prebuilt .icns (default icons/Framefang.icns)
-#
-# Adapted from Kashot's dist/macos/make-app.sh (Apache-2.0, see NOTICE).
-set -eu
+# Usage, from the repository root:
+#   sh dist/macos/make-app.sh --arch x64 --version 2.0.0 \
+#       --binary framefang-rs/target/x86_64-apple-darwin/release/framefang \
+#       [--out-dir DIR]   where the .app goes (default: dist)
+#       [--icns FILE]     the app icon (default: icons/Framefang.icns)
+set -e -u
 
-PROG=$(basename "$0")
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
+me=$(basename "$0")
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repo=$(CDPATH= cd -- "$here/../.." && pwd)
 
-BINARY=
-VERSION=
-ARCH=
-ICNS="$REPO_ROOT/icons/Framefang.icns"
-OUT_DIR=dist
-
-die() {
-    echo "$PROG: $*" >&2
-    exit 1
+fail() {
+    printf '%s: %s\n' "$me" "$*" >&2
+    exit 2
 }
 
-# Print this file's leading comment block as the help text.
-usage() {
-    awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
+# The help text is the comment block at the top of this file, minus the
+# shebang, so the two can't disagree.
+show_help() {
+    sed -n -e 1d -e '/^#/!q' -e 's/^# \{0,1\}//' -e p "$0"
 }
 
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --binary)  BINARY=${2:?--binary needs a path};   shift 2 ;;
-        --version) VERSION=${2:?--version needs a value}; shift 2 ;;
-        --arch)    ARCH=${2:?--arch needs a value};       shift 2 ;;
-        --icns)    ICNS=${2:?--icns needs a path};        shift 2 ;;
-        --out-dir) OUT_DIR=${2:?--out-dir needs a path};  shift 2 ;;
-        -h|--help) usage; exit 0 ;;
-        *) die "unknown argument: $1 (try --help)" ;;
+binary=
+version=
+arch=
+icns="$repo/icons/Framefang.icns"
+out_dir=dist
+
+# Every option takes a value; a missing one is an error, not a silent blank.
+until [ "$#" -eq 0 ]; do
+    opt=$1
+    if [ "$opt" = -h ] || [ "$opt" = --help ]; then
+        show_help
+        exit 0
+    fi
+    case "$opt" in
+        --binary|--version|--arch|--icns|--out-dir) ;;
+        *) fail "unknown argument: $opt (try --help)" ;;
+    esac
+    [ "$#" -ge 2 ] && [ -n "$2" ] || fail "$opt needs a value"
+    value=$2
+    shift 2
+    case "$opt" in
+        --binary)  binary=$value ;;
+        --version) version=$value ;;
+        --arch)    arch=$value ;;
+        --icns)    icns=$value ;;
+        --out-dir) out_dir=$value ;;
     esac
 done
 
-[ -n "$BINARY" ]  || die "--binary is required"
-[ -n "$VERSION" ] || die "--version is required"
-[ -n "$ARCH" ]    || die "--arch is required"
-[ -f "$BINARY" ]  || die "binary not found: $BINARY"
-[ -f "$ICNS" ]    || die "icns not found: $ICNS"
+for required in binary version arch; do
+    eval "given=\${$required}"
+    [ -n "$given" ] || fail "--$required is required"
+done
+[ -f "$binary" ] || fail "binary not found: $binary"
+[ -f "$icns" ]   || fail "icns not found: $icns"
 
-case "$ARCH" in
-    arm64|x64) ;;
-    *) die "unknown arch: $ARCH (expected arm64 or x64)" ;;
-esac
+# Only the two architectures the release builds.
+[ "$arch" = arm64 ] || [ "$arch" = x64 ] || fail "unknown arch: $arch (expected arm64 or x64)"
 
-# The version lands in the plist through sed, so keep it to safe characters.
-case "$VERSION" in
-    *[!0-9A-Za-z.+-]*) die "version has unexpected characters: $VERSION" ;;
-esac
+# The version is pasted into the plist by sed below; letters, digits, dots,
+# plus and minus are all a version needs and none of them confuse sed.
+if printf '%s' "$version" | LC_ALL=C tr -d '0-9A-Za-z.+-' | grep -q .; then
+    fail "version has unexpected characters: $version"
+fi
 
-TEMPLATE="$SCRIPT_DIR/Info.plist.in"
-[ -f "$TEMPLATE" ] || die "missing plist template: $TEMPLATE"
+plist_template="$here/Info.plist.in"
+[ -f "$plist_template" ] || fail "missing plist template: $plist_template"
 
-APP="$OUT_DIR/Frame Fang.app"
-rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+bundle="$out_dir/Frame Fang.app"
+contents="$bundle/Contents"
+rm -rf "$bundle"
+mkdir -p "$contents/MacOS" "$contents/Resources"
 
-# The binary inside the bundle is always `framefang` (CFBundleExecutable).
-cp "$BINARY" "$APP/Contents/MacOS/framefang"
-chmod +x "$APP/Contents/MacOS/framefang"
-cp "$ICNS" "$APP/Contents/Resources/framefang.icns"
+# Info.plist names the executable `framefang` and the icon `framefang`, so
+# both are copied under those names whatever the inputs were called.
+cp "$binary" "$contents/MacOS/framefang"
+chmod +x "$contents/MacOS/framefang"
+cp "$icns" "$contents/Resources/framefang.icns"
+sed "s/@VERSION@/$version/g" "$plist_template" > "$contents/Info.plist"
 
-sed "s/@VERSION@/$VERSION/g" "$TEMPLATE" > "$APP/Contents/Info.plist"
-
-echo "$PROG: built $APP (version $VERSION, arch $ARCH)"
+printf '%s: built %s (version %s, arch %s)\n' "$me" "$bundle" "$version" "$arch"

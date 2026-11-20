@@ -1062,7 +1062,7 @@ dependencies = [
 
 [[package]]
 name = "framefang-app"
-version = "1.6.2"
+version = "1.7.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1088,7 +1088,7 @@ dependencies = [
 
 [[package]]
 name = "framefang-core"
-version = "1.6.2"
+version = "1.7.0"
 dependencies = [
  "bitflags 2.11.1",
  "chrono",
@@ -1102,7 +1102,7 @@ dependencies = [
 
 [[package]]
 name = "framefang-platform"
-version = "1.6.2"
+version = "1.7.0"
 dependencies = [
  "anyhow",
  "arboard",

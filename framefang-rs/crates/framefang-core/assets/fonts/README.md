@@ -1,22 +1,19 @@
-# Bundled typeface
+# The Text tool's font
 
-`NotoSans-Regular.ttf` — **Noto Sans**, Regular, static hinted TTF.
+`NotoSans-Regular.ttf` is Noto Sans Regular (static, hinted TrueType) from the
+Noto Project. `framefang_core::text` embeds it with `include_bytes!` and
+fontdue rasterizes it, so text annotations come out pixel for pixel the same
+on every operating system, with no system fonts involved.
 
-Used by `framefang_core::text` for the annotation Text tool: it is compiled into
-the binary with `include_bytes!` and rasterized at runtime by `fontdue`, so the
-Text tool renders the same glyphs on Windows, Linux and macOS with no
-dependency on any system font.
+| | |
+| --- | --- |
+| Source | <https://github.com/notofonts/latin-greek-cyrillic> |
+| Version | Noto Sans 2022, `Copyright 2022 The Noto Project Authors` |
+| SHA-256 | `478c558ea716033cd60c03438f628dfa75694dcf6b5f6d505a2f05fd2b4f3823` |
+| License | SIL Open Font License 1.1: `OFL.txt` here, and `THIRD_PARTY_LICENSES.md` at the repository root |
 
-- Upstream: <https://github.com/notofonts/latin-greek-cyrillic>
-- Version: Noto Sans 2022 (`Copyright 2022 The Noto Project Authors`)
-- SHA256: `478c558ea716033cd60c03438f628dfa75694dcf6b5f6d505a2f05fd2b4f3823`
-- License: **SIL Open Font License 1.1** — full text in `OFL.txt` next to this
-  file, and summarized in `THIRD_PARTY_LICENSES.md` at the repo root.
-
-Coverage is Latin (including the full set of accented and Central/Eastern
-European forms), Greek, Cyrillic, general punctuation, currency and the common
-math symbols. It deliberately does **not** carry CJK, Arabic, Hebrew, Indic, or
-the dingbat/arrow blocks — those live in separate Noto families and are not
-worth the binary size here. A character the font has no glyph for renders as
-the font's `.notdef` box, so it stays visible and takes up space rather than
-silently vanishing from the annotation.
+It covers Latin with its accented letters, Greek, Cyrillic, punctuation,
+currency signs and common math symbols. Scripts that Noto ships as separate
+families (CJK, Arabic, Hebrew, the Indic scripts) and the symbol and arrow
+blocks are left out to keep the binary small. A character the font lacks is
+drawn as its placeholder box, so it still shows and takes up room.

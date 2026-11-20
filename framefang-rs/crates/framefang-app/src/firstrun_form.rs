@@ -1,335 +1,186 @@
-//! One-time welcome window, shown on the very first launch.
+//! The welcome window, shown once on the very first launch.
 //!
-//! Framefang has no main window: after startup the only evidence it is alive is
-//! a tray icon, and the "Framefang is running" line it prints goes to a console
-//! that neither the Windows nor the macOS build has. A first-time user is
-//! therefore left staring at a desktop that looks unchanged. This window is
-//! that missing confirmation — it names the app, the hotkey and the save
-//! folder, and says where on *this* OS the tray icon actually appears.
+//! After start-up the app has no window of its own, only a tray icon, and
+//! the release builds have no console for a "started" line either. Someone
+//! running it for the first time sees a desktop that looks just as it did
+//! and can fairly assume nothing happened. This card says otherwise: the
+//! app is running, here is the capture key, here is where pictures go, and
+//! here is where this OS puts the tray icon.
 //!
-//! Structure mirrors `about_form.rs` (same palette, same `BufferSurface`
-//! painter, same `Option<View>` + `outcome` lifecycle in the tray app), with
-//! one button instead of four. Unlike the tray-failure About fallback,
-//! dismissing this window never exits the app.
+//! Built on the shared dialog shell (`dialog::Shell`). Closing it never
+//! quits the app; the tray loop just drops the view.
 
-use std::num::NonZeroU32;
-use std::rc::Rc;
-
-use anyhow::{anyhow, Result};
-use softbuffer::{Context, Surface};
-use winit::dpi::{PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use anyhow::Result;
+use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
-use winit::keyboard::{Key, NamedKey};
-use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
+use winit::keyboard::NamedKey;
+use winit::window::WindowId;
 
-use framefang_core::color::Rgba as FramefangRgba;
-
-use crate::bitmap_font;
-use crate::painter;
-
-// Colors: the app's one palette (cyan and magenta on blue-black).
-#[allow(unused_imports)]
+use crate::dialog::{fit_middle, inside, Input, Rect, Shell};
 use crate::palette::*;
 
-const WIN_W: u32 = 520;
-const WIN_H: u32 = 248;
-const PAD:   i32 = 22;
-/// The version line's top: the window's first line, right under the title
-/// bar (which holds the heading).
-const BODY_Y: i32 = 22;
-const BTN_W: i32 = 140;
-const BTN_H: i32 = 34;
-/// Left edge of the value column in the HOTKEY / SAVE TO rows.
-const VALUE_X: i32 = PAD + 90;
+const CARD_W: u32 = 520;
+const CARD_H: u32 = 248;
+const MARGIN: i32 = 22;
+/// The version line, the body's first; the title strip carries the heading.
+const VERSION_Y: i32 = 22;
+const RUNNING_Y: i32 = VERSION_Y + 26;
+/// The HOTKEY line; SAVE TO follows one step lower.
+const SETTINGS_Y: i32 = RUNNING_Y + 30;
+const SETTINGS_STEP: i32 = 18;
+/// Where the values in the HOTKEY and SAVE TO lines start.
+const VALUE_X: i32 = MARGIN + 90;
+const HINTS_Y: i32 = SETTINGS_Y + SETTINGS_STEP + 32;
+const HINT_STEP: i32 = 16;
+
+const OK_W: i32 = 140;
+const OK_H: i32 = 34;
+/// The one button, in the bottom-right corner.
+const OK_BUTTON: Rect = (CARD_W as i32 - MARGIN - OK_W, CARD_H as i32 - MARGIN - OK_H, OK_W, OK_H);
 
 pub enum FirstRunOutcome {
-    /// User clicked "Got it" / hit Esc or Enter / closed the window. The tray
-    /// app just drops the view — the app keeps running.
+    /// Dismissed by the button, Esc, Enter or a close. The app carries on.
     Closed,
 }
 
 pub struct FirstRunView {
-    window:  Rc<Window>,
-    _ctx:    Context<Rc<Window>>,
-    surface: Surface<Rc<Window>, Rc<Window>>,
-    hotkey:   String,
+    shell: Shell,
+    hotkey: String,
     save_dir: String,
-    /// Where to look for the tray icon on this OS, one short line each.
-    notes:    Vec<String>,
-    btn:      (i32, i32, i32, i32),
-    cursor:   (i32, i32),
-    hover:    bool,
-    /// The title strip drawn above the dialog (minimize, close, drag).
-    title_bar: crate::chrome::TitleBar,
+    hints: Vec<&'static str>,
+    over_button: bool,
     pub outcome: Option<FirstRunOutcome>,
 }
 
 impl FirstRunView {
-    /// `hotkey` is `settings.hotkey().describe()` and `save_dir` the resolved
-    /// screenshot folder — both are passed in already rendered so this view
-    /// never has to know how either is derived.
+    /// `hotkey` is the capture key as `Hotkey::describe` writes it and
+    /// `save_dir` the folder screenshots go to, both ready to show.
     pub fn new(
         loop_target: &ActiveEventLoop,
-        hotkey:      &str,
-        save_dir:    &str,
-        wayland:     bool,
+        hotkey: &str,
+        save_dir: &str,
+        wayland: bool,
     ) -> Result<Self> {
-        let win_h = WIN_H + crate::chrome::TITLE_H as u32;
-        let (cx, cy) = centered_origin(loop_target, WIN_W, win_h);
-        let attrs = crate::chrome::frameless(WindowAttributes::default())
-            .with_title("Welcome to Frame Fang")
-            .with_resizable(false)
-            .with_inner_size(PhysicalSize::new(WIN_W, win_h))
-            .with_position(PhysicalPosition::new(cx, cy))
-            .with_window_icon(crate::brand_icon::shared());
-
-        let window = loop_target
-            .create_window(attrs)
-            .map(Rc::new)
-            .map_err(|e| anyhow!("create_window (firstrun): {e}"))?;
-        crate::chrome::finish(&window);
-
-        // Same reason as the About window: Framefang is a tray/menu-bar agent
-        // with no Dock icon, so a window that opens behind the frontmost app
-        // is a window the user never finds.
-        window.focus_window();
-        window.set_cursor(CursorIcon::Default);
-        let ctx = Context::new(window.clone())
-            .map_err(|e| anyhow!("softbuffer Context::new (firstrun): {e}"))?;
-        let surface = Surface::new(&ctx, window.clone())
-            .map_err(|e| anyhow!("softbuffer Surface::new (firstrun): {e}"))?;
-
-        let mut me = FirstRunView {
-            window, _ctx: ctx, surface,
-            hotkey:   hotkey.to_owned(),
-            save_dir: save_dir.to_owned(),
-            notes:    locator_notes(wayland),
-            btn:      (WIN_W as i32 - PAD - BTN_W, WIN_H as i32 - PAD - BTN_H, BTN_W, BTN_H),
-            cursor:   (0, 0),
-            hover:    false,
-            title_bar: Default::default(),
-            outcome:  None,
+        let shell = Shell::open(loop_target, "Welcome to Frame Fang", "// WELCOME", "welcome", (CARD_W, CARD_H))?;
+        let mut view = FirstRunView {
+            shell,
+            hotkey: hotkey.into(),
+            save_dir: save_dir.into(),
+            hints: tray_hints(wayland),
+            over_button: false,
+            outcome: None,
         };
-        me.redraw();
-        Ok(me)
+        view.paint();
+        Ok(view)
     }
 
-    pub fn window_id(&self) -> WindowId { self.window.id() }
+    pub fn window_id(&self) -> WindowId { self.shell.id() }
 
     pub fn handle_event(&mut self, event: WindowEvent) {
-        match event {
-            WindowEvent::CloseRequested => self.outcome = Some(FirstRunOutcome::Closed),
-            WindowEvent::KeyboardInput {
-                event: winit::event::KeyEvent {
-                    logical_key: Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter),
-                    state: ElementState::Pressed, ..
-                }, ..
-            } => self.outcome = Some(FirstRunOutcome::Closed),
-            WindowEvent::CursorLeft { .. } => {
-                if self.title_bar.leave() { self.window.request_redraw(); }
+        match self.shell.input(event) {
+            Input::Close | Input::Key(NamedKey::Escape | NamedKey::Enter) => {
+                self.outcome = Some(FirstRunOutcome::Closed);
             }
-            WindowEvent::CursorMoved { position, .. } => {
-                let raw = (position.x as i32, position.y as i32);
-                if self.title_bar.hover_at(&self.window, raw) { self.window.request_redraw(); }
-                // The dialog's own coordinates start below the title strip.
-                self.cursor = (raw.0, raw.1 - crate::chrome::TITLE_H);
-                let hovered = self.hit_test(self.cursor.0, self.cursor.1);
-                self.window.set_cursor(if hovered { CursorIcon::Pointer } else { CursorIcon::Default });
-                if hovered != self.hover {
-                    self.hover = hovered;
-                    self.window.request_redraw();
-                }
+            Input::Moved => {
+                let over = inside(OK_BUTTON, self.shell.cursor);
+                self.shell.track_hover(&mut self.over_button, over, over);
             }
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Left, ..
-            } => {
-                match self.title_bar.press(&self.window, self.cursor) {
-                    Some(crate::chrome::TitlePart::Close) => return self.handle_event(WindowEvent::CloseRequested),
-                    Some(_) => return,
-                    None => {}
-                }
-                if self.hit_test(self.cursor.0, self.cursor.1) {
-                    self.outcome = Some(FirstRunOutcome::Closed);
-                }
+            Input::Press if inside(OK_BUTTON, self.shell.cursor) => {
+                self.outcome = Some(FirstRunOutcome::Closed);
             }
-            WindowEvent::Resized(_) | WindowEvent::RedrawRequested => self.redraw(),
+            Input::Paint => self.paint(),
             _ => {}
         }
     }
 
-    fn hit_test(&self, x: i32, y: i32) -> bool {
-        let (bx, by, bw, bh) = self.btn;
-        x >= bx && x < bx + bw && y >= by && y < by + bh
-    }
+    fn paint(&mut self) {
+        let Some(mut page) = self.shell.page() else { return };
 
-    fn redraw(&mut self) {
-        let phys = self.window.inner_size();
-        let (Some(w), Some(h)) = (NonZeroU32::new(phys.width), NonZeroU32::new(phys.height))
-            else { return; };
-        if let Err(e) = self.surface.resize(w, h) { eprintln!("firstrun: surface.resize: {e}"); return; }
-        let mut frame = match self.surface.buffer_mut() {
-            Ok(b) => b,
-            Err(e) => { eprintln!("firstrun: buffer_mut: {e}"); return; }
-        };
-        let win_w = w.get() as usize;
-        // The dialog draws into its own buffer, placed below the title strip.
-        let win_h = (h.get() as usize).saturating_sub(crate::chrome::TITLE_H as usize);
-        let mut buf = vec![0u32; win_w * win_h];
-        // The title bar holds the heading; the glowing rule runs along the
-        // body's top.
-        crate::hud::backdrop(&mut buf, win_w, win_h, 0);
+        let version = format!("v{}  //  welcome", env!("CARGO_PKG_VERSION"));
+        page.text(MARGIN, VERSION_Y, &version, TEXT_MUTED());
+        page.text(MARGIN, RUNNING_Y, "Frame Fang is now running in the tray / menu bar.", TEXT_BRIGHT);
 
-        let mut surf = BufferSurface { buf: &mut buf, w: win_w as i32, h: win_h as i32 };
+        // The two settings a newcomer most needs, as they are right now, so
+        // there's no trip to Settings just to find them.
+        page.text(MARGIN, SETTINGS_Y, "HOTKEY", SECTION_TINT());
+        crate::keycap::draw_line_on(&mut page, VALUE_X, SETTINGS_Y, &crate::keycap::chord(&self.hotkey), 1, TEXT_BRIGHT);
+        let folder_y = SETTINGS_Y + SETTINGS_STEP;
+        page.text(MARGIN, folder_y, "SAVE TO", SECTION_TINT());
+        let folder = fit_middle(&self.save_dir, CARD_W as i32 - MARGIN - VALUE_X);
+        page.text(VALUE_X, folder_y, &folder, TEXT_BRIGHT);
 
-        let version = format!("v{}  //  first run", env!("CARGO_PKG_VERSION"));
-        draw_text(&mut surf, PAD, BODY_Y, 1, &version, argb_to_framefang(TEXT_MUTED()));
-
-        // The one thing a first-time user needs to know.
-        let mut y = BODY_Y + 26;
-        draw_text(&mut surf, PAD, y, 1,
-            "Frame Fang is running in your tray / menu bar.", argb_to_framefang(TEXT_BRIGHT));
-
-        // Resolved settings, so the user can confirm both without opening the
-        // Settings dialog.
-        y += 30;
-        draw_text(&mut surf, PAD, y, 1, "HOTKEY", argb_to_framefang(SECTION_TINT()));
-        // The capture key as the keys themselves (`keycap`).
-        crate::keycap::draw_line_on(&mut surf, VALUE_X, y, &crate::keycap::chord(&self.hotkey), 1, TEXT_BRIGHT);
-        y += 18;
-        let dir_w = WIN_W as i32 - PAD - VALUE_X;
-        draw_text(&mut surf, PAD, y, 1, "SAVE TO", argb_to_framefang(SECTION_TINT()));
-        draw_text(&mut surf, VALUE_X, y, 1, &truncate_for(&self.save_dir, dir_w),
-            argb_to_framefang(TEXT_BRIGHT));
-
-        // Where the icon actually is on this desktop.
-        y += 32;
-        for note in &self.notes {
-            draw_text(&mut surf, PAD, y, 1, note, argb_to_framefang(TEXT_MUTED()));
-            y += 16;
+        let mut y = HINTS_Y;
+        for hint in &self.hints {
+            page.text(MARGIN, y, hint, TEXT_MUTED());
+            y += HINT_STEP;
         }
 
-        let (bx, by, bw, bh) = self.btn;
-        if self.hover { fill_rect(&mut surf, bx, by, bw, bh, argb_to_framefang(PRIMARY_FILL())); }
-        stroke_rect_argb(&mut surf, bx, by, bw, bh, argb_to_framefang(LASER()));
-        let label = "Got it";
-        let tw = bitmap_font::measure(label, 1);
-        draw_text(&mut surf, bx + (bw - tw) / 2, by + (bh - bitmap_font::GLYPH_H) / 2, 1,
-            label, argb_to_framefang(LASER()));
-
-        self.title_bar.draw(&mut frame, win_w, &buf, "// WELCOME", BG_TOP());
-        if let Err(e) = frame.present() { eprintln!("firstrun: buf.present: {e}"); }
+        page.button(OK_BUTTON, "Okay", true, self.over_button);
+        self.shell.show(page);
     }
 }
 
-/// Where to look for the tray icon, per OS. `cfg!` rather than `#[cfg]` so
-/// every branch is type-checked on every platform.
+/// Where this OS shows the tray icon, a short line each. Chosen at run
+/// time, so every branch compiles on every platform.
 ///
-/// Wording is deliberately concrete: the single most common "Framefang didn't
-/// start" report is a Windows icon sitting in the hidden-icons overflow.
-fn locator_notes(wayland: bool) -> Vec<String> {
-    let mut notes: Vec<String> = Vec::new();
-    if cfg!(target_os = "windows") {
-        notes.push("Windows hides new tray icons behind the taskbar chevron.".to_owned());
-        notes.push("Click it, then drag the Frame Fang icon onto the bar to pin it.".to_owned());
-    } else if cfg!(target_os = "macos") {
-        notes.push("Look for the Frame Fang icon at the top right of the menu bar.".to_owned());
-        notes.push("Frame Fang runs as a menu-bar agent - it has no Dock icon.".to_owned());
-    } else {
-        notes.push("The icon needs an AppIndicator / tray host on your desktop.".to_owned());
-        notes.push("GNOME needs the AppIndicator extension to show it.".to_owned());
-        if wayland {
-            // Wayland has no key grab: the shortcut is requested from the
-            // desktop's global-shortcuts portal, and the desktop has the final
-            // say on what it ends up being.
-            notes.push("On Wayland your desktop assigns the capture shortcut.".to_owned());
+/// Kept concrete on purpose: the usual "it didn't start" report on Windows
+/// is an icon tucked away in the hidden-icons overflow.
+fn tray_hints(wayland: bool) -> Vec<&'static str> {
+    match std::env::consts::OS {
+        "windows" => vec![
+            "New tray icons start out hidden behind the taskbar's ^ arrow.",
+            "Open it and drag the Frame Fang icon onto the taskbar to keep it.",
+        ],
+        "macos" => vec![
+            "The Frame Fang icon sits at the top right, in the menu bar.",
+            "There is no Dock icon: Frame Fang lives in the menu bar.",
+        ],
+        _ => {
+            let mut hints = vec![
+                "Showing the icon takes a tray host (AppIndicator) on the desktop.",
+                "On GNOME, add the AppIndicator extension to see it.",
+            ];
+            // Wayland lets no app grab a key itself: the capture shortcut is
+            // asked for through the desktop's global-shortcuts portal, and
+            // the desktop decides what it finally is.
+            hints.extend(wayland.then_some("Under Wayland, your desktop picks the capture shortcut."));
+            hints
         }
     }
-    notes
 }
 
-// ── tiny rendering helpers (same shape as about_form) ───────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bitmap_font::measure;
 
-struct BufferSurface<'a> {
-    buf: &'a mut [u32],
-    w:   i32,
-    h:   i32,
-}
-
-impl painter::Surface for BufferSurface<'_> {
-    fn width(&self)  -> i32 { self.w }
-    fn height(&self) -> i32 { self.h }
-    fn read(&self, x: i32, y: i32) -> [u8; 4] {
-        if x < 0 || y < 0 || x >= self.w || y >= self.h { return [0, 0, 0, 0xFF]; }
-        let p = self.buf[(y as usize) * (self.w as usize) + (x as usize)];
-        [((p >> 16) & 0xFF) as u8, ((p >> 8) & 0xFF) as u8, (p & 0xFF) as u8, 0xFF]
-    }
-    fn write(&mut self, x: i32, y: i32, rgba: [u8; 4]) {
-        if x < 0 || y < 0 || x >= self.w || y >= self.h { return; }
-        let dst = (y as usize) * (self.w as usize) + (x as usize);
-        self.buf[dst] = ((rgba[0] as u32) << 16) | ((rgba[1] as u32) << 8) | rgba[2] as u32;
-    }
-}
-
-fn argb_to_framefang(argb: u32) -> FramefangRgba {
-    FramefangRgba {
-        r: ((argb >> 16) & 0xFF) as u8,
-        g: ((argb >>  8) & 0xFF) as u8,
-        b: ( argb        & 0xFF) as u8,
-        a: 255,
-    }
-}
-
-fn centered_origin(loop_target: &ActiveEventLoop, w: u32, h: u32) -> (i32, i32) {
-    let primary = loop_target.primary_monitor()
-        .or_else(|| loop_target.available_monitors().next());
-    let (mon_x, mon_y, mon_w, mon_h) = match primary {
-        Some(m) => {
-            let pos  = m.position();
-            let size = m.size();
-            (pos.x as i32, pos.y as i32, size.width as i32, size.height as i32)
+    #[test]
+    fn every_line_fits_the_card_in_the_pixel_font() {
+        let room = CARD_W as i32 - 2 * MARGIN;
+        let lines = tray_hints(true).into_iter().chain(["Frame Fang is now running in the tray / menu bar."]);
+        for line in lines {
+            assert!(measure(line, 1) <= room, "too wide: {line}");
+            assert!(line.chars().all(|c| (' '..='~').contains(&c)), "the font can't draw: {line}");
         }
-        None => (0, 0, 1920, 1080),
-    };
-    let x = mon_x + (mon_w - w as i32) / 2;
-    let y = mon_y + (mon_h - h as i32) / 2;
-    (x.max(mon_x), y.max(mon_y))
-}
-
-
-fn fill_rect<S: painter::Surface>(s: &mut S, x: i32, y: i32, w: i32, h: i32, color: FramefangRgba) {
-    let rgba = [color.r, color.g, color.b, color.a];
-    for yy in y..y + h { for xx in x..x + w { s.write(xx, yy, rgba); } }
-}
-
-fn stroke_rect_argb<S: painter::Surface>(s: &mut S, x: i32, y: i32, w: i32, h: i32, color: FramefangRgba) {
-    let rgba = [color.r, color.g, color.b, color.a];
-    for xx in x..x + w { s.write(xx, y, rgba); s.write(xx, y + h - 1, rgba); }
-    for yy in y..y + h { s.write(x, yy, rgba); s.write(x + w - 1, yy, rgba); }
-}
-
-fn draw_text<S: painter::Surface>(s: &mut S, x: i32, y: i32, scale: i32, text: &str, color: FramefangRgba) {
-    painter::draw_text(s, x, y, scale, text, color);
-}
-
-/// Shrink `s` until it fits in `max_px` at scale 1, eliding the middle: this
-/// only ever renders a filesystem path, whose leaf is the part worth reading.
-fn truncate_for(s: &str, max_px: i32) -> String {
-    if bitmap_font::measure(s, 1) <= max_px { return s.to_owned(); }
-    let ellipsis = "..";
-    let advance = bitmap_font::GLYPH_W + 1;
-    let fits = (max_px + 1) / advance;
-    let ell_n = ellipsis.chars().count() as i32;
-    if fits <= ell_n {
-        return ellipsis.chars().take(fits.max(0) as usize).collect();
+        assert!(measure("Okay", 1) < OK_W - 16);
     }
-    let keep = fits - ell_n;
-    let tail = (keep * 2 / 3).max(1) as usize;
-    let head = keep as usize - tail;
-    let chars: Vec<char> = s.chars().collect();
-    let mut out: String = chars[..head].iter().collect();
-    out.push_str(ellipsis);
-    out.extend(&chars[chars.len() - tail..]);
-    out
+
+    #[test]
+    fn the_wayland_line_appears_only_on_wayland_desktops() {
+        let (with, without) = (tray_hints(true).len(), tray_hints(false).len());
+        if cfg!(any(target_os = "windows", target_os = "macos")) {
+            assert_eq!(with, without);
+        } else {
+            assert_eq!(with, without + 1);
+        }
+        assert!(without >= 2);
+    }
+
+    #[test]
+    fn the_hints_end_above_the_button() {
+        let lines = tray_hints(true).len() as i32;
+        let last_bottom = HINTS_Y + (lines - 1) * HINT_STEP + crate::bitmap_font::GLYPH_H;
+        assert!(last_bottom < OK_BUTTON.1 + OK_BUTTON.3, "hints run past the button row");
+        assert!(OK_BUTTON.0 + OK_BUTTON.2 == CARD_W as i32 - MARGIN);
+    }
 }

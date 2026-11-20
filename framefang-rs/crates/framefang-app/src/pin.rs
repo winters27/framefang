@@ -1,175 +1,184 @@
-//! Pinned-image window — borderless, always-on-top, draggable.
-//!
-//! Mirrors `Framefang/PinForm.cs` from the C# build: when the user picks "Pin"
-//! on a captured selection, the cropped bitmap stays floating on screen as
-//! its own little window. Click-and-drag moves it; Esc / right-click /
-//! middle-click closes it.
-//!
-//! Like the editor overlay, this can't own its own event loop because the
-//! tray app is the single owner — instead `TrayApp` keeps a `Vec<PinView>`
-//! and dispatches `WindowEvent`s by `WindowId`.
+/*!
+Pinned images: a captured selection kept floating on screen in its own small
+window, frameless and always on top.
 
-use std::num::NonZeroU32;
-use std::rc::Rc;
+Choosing Pin in the editor hands the cropped bitmap here. Dragging with the
+left button moves the window; Esc, a right click or a middle click closes it.
 
-use anyhow::{anyhow, Result};
-use image::{ImageBuffer, Rgba};
-use framefang_core::dpi::sample_index;
-use softbuffer::{Context, Surface};
-use winit::dpi::{PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
-use winit::event_loop::ActiveEventLoop;
-use winit::keyboard::{Key, NamedKey};
-use winit::window::{CursorIcon, Window, WindowAttributes, WindowId, WindowLevel};
+The tray app owns the only event loop, so a pin cannot run one of its own.
+`TrayApp` keeps a `Vec<PinView>` and routes each `WindowEvent` to the pin
+whose `WindowId` it carries, the same way it drives the editor overlay. The
+window plumbing (attributes, drawing surface, repaint cycle) is shared with
+the recording panel and lives in `recording_indicator`.
+*/
+
+use {
+    crate::recording_indicator::{drawing_surface, floating_attrs, open_window, repaint, SoftContext, SoftSurface},
+    anyhow::Result,
+    framefang_core::dpi::sample_index,
+    image::{ImageBuffer, Rgba},
+    std::rc::Rc,
+    winit::{
+        event::{ElementState, KeyEvent, MouseButton, WindowEvent},
+        event_loop::ActiveEventLoop,
+        keyboard::{Key, NamedKey},
+        window::{CursorIcon, Window, WindowId},
+    },
+};
+
+type Bitmap = ImageBuffer<Rgba<u8>, Vec<u8>>;
+
+/// What an empty pin shows: the near-black window background.
+const EMPTY_FILL: u32 = 0x0010_1014;
 
 pub struct PinView {
-    image:   ImageBuffer<Rgba<u8>, Vec<u8>>,
-    window:  Rc<Window>,
-    _ctx:    Context<Rc<Window>>,
-    surface: Surface<Rc<Window>, Rc<Window>>,
+    bitmap: Bitmap,
+    window: Rc<Window>,
+    // Never read, but the surface is only valid while its context lives.
+    _context: SoftContext,
+    canvas: SoftSurface,
 }
 
 impl PinView {
-    /// Pin the image at the given desktop position, in **device pixels**.
-    ///
-    /// The bitmap is in device pixels too (it was cut out of the capture,
-    /// which the display map builds at device resolution), so a window whose
-    /// *physical* inner size is the bitmap's size covers exactly the region
-    /// the user selected on any display — a 2x panel gets a 2x bitmap in a
-    /// window that is half as many logical points across, i.e. the same
-    /// physical rectangle. `redraw` handles the case where the window manager
-    /// hands back a different size anyway.
+    /// Open a pin showing `image` with its top-left corner at `screen_pos`,
+    /// both in device pixels. The bitmap was cut from a capture taken at
+    /// device resolution, so asking for a window whose physical inner size
+    /// equals the bitmap's covers exactly the area the user selected, whatever
+    /// the display's scale factor: on a 2x panel the bitmap is twice as wide
+    /// and the window half as many logical points, which is the same physical
+    /// rectangle. If the window manager hands back some other size, the
+    /// repaint scales to fit.
     pub fn new(
-        loop_target: &ActiveEventLoop,
-        image:       ImageBuffer<Rgba<u8>, Vec<u8>>,
-        screen_pos:  (i32, i32),
+        loop_target: &ActiveEventLoop, image: Bitmap, screen_pos: (i32, i32),
     ) -> Result<Self> {
-        let (w, h) = (image.width(), image.height());
-        let attrs = WindowAttributes::default()
-            .with_title("Frame Fang: pinned")
-            .with_decorations(false)
-            .with_resizable(false)
-            .with_inner_size(PhysicalSize::new(w, h))
-            .with_position(PhysicalPosition::new(screen_pos.0, screen_pos.1))
-            .with_window_icon(crate::brand_icon::shared())
-            .with_window_level(WindowLevel::AlwaysOnTop);
+        let size = image.dimensions();
+        let floating = open_window(loop_target, floating_attrs("Frame Fang: pinned", size, screen_pos), "pin")?;
+        // As a tray or menu-bar agent Frame Fang has no Dock icon on macOS,
+        // so a pin that opened behind the front app could not be brought
+        // forward. Asking for focus fixes that; elsewhere it just raises it.
+        floating.focus_window();
+        floating.set_cursor(CursorIcon::Move);
+        let (context, canvas) = drawing_surface(&floating, "pin")?;
 
-        let window = loop_target
-            .create_window(attrs)
-            .map(Rc::new)
-            .map_err(|e| anyhow!("create_window (pin): {e}"))?;
-
-        // Framefang runs as a menu-bar/tray agent, so on macOS there is no Dock
-        // icon to click if this opens behind the frontmost app. Ask for focus
-        // explicitly; on Windows/Linux it is a harmless raise.
-        window.focus_window();
-        window.set_cursor(CursorIcon::Move);
-
-        let ctx = Context::new(window.clone())
-            .map_err(|e| anyhow!("softbuffer Context::new (pin): {e}"))?;
-        let surface = Surface::new(&ctx, window.clone())
-            .map_err(|e| anyhow!("softbuffer Surface::new (pin): {e}"))?;
-
-        let mut me = PinView { image, window, _ctx: ctx, surface };
-        me.redraw();
-        Ok(me)
+        let mut pin = Self { bitmap: image, window: floating, _context: context, canvas };
+        pin.repaint_now();
+        Ok(pin)
     }
 
-    pub fn window_id(&self) -> WindowId { self.window.id() }
+    pub fn window_id(&self) -> WindowId {
+        self.window.id()
+    }
 
-    /// Returns `true` when the pin window should be torn down.
+    /// Handle one event for this pin. Returns `true` once the pin should
+    /// close.
     pub fn handle_event(&mut self, event: WindowEvent) -> bool {
-        match event {
-            WindowEvent::CloseRequested => true,
+        use WindowEvent as Ev;
+        let escape = |key: &KeyEvent| {
+            key.state == ElementState::Pressed && key.logical_key == Key::Named(NamedKey::Escape)
+        };
+        match &event {
+            Ev::CloseRequested => return true,
+            Ev::KeyboardInput { event: key, .. } if escape(key) => return true,
+            Ev::MouseInput { state: ElementState::Pressed, button, .. } => match button {
+                MouseButton::Right | MouseButton::Middle => return true,
+                // Let the window manager run the move (on X11 this is
+                // _NET_WM_MOVERESIZE, which every current WM supports), so it
+                // feels like dragging any other window.
+                MouseButton::Left => drop(self.window.drag_window()),
+                _ => (),
+            },
+            Ev::Resized(_) | Ev::RedrawRequested => self.repaint_now(),
+            _ => (),
+        }
+        false
+    }
 
-            WindowEvent::KeyboardInput {
-                event: KeyEvent { logical_key: Key::Named(NamedKey::Escape), state: ElementState::Pressed, .. }, ..
-            } => true,
+    fn repaint_now(&mut self) {
+        let bitmap = &self.bitmap;
+        repaint(&self.window, &mut self.canvas, "pin", |frame, width, height| {
+            paint(bitmap, frame, width, height);
+        });
+    }
+}
 
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Right,
-                ..
-            } => true,
+/// Fill `frame` (`width` by `height`, softbuffer's 0RGB pixels) with
+/// `bitmap` scaled to fit. Normally the window is exactly the bitmap's size
+/// and this is a straight copy, but a window manager that clamps the window,
+/// or a move to a display with another scale factor, would otherwise crop the
+/// picture rather than show all of it. An empty bitmap paints the background.
+fn paint(bitmap: &Bitmap, frame: &mut [u32], width: usize, height: usize) {
+    let (src_w, src_h) = bitmap.dimensions();
+    if src_w == 0 || src_h == 0 {
+        frame.fill(EMPTY_FILL);
+        return;
+    }
+    let pixels = bitmap.as_raw();
+    let src_stride = src_w as usize * 4;
+    // Every row samples the same columns, so work them out once.
+    let columns: Vec<usize> = (0..width)
+        .map(|x| sample_index(x as u32, width as u32, src_w) as usize * 4)
+        .collect();
+    for (y, out_row) in frame.chunks_exact_mut(width).take(height).enumerate() {
+        let row_start = sample_index(y as u32, height as u32, src_h) as usize * src_stride;
+        let src_row = &pixels[row_start..row_start + src_stride];
+        for (out, &at) in out_row.iter_mut().zip(&columns) {
+            let [r, g, b] = [src_row[at], src_row[at + 1], src_row[at + 2]].map(u32::from);
+            *out = r << 16 | g << 8 | b;
+        }
+    }
+}
 
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Middle,
-                ..
-            } => true,
+#[cfg(test)]
+mod checks {
+    use super::{paint, sample_index, Bitmap, ImageBuffer, Rgba, EMPTY_FILL};
 
-            // Left-click-and-drag delegates to the window manager via winit's
-            // interactive-drag API. On X11 this fires _NET_WM_MOVERESIZE which
-            // every modern WM (Cinnamon / Mutter / KWin / sway) honors.
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Left,
-                ..
-            } => {
-                let _ = self.window.drag_window();
-                false
+    fn bitmap(w: u32, h: u32, colour: impl Fn(u32, u32) -> [u8; 4]) -> Bitmap {
+        ImageBuffer::from_fn(w, h, |x, y| Rgba(colour(x, y)))
+    }
+
+    #[test]
+    fn same_size_is_a_straight_copy_without_alpha() {
+        let src = bitmap(3, 2, |x, y| [x as u8 * 10, y as u8 * 20, 7, 128]);
+        let mut frame = vec![0u32; 6];
+        paint(&src, &mut frame, 3, 2);
+        assert_eq!(
+            frame,
+            [0x00_00_07, 0x0A_00_07, 0x14_00_07, 0x00_14_07, 0x0A_14_07, 0x14_14_07]
+        );
+    }
+
+    #[test]
+    fn a_larger_window_repeats_source_pixels() {
+        let src = bitmap(2, 1, |x, _| if x == 0 { [255, 0, 0, 255] } else { [0, 0, 255, 255] });
+        let mut frame = vec![0u32; 8];
+        paint(&src, &mut frame, 4, 2);
+        let red = 0xFF_00_00;
+        let blue = 0x00_00_FF;
+        assert_eq!(frame, [red, red, blue, blue, red, red, blue, blue]);
+    }
+
+    #[test]
+    fn every_pixel_matches_sample_index() {
+        let src = bitmap(5, 3, |x, y| [x as u8, y as u8, (x * y) as u8, 255]);
+        let (w, h) = (7usize, 4usize);
+        let mut frame = vec![0u32; w * h];
+        paint(&src, &mut frame, w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let sx = sample_index(x as u32, w as u32, 5);
+                let sy = sample_index(y as u32, h as u32, 3);
+                let p = src.get_pixel(sx, sy).0;
+                let want = u32::from(p[0]) << 16 | u32::from(p[1]) << 8 | u32::from(p[2]);
+                assert_eq!(frame[y * w + x], want, "({x}, {y})");
             }
-
-            WindowEvent::Resized(_) => {
-                self.redraw();
-                false
-            }
-
-            WindowEvent::RedrawRequested => {
-                self.redraw();
-                false
-            }
-
-            _ => false,
         }
     }
 
-    fn redraw(&mut self) {
-        let phys = self.window.inner_size();
-        let (Some(w), Some(h)) = (NonZeroU32::new(phys.width), NonZeroU32::new(phys.height)) else { return; };
-        if let Err(e) = self.surface.resize(w, h) {
-            eprintln!("pin: surface.resize: {e}"); return;
-        }
-        let mut buf = match self.surface.buffer_mut() {
-            Ok(b) => b,
-            Err(e) => { eprintln!("pin: buffer_mut: {e}"); return; }
-        };
-
-        let win_w = w.get() as usize;
-        let win_h = h.get() as usize;
-        let img_w = self.image.width();
-        let img_h = self.image.height();
-        let raw   = self.image.as_raw();
-
-        if img_w == 0 || img_h == 0 {
-            buf.fill(0x0010_1014);
-            if let Err(e) = buf.present() {
-                eprintln!("pin: buf.present: {e}");
-            }
-            return;
-        }
-
-        // Fit the bitmap to whatever size we actually got. It normally is the
-        // bitmap's own size (see `new`), and then this is a straight copy —
-        // but a window manager that clamps the window, or a move onto a
-        // display with a different scale factor, would otherwise crop the
-        // pinned image instead of showing all of it.
-        for y in 0..win_h {
-            let sy = sample_index(y as u32, win_h as u32, img_h) as usize;
-            let src_row = sy * img_w as usize * 4;
-            let dst_row = y * win_w;
-            for x in 0..win_w {
-                let sx = sample_index(x as u32, win_w as u32, img_w) as usize;
-                let src = src_row + sx * 4;
-                let r = raw[src]     as u32;
-                let g = raw[src + 1] as u32;
-                let b = raw[src + 2] as u32;
-                buf[dst_row + x] = (r << 16) | (g << 8) | b;
-            }
-        }
-
-        if let Err(e) = buf.present() {
-            eprintln!("pin: buf.present: {e}");
-        }
+    #[test]
+    fn an_empty_bitmap_paints_the_background() {
+        let src = Bitmap::new(0, 0);
+        let mut frame = vec![1u32; 4];
+        paint(&src, &mut frame, 2, 2);
+        assert!(frame.iter().all(|&p| p == EMPTY_FILL));
     }
 }

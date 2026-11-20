@@ -1,20 +1,26 @@
-//! Real Framefang — Settings window.
+//! The Settings window.
 //!
-//! Borderless winit + softbuffer + the in-tree bitmap font. Same lifecycle
-//! pattern as `PinView` / `Overlay`: TrayApp owns an `Option<SettingsView>`,
-//! dispatches `WindowEvent`s by `WindowId`, and polls `outcome` after each
-//! event to learn when the user saved or cancelled.
+//! A frameless winit window drawn with softbuffer and the in-tree bitmap
+//! font. The tray owns an `Option<SettingsView>`, hands it each `WindowEvent`
+//! for its `WindowId`, and drains `take_outcomes` afterwards to learn what the
+//! person did here.
 //!
-//! Layout: four tabs (CAPTURES, FILES, HOTKEYS, GENERAL), each a page of
-//! settings with a hairline between them; see `build_rows`.
+//! Four tabs (CAPTURES, FILES, HOTKEYS, GENERAL), each a page of settings
+//! with a hairline between them; `build_rows` lays them out.
 //!
-//! There is no Save button: every change is handed to the tray as it is
-//! made (`SettingsOutcome::Changed`), which applies and saves it.
+//! There is no Save button: each change goes to the tray as it happens
+//! (`SettingsOutcome::Patch`), which applies and saves it.
 //!
-//! GENERAL's last row holds the settings file: Edit as JSON opens
-//! settings.json in the user's default editor (a saved edit shows here within
-//! a second), Import... loads a copy, Export... saves one where the user
-//! picks. What the last of them did shows under the heading.
+//! GENERAL ends with the settings file: Edit as JSON opens settings.json in
+//! the default editor (a saved edit shows here within a second), Import...
+//! loads a copy, Export... saves one wherever the person picks. What the last
+//! of them did shows under the buttons.
+//!
+//! Submodules: `draw` paints rows and holds the drawing kit, `keys` turns
+//! winit keys and modifiers into the numbers `settings.json` stores.
+
+mod draw;
+mod keys;
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -25,16 +31,19 @@ use softbuffer::{Context, Surface};
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
-use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
+use winit::keyboard::{Key, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
-use framefang_core::{AppSettings, Hotkey, Modifiers as HkMods};
-use framefang_core::color::Rgba as FramefangRgba;
+use framefang_core::{AppSettings, Hotkey};
 use framefang_core::hotkeys::{conflict_message, HotkeyAction};
-use framefang_core::settings::{vk_label, SwitchKey};
+use framefang_core::settings::SwitchKey;
 
 use crate::bitmap_font;
 use crate::painter;
+
+use self::draw::*;
+use self::keys::*;
+pub(crate) use self::keys::vk_of;
 
 // Colors: the app's one palette (cyan and magenta on blue-black).
 #[allow(unused_imports)]
@@ -57,8 +66,11 @@ const CARD_BTN_H: i32 = 24;
 /// A row that refines the one above it is indented by this much and its
 /// label is muted, so it reads as part of that setting.
 const SUB_INDENT: i32 = 18;
+/// Space between rows that sit in a stack of their own.
 const ROW_GAP: i32 = 6;
-const PAD:   i32 = 22;
+/// Side margin of every page.
+const PAD: i32 = 22;
+/// A setting row's height.
 const ROW_H: i32 = 34;
 /// The label column. Wide enough for the longest label plus the indent of a
 /// refining row and a clear gap before its control (pinned by a test).
@@ -71,17 +83,20 @@ const SECTION_ABOVE: i32 = 34;
 const THEME_CHIP_GAP: i32 = 8;
 /// Between a row's choice chips.
 const CHIP_GAP: i32 = 6;
-// Buttons that sit inside a hotkey row, right-anchored: REBIND on the edge,
-// CLEAR to its left on the two optional actions.
+/// Widths of the two buttons at a hotkey row's right end: REBIND on the
+/// edge, and CLEAR just left of it (optional actions only).
 const REBIND_W: i32 = 100;
-const CLEAR_W:  i32 = 76;
+const CLEAR_W: i32 = 76;
 /// Between the settings file's buttons and the line saying what the last of
 /// them did.
 const STATUS_GAP: i32 = 8;
 
+/// What a laid-out row is, and so what clicking it does.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WidgetKind {
+    /// The screenshots folder: a path field and Browse....
     SaveFolder,
+    /// The recordings folder, the same way.
     RecordingsFolder,
     /// Which FFmpeg is used: the one picked, or where one was found, or that
     /// none is installed (a label and a read-out; its buttons follow).
@@ -94,16 +109,17 @@ enum WidgetKind {
     /// Forget the pick and find FFmpeg by itself again. In Download's place,
     /// live only while an FFmpeg is picked.
     FfmpegAuto,
-    /// Read-out box for one action's binding.
+    /// The box showing one action's binding.
     HotkeyDisplay(HotkeyAction),
-    /// "REBIND" button: arms capture of the next keypress for that action.
+    /// REBIND: the next key pressed becomes that action's binding.
     HotkeyRebind(HotkeyAction),
-    /// "CLEAR" button, only laid out for the optional actions.
+    /// CLEAR: unbinds the action. Laid out only for the optional ones.
     HotkeyClear(HotkeyAction),
     /// The Theme row's label. The chips beside it are the controls.
     Theme,
     /// One color-scheme chip. Picking it previews at once; Cancel reverts.
     ThemeChoice(crate::palette::Scheme),
+    /// Run Frame Fang when the system starts.
     StartWithOs,
     /// The After-a-capture row's label and caption. The chips beside it are
     /// the controls.
@@ -129,6 +145,7 @@ enum WidgetKind {
     CaptureCursor,
     /// The Settings file row's label; its three buttons are the controls.
     SettingsFile,
+    /// Open settings.json in the default editor.
     OpenJson,
     /// Save a copy of the settings to a file the user picks.
     ExportBtn,
@@ -313,12 +330,15 @@ fn tab_w(t: Tab) -> i32 { bitmap_font::measure(t.label(), 1) + 2 * TAB_PAD }
 /// is taking the capture binding right now.
 const SYSTEM_BTN_H: i32 = 20;
 
+/// One laid-out control or label: what it is, its words, and where it sits
+/// in the page's own coordinates (x, y, width, height).
 struct Row {
-    kind:  WidgetKind,
+    kind: WidgetKind,
     label: &'static str,
-    rect:  (i32, i32, i32, i32),
+    rect: Rect,
 }
 
+/// What the window tells the tray, collected by `take_outcomes`.
 pub enum SettingsOutcome {
     /// Settings changed here: only what changed, which the tray applies to
     /// `settings.json` as it is on disk and saves at once. There is no Save
@@ -329,39 +349,42 @@ pub enum SettingsOutcome {
     /// The window was closed (Esc or its close button). Everything is
     /// already saved; the tray turns the shortcuts back on.
     Closed,
-    /// User clicked [Edit as JSON]; tray loop should shell-open the config
-    /// path. The window stays open, and an edit saved there shows in it.
+    /// Edit as JSON was clicked: the tray opens settings.json with the
+    /// system's handler. The window stays open, and an edit saved there shows
+    /// in it.
     OpenJson,
 }
 
+/// The open Settings window and everything it is showing or waiting on.
 pub struct SettingsView {
-    window:  Rc<Window>,
-    _ctx:    Context<Rc<Window>>,
+    window: Rc<Window>,
+    _ctx: Context<Rc<Window>>,
     surface: Surface<Rc<Window>, Rc<Window>>,
-    draft:   AppSettings,
-    rows:    Vec<Row>,
-    cursor:  (i32, i32),
-    hover:   Option<usize>,
-    /// The action whose row is in "press a key" capture mode, if any. The
-    /// next non-modifier `KeyboardInput::Pressed` event commits its binding;
-    /// `Esc` cancels and reverts to `hotkey_before_capture`.
-    capturing_hotkey: Option<HotkeyAction>,
+    /// The settings as shown, changed by each click before it is reported.
+    draft: AppSettings,
+    rows: Vec<Row>,
+    /// The pointer in page coordinates (below the title bar), and the row
+    /// under it.
+    cursor: (i32, i32),
+    hover: Option<usize>,
+    /// The hotkey row waiting for a key to bind, if any. The next key that
+    /// isn't a bare modifier becomes its binding, and Esc puts back
+    /// `rebind_backup`.
+    rebinding: Option<HotkeyAction>,
     /// A hold line's key waiting for a press to bind, and why the last press
     /// was refused, if it was.
     listening_hold: Option<Hold>,
     hold_refused: Option<String>,
-    /// Snapshot of the binding the captured action had before the user
-    /// pressed REBIND, so Esc can roll back the draft without disk
-    /// persistence. `None` when that action was unbound.
-    hotkey_before_capture: Option<Hotkey>,
-    /// Latest live modifier state, tracked via `WindowEvent::ModifiersChanged`.
-    /// The `KeyboardInput` event doesn't carry modifier info on its own.
-    mods_state: ModifiersState,
-    /// Inline validation message drawn under the HOTKEYS block, in the same
-    /// tint the convert dialogs use for failures. Set when Save is refused
-    /// because two actions share a chord; cleared by the next rebind or
-    /// clear.
-    error:   Option<String>,
+    /// What that action was bound to when REBIND was pressed, so Esc can
+    /// put it back (`None` if it was unbound).
+    rebind_backup: Option<Hotkey>,
+    /// The modifiers held right now. winit reports them in their own event,
+    /// not with each key press.
+    held_mods: ModifiersState,
+    /// A message under the HOTKEYS rows, in the danger tint: a chord another
+    /// action already has, or a system page that wouldn't open. The next
+    /// rebind or clear removes it.
+    notice: Option<String>,
     /// The system's screenshot-shortcut page, if this platform has one.
     system_page: Option<crate::system_shortcuts::Page>,
     /// The system takes the draft's capture binding (Windows' Print Screen
@@ -416,36 +439,41 @@ impl SettingsView {
     pub fn new(loop_target: &ActiveEventLoop, current: AppSettings, ffmpeg_attention: bool) -> Result<Self> {
         let system_page = crate::system_shortcuts::page();
         let guide_shown = shows_windows_guide(system_page, &current);
-        // Something needed FFmpeg: open where it is set up.
+        // Something needed FFmpeg: open on the page where it is set up.
         let tab = if ffmpeg_attention { Tab::Files } else { Tab::Captures };
         let rows = Self::build_rows(system_page, guide_shown, tab);
-        let win_h = window_height(system_page);
-        let (cx, cy) = centered_origin(loop_target, WIN_W, win_h);
+        let height = window_height(system_page);
+        let (left, top) = centred_origin(
+            loop_target.primary_monitor().or_else(|| loop_target.available_monitors().next())
+                .map(|m| (m.position().x, m.position().y, m.size().width as i32, m.size().height as i32)),
+            WIN_W,
+            height,
+        );
         let attrs = crate::chrome::frameless(WindowAttributes::default())
             .with_title("Frame Fang: Settings")
             .with_resizable(false)
-            .with_inner_size(PhysicalSize::new(WIN_W, win_h))
-            .with_position(PhysicalPosition::new(cx, cy))
+            .with_inner_size(PhysicalSize::new(WIN_W, height))
+            .with_position(PhysicalPosition::new(left, top))
             .with_window_icon(crate::brand_icon::shared());
 
-        let window = loop_target
-            .create_window(attrs)
-            .map(Rc::new)
-            .map_err(|e| anyhow!("create_window (settings): {e}"))?;
+        let window = Rc::new(
+            loop_target.create_window(attrs).map_err(|e| anyhow!("settings window: {e}"))?,
+        );
         crate::chrome::finish(&window);
 
-        // Framefang runs as a menu-bar/tray agent, so on macOS there is no Dock
-        // icon to click if this opens behind the frontmost app. Ask for focus
-        // explicitly; on Windows/Linux it is a harmless raise.
+        // The app lives in the tray (or the macOS menu bar), so with no Dock
+        // icon to click this window could open out of sight behind the one in
+        // front. Ask for focus outright; where that isn't needed it is just a
+        // raise.
         window.focus_window();
         window.set_cursor(CursorIcon::Default);
-        let ctx = Context::new(window.clone())
-            .map_err(|e| anyhow!("softbuffer Context::new (settings): {e}"))?;
-        let surface = Surface::new(&ctx, window.clone())
-            .map_err(|e| anyhow!("softbuffer Surface::new (settings): {e}"))?;
+        let ctx = Context::new(window.clone()).map_err(|e| anyhow!("settings graphics context: {e}"))?;
+        let surface = Surface::new(&ctx, window.clone()).map_err(|e| anyhow!("settings drawing surface: {e}"))?;
 
-        let mut me = SettingsView {
-            window, _ctx: ctx, surface,
+        let mut view = SettingsView {
+            window,
+            _ctx: ctx,
+            surface,
             baseline: current.clone(),
             imported: false,
             tab,
@@ -454,12 +482,12 @@ impl SettingsView {
             guide_shown,
             cursor: (0, 0),
             hover: None,
-            capturing_hotkey: None,
+            rebinding: None,
             listening_hold: None,
             hold_refused: None,
-            hotkey_before_capture: None,
-            mods_state: ModifiersState::empty(),
-            error: None,
+            rebind_backup: None,
+            held_mods: ModifiersState::empty(),
+            notice: None,
             system_page,
             system_takes_capture: false,
             capture_hint: None,
@@ -472,10 +500,10 @@ impl SettingsView {
             status: None,
             outcome: Default::default(),
         };
-        me.refresh_system_takes();
-        me.ffmpeg_found = me.find_ffmpeg();
-        me.redraw();
-        Ok(me)
+        view.refresh_system_takes();
+        view.ffmpeg_found = view.find_ffmpeg();
+        view.redraw();
+        Ok(view)
     }
 
     /// The FFmpeg recording and conversion would use with the draft: its
@@ -493,7 +521,7 @@ impl SettingsView {
     pub fn replace_draft(&mut self, s: AppSettings) {
         self.baseline = s.clone();
         self.imported = false;
-        if let Some(a) = self.capturing_hotkey { self.hotkey_before_capture = s.hotkey_for(a); }
+        if let Some(a) = self.rebinding { self.rebind_backup = s.hotkey_for(a); }
         if s == self.draft { return; }
         self.draft = s;
         crate::palette::set(crate::palette::Scheme::parse(&self.draft.theme));
@@ -573,10 +601,10 @@ impl SettingsView {
     /// cancelled first, as Esc would, so no key binds a row out of sight.
     fn switch_tab(&mut self, t: Tab) {
         self.stop_hold_listen();
-        if let Some(action) = self.capturing_hotkey.take() {
-            self.draft.set_hotkey_for(action, self.hotkey_before_capture);
+        if let Some(action) = self.rebinding.take() {
+            self.draft.set_hotkey_for(action, self.rebind_backup);
             self.capture_hint = None;
-            self.error = None;
+            self.notice = None;
             self.relayout();
         }
         if t == self.tab { return; }
@@ -602,53 +630,22 @@ impl SettingsView {
                     self.window.request_redraw();
                 }
             }
-            WindowEvent::ModifiersChanged(mods) => {
-                // Track the live modifier mask so the rebind capture step can
-                // pair `Ctrl+Shift+P` together — `KeyboardInput` on its own
-                // doesn't carry modifier info in winit 0.30.
-                self.mods_state = mods.state();
-            }
+            // winit sends the held modifiers on their own, apart from the
+            // key presses; keep them to pair with a rebound key.
+            WindowEvent::ModifiersChanged(mods) => self.held_mods = mods.state(),
             WindowEvent::CursorLeft { .. } => {
                 if self.title_bar.leave() { self.window.request_redraw(); }
             }
-            WindowEvent::CursorMoved { position, .. } => {
-                let raw = (position.x as i32, position.y as i32);
-                if self.title_bar.hover_at(&self.window, raw) { self.window.request_redraw(); }
-                // The dialog's own coordinates start below the title strip.
-                self.cursor = (raw.0, raw.1 - crate::chrome::TITLE_H);
-                let new_hover = self.hit_test(self.cursor.0, self.cursor.1);
-                let want_cursor = if new_hover.is_some() { CursorIcon::Pointer } else { CursorIcon::Default };
-                self.window.set_cursor(want_cursor);
-                if new_hover != self.hover {
-                    self.hover = new_hover;
-                    self.window.request_redraw();
-                }
-            }
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Left, ..
-            } => {
-                match self.title_bar.press(&self.window, self.cursor) {
-                    Some(crate::chrome::TitlePart::Close) => return self.handle_event(WindowEvent::CloseRequested),
-                    Some(_) => return,
-                    None => {}
-                }
-                let hit = self.hit_test(self.cursor.0, self.cursor.1);
-                // A click anywhere but the waiting key stops it waiting.
-                if self.listening_hold.is_some()
-                    && !hit.is_some_and(|i| matches!(self.rows[i].kind, WidgetKind::HoldKey(_))) {
-                    self.stop_hold_listen();
-                }
-                if let Some(i) = hit {
-                    self.activate(i);
-                } else {
-                    crate::chrome::press_off_controls(&self.window, self.cursor.1, 0);
-                }
+            WindowEvent::CursorMoved { position, .. } => self.on_pointer_moved((position.x as i32, position.y as i32)),
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
+                self.on_left_press();
             }
             WindowEvent::KeyboardInput { event: key_ev, .. } => {
+                // A waiting hold key gets the press first, then a waiting
+                // hotkey box; otherwise it is an ordinary key.
                 if self.listening_hold.is_some() {
                     self.on_hold_key(key_ev);
-                } else if self.capturing_hotkey.is_some() {
+                } else if self.rebinding.is_some() {
                     self.on_capture_key(key_ev);
                 } else {
                     self.on_key(key_ev);
@@ -665,31 +662,54 @@ impl SettingsView {
         }
     }
 
+    /// The pointer moved to `raw` (window coordinates): title bar hover, the
+    /// row under it, and the pointer's shape.
+    fn on_pointer_moved(&mut self, raw: (i32, i32)) {
+        if self.title_bar.hover_at(&self.window, raw) { self.window.request_redraw(); }
+        // Page coordinates start below the title strip.
+        self.cursor = (raw.0, raw.1 - crate::chrome::TITLE_H);
+        let under = self.hit_test(self.cursor.0, self.cursor.1);
+        self.window.set_cursor(if under.is_some() { CursorIcon::Pointer } else { CursorIcon::Default });
+        if under != self.hover {
+            self.hover = under;
+            self.window.request_redraw();
+        }
+    }
+
+    /// A left press: the title bar's buttons first, then the row under the
+    /// pointer, or the window's drag area if there is none.
+    fn on_left_press(&mut self) {
+        match self.title_bar.press(&self.window, self.cursor) {
+            Some(crate::chrome::TitlePart::Close) => {
+                self.handle_event(WindowEvent::CloseRequested);
+                return;
+            }
+            Some(_) => return,
+            None => {}
+        }
+        let hit = self.hit_test(self.cursor.0, self.cursor.1);
+        // A click anywhere but the waiting key stops it waiting.
+        let on_waiting_key = hit.is_some_and(|i| matches!(self.rows[i].kind, WidgetKind::HoldKey(_)));
+        if self.listening_hold.is_some() && !on_waiting_key {
+            self.stop_hold_listen();
+        }
+        match hit {
+            Some(i) => self.activate(i),
+            None => crate::chrome::press_off_controls(&self.window, self.cursor.1, 0),
+        }
+    }
+
+    /// A key with nothing waiting for it. Esc doesn't close the window (the
+    /// title bar does, like any window's); Ctrl+Tab and Ctrl+Shift+Tab step
+    /// through the pages. A waiting rebind takes every key before this.
     fn on_key(&mut self, ev: winit::event::KeyEvent) {
         if ev.state != ElementState::Pressed { return; }
-        // Esc doesn't close the window (Brandon 2026-11-19): it closes
-        // from its title bar like any other window.
-        // Ctrl+Tab and Ctrl+Shift+Tab go through the pages (a listening
-        // rebind takes every key before this is reached).
-        if ev.logical_key == Key::Named(NamedKey::Tab) && self.mods_state.control_key() {
-            let by = if self.mods_state.shift_key() { -1 } else { 1 };
+        if ev.logical_key == Key::Named(NamedKey::Tab) && self.held_mods.control_key() {
+            let by = if self.held_mods.shift_key() { -1 } else { 1 };
             self.switch_tab(self.tab.step(by));
         }
     }
 
-    /// Hotkey-capture key handler. Active only while `capturing_hotkey` is
-    /// set. Eats every key event so they don't fall through into the regular
-    /// `on_key` text-input path.
-    ///
-    /// Behavior:
-    /// - `Esc` cancels capture and rolls back to `hotkey_before_capture`.
-    /// - A bare modifier press (Ctrl / Shift / Alt / Super) is ignored —
-    ///   we want a real key alongside the modifiers.
-    /// - Any supported `KeyCode` commits the binding using the live
-    ///   `mods_state` mask. The draft is mutated; persistence waits for the
-    ///   Save button (or rolls back on Cancel).
-    /// - Unsupported keys ignore the press; the user can hit `Esc` and use
-    ///   the "Edit as JSON" escape hatch for exotic keys.
     /// A hold line's key is waiting: the next press binds it. Esc gives up;
     /// a key the capture screen or the system already uses is refused, and
     /// the line says so while it keeps waiting.
@@ -701,57 +721,65 @@ impl SettingsView {
             return;
         }
         let Some(vk) = vk_of(ev.physical_key) else { return };
-        match SwitchKey::from_vk(vk) {
-            Some(key) => {
-                let before = self.draft.clone();
-                hold.set(&mut self.draft, key);
-                self.stop_hold_listen();
-                self.report_change(&before);
-            }
-            None => {
-                let name = framefang_core::settings::vk_label(vk).unwrap_or("That key");
-                self.hold_refused = Some(format!("{name} is in use"));
-                self.window.request_redraw();
-            }
-        }
-    }
-
-    fn stop_hold_listen(&mut self) {
-        if self.listening_hold.take().is_some() || self.hold_refused.take().is_some() {
+        let Some(key) = SwitchKey::from_vk(vk) else {
+            let name = framefang_core::settings::vk_label(vk).unwrap_or("That key");
+            self.hold_refused = Some(format!("{name} is in use"));
             self.window.request_redraw();
+            return;
+        };
+        let before = self.draft.clone();
+        hold.set(&mut self.draft, key);
+        self.stop_hold_listen();
+        self.report_change(&before);
+    }
+
+    /// Give up waiting on a hold key, and forget why a key was refused.
+    fn stop_hold_listen(&mut self) {
+        let was_listening = self.listening_hold.take().is_some();
+        let was_refusing = self.hold_refused.take().is_some();
+        if was_listening || was_refusing { self.window.request_redraw(); }
+    }
+
+    /// The key that ends the rebind of a hotkey box, as far as winit names it:
+    /// its Win32 number, or `None` for a bare modifier or a key with no number.
+    fn rebind_vk(key: PhysicalKey) -> Option<u32> {
+        match key {
+            PhysicalKey::Code(code) if is_modifier_code(code) => None,
+            // Named but unmapped: ask Windows what it calls the key.
+            PhysicalKey::Code(code) => keycode_to_vk(code).or_else(|| native_vk(key)),
+            // A key winit can't name (some media and OEM keys): Windows can.
+            other => native_vk(other),
         }
     }
 
+    /// The key handler while a hotkey box waits (`rebinding` is set).
+    /// It takes every key, so none reaches `on_key`.
+    ///
+    /// - Esc cancels and puts back `rebind_backup`.
+    /// - A bare modifier is ignored: the box wants a real key to go with it.
+    /// - A typing key that would stop typing is refused with a hint, and the
+    ///   box keeps listening.
+    /// - A chord another action has is refused too, with its message.
+    /// - Anything else becomes the binding, with the modifiers held now, and
+    ///   is reported at once.
+    /// - A key with no Win32 number is ignored; Edit as JSON is the way to
+    ///   bind an exotic one.
     fn on_capture_key(&mut self, ev: winit::event::KeyEvent) {
         if ev.state != ElementState::Pressed { return; }
-        let Some(action) = self.capturing_hotkey else { return; };
-        // Esc always aborts capture and reverts the draft.
+        let Some(action) = self.rebinding else { return; };
         if matches!(ev.logical_key, Key::Named(NamedKey::Escape)) {
-            self.draft.set_hotkey_for(action, self.hotkey_before_capture);
-            self.capturing_hotkey = None;
+            self.draft.set_hotkey_for(action, self.rebind_backup);
+            self.rebinding = None;
             self.capture_hint = None;
-            self.error = None;
+            self.notice = None;
             self.relayout();
             self.window.request_redraw();
             return;
         }
-        let vk = match ev.physical_key {
-            PhysicalKey::Code(code) => {
-                // Bare modifier press → keep waiting for a non-modifier.
-                if is_modifier_code(code) { return; }
-                match keycode_to_vk(code) {
-                    Some(vk) => vk,
-                    // Named but unmapped: try what Windows calls it.
-                    None => match native_vk(ev.physical_key) { Some(vk) => vk, None => return },
-                }
-            }
-            // A key winit can't name (some media and OEM keys): Windows still can.
-            other => match native_vk(other) { Some(vk) => vk, None => return },
-        };
-        let modifiers = mods_state_to_hk(self.mods_state);
-        let hk = Hotkey { modifiers, virtual_key: vk };
-        // A typing key (alone, or with only Shift) would stop that key typing
-        // in every app; keep listening and say what to hold with it.
+        let Some(vk) = Self::rebind_vk(ev.physical_key) else { return };
+        let hk = Hotkey { modifiers: mods_state_to_hk(self.held_mods), virtual_key: vk };
+        // Alone (or with only Shift) a typing key would stop typing that
+        // character in every app: keep listening and say what to hold.
         if framefang_core::settings::blocks_typing(&hk) {
             self.capture_hint = Some(typing_key_hint(vk));
             self.window.request_redraw();
@@ -760,51 +788,55 @@ impl SettingsView {
         self.capture_hint = None;
         let before = self.draft.clone();
         self.draft.set_hotkey_for(action, Some(hk));
-        // A chord another action already has is refused as it is pressed,
-        // and the box keeps listening for another key. The OS can't share
-        // one: on Windows the second `RegisterHotKey` just fails, and under
-        // X11 whichever grab matches first silently wins.
+        // The system can't give one chord to two actions (on Windows the
+        // second `RegisterHotKey` fails; under X11 the first grab to match
+        // wins quietly), so a repeat is refused as it is pressed and the box
+        // keeps listening.
         if let Some((a, b)) = self.draft.hotkey_conflict() {
             let chord = self.draft.hotkey_for(a).unwrap_or_default();
-            self.error = Some(conflict_message(a, b, chord));
+            self.notice = Some(conflict_message(a, b, chord));
             self.draft = before;
             self.window.request_redraw();
             return;
         }
-        self.capturing_hotkey = None;
-        self.error = None;
+        self.rebinding = None;
+        self.notice = None;
         // Print Screen in or out: the Windows card comes or goes with it.
         self.relayout();
         self.report_change(&before);
         self.window.request_redraw();
     }
 
+    /// The row under (x, y), if any; later rows win where they overlap, which
+    /// is how the REBIND and CLEAR buttons beat the box they sit on.
     fn hit_test(&self, x: i32, y: i32) -> Option<usize> {
-        // Reverse so action-bar buttons on top of any overlapping layout win.
         self.rows.iter().enumerate().rev().find_map(|(i, r)| {
-            // A hotkey error takes the system line's place, button included.
-            if r.kind == WidgetKind::SystemShortcut && self.error.is_some() { return None; }
-            // Only a label; its chips are the controls.
-            if matches!(r.kind, WidgetKind::Theme | WidgetKind::SettingsFile | WidgetKind::AfterCapture
-                | WidgetKind::ScrollAfter | WidgetKind::FileNames
-                | WidgetKind::RecordFormat | WidgetKind::Frame | WidgetKind::QrLinks
-                | WidgetKind::HoldLine(_) | WidgetKind::Card(_) | WidgetKind::Divider) { return None; }
-            // A hold line's key: the key as drawn, a little room around it.
-            if let WidgetKind::HoldKey(hold) = r.kind {
-                let name = hold_key_name(hold, &self.draft, self.listening_hold == Some(hold));
-                let (kx, ky, kw, kh) = hold_key_rect(r, &name);
-                let hit = x >= kx - 4 && x < kx + kw + 4 && y >= ky - 4 && y < ky + kh + 4;
-                return hit.then_some(i);
-            }
-            // A listening row's CLEAR is hidden, and so can't be pressed.
-            if let WidgetKind::HotkeyClear(a) = r.kind { if self.capturing_hotkey == Some(a) { return None; } }
-            // A read-out, and a button that is live only when there is
-            // something to download.
-            if r.kind == WidgetKind::Ffmpeg { return None; }
-            if r.kind == WidgetKind::FfmpegDownload && !self.ffmpeg_actionable() { return None; }
-            if r.kind == WidgetKind::FfmpegAuto && self.draft.chosen_ffmpeg().is_none() { return None; }
-            let (rx, ry, rw, rh) = r.rect;
-            if x >= rx && x < rx + rw && y >= ry && y < ry + rh { Some(i) } else { None }
+            let live = match r.kind {
+                // A hotkey error takes the system line's place, button too.
+                WidgetKind::SystemShortcut => self.notice.is_none(),
+                // Words only (their chips or buttons are the controls), and
+                // the lines and surfaces behind rows.
+                WidgetKind::Theme | WidgetKind::SettingsFile | WidgetKind::AfterCapture
+                | WidgetKind::ScrollAfter | WidgetKind::FileNames | WidgetKind::RecordFormat
+                | WidgetKind::Frame | WidgetKind::QrLinks | WidgetKind::HoldLine(_)
+                | WidgetKind::Card(_) | WidgetKind::Divider => false,
+                // The FFmpeg read-out can't be pressed; its Download is live
+                // only when there is something to download, and Auto only
+                // while a pick exists.
+                WidgetKind::Ffmpeg => false,
+                WidgetKind::FfmpegDownload => self.ffmpeg_actionable(),
+                WidgetKind::FfmpegAuto => self.draft.chosen_ffmpeg().is_some(),
+                // A listening row hides its CLEAR, so it can't be pressed.
+                WidgetKind::HotkeyClear(a) => self.rebinding != Some(a),
+                // A hold key is where it is drawn, with a little room around.
+                WidgetKind::HoldKey(hold) => {
+                    let name = hold_key_name(hold, &self.draft, self.listening_hold == Some(hold));
+                    let (kx, ky, kw, kh) = hold_key_rect(r, &name);
+                    return rect_has((kx - 4, ky - 4, kw + 8, kh + 8), x, y).then_some(i);
+                }
+                _ => true,
+            };
+            (live && rect_has(r.rect, x, y)).then_some(i)
         })
     }
 
@@ -838,35 +870,23 @@ impl SettingsView {
                 self.ffmpeg_found = self.find_ffmpeg();
             }
             WidgetKind::SaveFolder => {
-                let starting = if self.draft.save_directory.is_empty() {
-                    directories::UserDirs::new()
-                        .and_then(|u| u.picture_dir().map(|p| p.to_path_buf()))
-                        .unwrap_or_else(std::env::temp_dir)
-                } else {
-                    PathBuf::from(&self.draft.save_directory)
-                };
-                if let Some(p) = rfd::FileDialog::new()
+                let start = folder_dialog_start(&self.draft.save_directory, directories::UserDirs::picture_dir);
+                let picked = rfd::FileDialog::new()
                     .set_title("Frame Fang: Screenshots folder")
-                    .set_directory(&starting)
-                    .pick_folder()
-                {
-                    self.draft.save_directory = p.to_string_lossy().to_string();
+                    .set_directory(&start)
+                    .pick_folder();
+                if let Some(dir) = picked {
+                    self.draft.save_directory = dir.to_string_lossy().into_owned();
                 }
             }
             WidgetKind::RecordingsFolder => {
-                let starting = if self.draft.recordings_directory.is_empty() {
-                    directories::UserDirs::new()
-                        .and_then(|u| u.video_dir().map(|p| p.to_path_buf()))
-                        .unwrap_or_else(std::env::temp_dir)
-                } else {
-                    PathBuf::from(&self.draft.recordings_directory)
-                };
-                if let Some(p) = rfd::FileDialog::new()
+                let start = folder_dialog_start(&self.draft.recordings_directory, directories::UserDirs::video_dir);
+                let picked = rfd::FileDialog::new()
                     .set_title("Frame Fang: Recordings folder")
-                    .set_directory(&starting)
-                    .pick_folder()
-                {
-                    self.draft.recordings_directory = p.to_string_lossy().to_string();
+                    .set_directory(&start)
+                    .pick_folder();
+                if let Some(dir) = picked {
+                    self.draft.recordings_directory = dir.to_string_lossy().into_owned();
                 }
             }
             WidgetKind::Theme | WidgetKind::SettingsFile => {}
@@ -889,48 +909,38 @@ impl SettingsView {
                 if self.listening_hold == Some(hold) {
                     self.stop_hold_listen();
                 } else {
-                    if let Some(action) = self.capturing_hotkey.take() {
-                        self.draft.set_hotkey_for(action, self.hotkey_before_capture);
+                    if let Some(action) = self.rebinding.take() {
+                        self.draft.set_hotkey_for(action, self.rebind_backup);
                         self.capture_hint = None;
                     }
                     self.listening_hold = Some(hold);
                     self.hold_refused = None;
                 }
             }
-            WidgetKind::KeepRecent => {
-                self.draft.keep_recent = !self.draft.keep_recent;
-            }
-            WidgetKind::CloseAfterCopy => {
-                self.draft.close_after_copy = !self.draft.close_after_copy;
-            }
-            WidgetKind::CaptureCursor => {
-                self.draft.capture_cursor = !self.draft.capture_cursor;
-            }
-            WidgetKind::StartWithOs => {
-                self.draft.start_with_windows = !self.draft.start_with_windows;
-            }
-            WidgetKind::HotkeyDisplay(_) => {
-                // Clicking the display box itself is a no-op — the user has
-                // to hit REBIND. Avoids accidental re-capture from a stray
-                // click on the green border.
-            }
+            WidgetKind::KeepRecent => self.draft.keep_recent ^= true,
+            WidgetKind::CloseAfterCopy => self.draft.close_after_copy ^= true,
+            WidgetKind::CaptureCursor => self.draft.capture_cursor ^= true,
+            WidgetKind::StartWithOs => self.draft.start_with_windows ^= true,
+            // Only REBIND starts a capture; a click on the box itself does
+            // nothing, so a stray click can't throw a binding away.
+            WidgetKind::HotkeyDisplay(_) => {}
             WidgetKind::HotkeyRebind(action) => {
-                // Snapshot the current binding so Esc during capture can
-                // roll back. Tray-loop has already unregistered every global
-                // hotkey while Settings is open, so the user can press the
-                // current PrintScreen freely without it firing.
-                self.hotkey_before_capture = self.draft.hotkey_for(action);
-                self.capturing_hotkey = Some(action);
+                // Remember the binding for Esc. The tray has already let go
+                // of every global shortcut while this window is open, so
+                // pressing the current one here doesn't fire it.
+                self.rebind_backup = self.draft.hotkey_for(action);
+                self.rebinding = Some(action);
                 self.capture_hint = None;
-                self.error = None;
+                self.notice = None;
             }
             WidgetKind::HotkeyClear(action) => {
-                // Only laid out for the optional actions, so this can never
-                // strip the mandatory capture binding.
+                // Laid out for optional actions only, so the capture binding
+                // can't be cleared from here.
                 self.draft.set_hotkey_for(action, None);
-                self.capturing_hotkey = None;
-                self.error = None;
+                self.rebinding = None;
+                self.notice = None;
             }
+            // Neither changes a setting, so nothing to report or redraw here.
             WidgetKind::OpenJson => {
                 self.outcome.push_back(SettingsOutcome::OpenJson);
                 return;
@@ -985,7 +995,7 @@ impl SettingsView {
             WidgetKind::SystemShortcut => {
                 if let Some(page) = self.system_page {
                     if let Err(e) = page.open() {
-                        self.error = Some(e);
+                        self.notice = Some(e);
                     }
                 }
             }
@@ -1031,8 +1041,8 @@ impl SettingsView {
                 self.imported = true;
                 crate::palette::set(crate::palette::Scheme::parse(&self.draft.theme));
                 self.ffmpeg_found = self.find_ffmpeg();
-                self.capturing_hotkey = None;
-                self.error = None;
+                self.rebinding = None;
+                self.notice = None;
                 self.relayout();
                 self.status = Some((format!("Imported {name}"), false));
             }
@@ -1040,14 +1050,10 @@ impl SettingsView {
         }
     }
 
-    /// Lay out section headers + every row. Sections are spaced apart with
-    /// a single section-rule line between them. Row rect spans the full
-    /// content width; the value half is computed inside `render_row`.
-    ///
-    /// Action buttons (Save / Cancel / Edit as JSON) are pinned to the
-    /// right side of the header band at the very top — clicking them is
-    /// the user's commit/abort action so they want to be reachable
-    /// without scrolling, like a real app's toolbar.
+    /// The tab strip's tabs, then page `tab`'s rows top to bottom. A
+    /// setting's row spans the page; the value half of it is worked out in
+    /// `draw::render_row`. `system_page` and `windows_guide` decide what sits
+    /// under the hotkeys.
     fn build_rows(system_page: Option<crate::system_shortcuts::Page>, windows_guide: bool, tab: Tab) -> Vec<Row> {
         let mut rows = Vec::new();
         // Setting rows span the page, the tab strip's width.
@@ -1194,27 +1200,24 @@ impl SettingsView {
         }
 
         if tab == Tab::Hotkeys {
-        // HOTKEYS — one row per action: a display box filling the left part
-        // of the value column, REBIND anchored to the right edge, and CLEAR
-        // just inside it on the optional actions. The buttons are their
-        // own rows laid out over the display row's rect; `hit_test` scans in
-        // reverse, so they win the click.
+        // HOTKEYS: a row per action. The display box takes the value column
+        // up to the buttons; REBIND ends at the right edge with CLEAR just
+        // left of it on the optional actions. Each button is a row of its
+        // own laid over the display row, and `hit_test` looks from the last
+        // row back, so the button gets the click.
         let c = CardBuild::open(&mut y);
         for (i, action) in HotkeyAction::ALL.into_iter().enumerate() {
             if i > 0 { divider(&mut rows, &mut y); }
-            rows.push(Row { kind:  WidgetKind::HotkeyDisplay(action),
-                            label: action.label(),
-                            rect:  (x, y, row_w, ROW_H) });
+            rows.push(Row { kind: WidgetKind::HotkeyDisplay(action), label: action.label(),
+                            rect: (x, y, row_w, ROW_H) });
             // As tall as the key box and the chips elsewhere, ending where
             // every other row's controls end.
             let rebind_x = x + row_w - 4 - REBIND_W;
-            rows.push(Row { kind:  WidgetKind::HotkeyRebind(action),
-                            label: "REBIND",
-                            rect:  (rebind_x, y + 4, REBIND_W, ROW_H - 8) });
+            rows.push(Row { kind: WidgetKind::HotkeyRebind(action), label: "REBIND",
+                            rect: (rebind_x, y + 4, REBIND_W, ROW_H - 8) });
             if action.is_optional() {
-                rows.push(Row { kind:  WidgetKind::HotkeyClear(action),
-                                label: "CLEAR",
-                                rect:  (rebind_x - 8 - CLEAR_W, y + 4, CLEAR_W, ROW_H - 8) });
+                rows.push(Row { kind: WidgetKind::HotkeyClear(action), label: "CLEAR",
+                                rect: (rebind_x - 8 - CLEAR_W, y + 4, CLEAR_W, ROW_H - 8) });
             }
             y += ROW_H;
         }
@@ -1258,7 +1261,9 @@ impl SettingsView {
         // (Brandon 2026-11-20: the file's buttons left the header, and Start
         // with system left a page named for looks).
         let c = CardBuild::open(&mut y);
-        rows.push(Row { kind: WidgetKind::StartWithOs, label: "Start with system", rect: (x, y, row_w, ROW_H) }); y += ROW_H;
+        rows.push(Row { kind: WidgetKind::StartWithOs, label: "Start with system",
+                        rect: (x, y, row_w, ROW_H) });
+        y += ROW_H;
         c.close(&mut rows, &mut y);
         let c = CardBuild::open(&mut y);
         rows.push(Row { kind: WidgetKind::Theme, label: "Theme", rect: (x, y, row_w, ROW_H) });
@@ -1281,10 +1286,13 @@ impl SettingsView {
         c.close(&mut rows, &mut y);
         }
 
+        // The last page's final advance of `y` has no row after it to use it.
         let _ = y;
         rows
     }
 
+    /// Paint the whole window: the page's body into a buffer of its own
+    /// (placed under the title strip), then the title bar over the top.
     fn redraw(&mut self) {
         // Read before the surface is borrowed below.
         let ffmpeg_actionable = self.ffmpeg_actionable();
@@ -1292,61 +1300,59 @@ impl SettingsView {
         let (Some(w), Some(h)) = (NonZeroU32::new(phys.width), NonZeroU32::new(phys.height))
             else { return; };
         if let Err(e) = self.surface.resize(w, h) {
-            eprintln!("settings: surface.resize: {e}"); return;
+            eprintln!("settings: could not resize the surface: {e}");
+            return;
         }
         let mut frame = match self.surface.buffer_mut() {
             Ok(b) => b,
-            Err(e) => { eprintln!("settings: buffer_mut: {e}"); return; }
+            Err(e) => {
+                eprintln!("settings: could not get a frame buffer: {e}");
+                return;
+            }
         };
         let win_w = w.get() as usize;
-        // The dialog draws into its own buffer, placed below the title strip.
-        let win_h = (h.get() as usize).saturating_sub(crate::chrome::TITLE_H as usize);
-        let mut buf = vec![0u32; win_w * win_h];
+        let body_h = (h.get() as usize).saturating_sub(crate::chrome::TITLE_H as usize);
+        let mut buf = vec![0u32; win_w * body_h];
 
-        // Pure black body under the title bar (which holds the heading),
-        // the glowing rule along its top (`hud`).
-        crate::hud::backdrop(&mut buf, win_w, win_h, 0);
+        // Black body under the title bar (which holds the heading), with the
+        // glowing rule along its top (`hud`).
+        crate::hud::backdrop(&mut buf, win_w, body_h, 0);
 
-        let mut surf = BufferSurface { buf: &mut buf, w: win_w as i32, h: win_h as i32 };
+        let mut surf = PixelBuf { px: &mut buf, wide: win_w as i32, tall: body_h as i32 };
 
         // What the settings file's last Export or Import did, under its
         // buttons on GENERAL.
-        if let (Some((msg, failed)), Some(r)) = (&self.status, self.rows.iter().find(|r| r.kind == WidgetKind::SettingsFile)) {
+        let file_row = self.rows.iter().find(|r| r.kind == WidgetKind::SettingsFile);
+        if let (Some((msg, failed)), Some(r)) = (&self.status, file_row) {
             let color = if *failed { DANGER() } else { OK_TINT };
             let x = r.rect.0 + LABEL_W;
-            let line_w = r.rect.0 + r.rect.2 - 4 - x;
-            draw_text(&mut surf, x, r.rect.1 + r.rect.3 + STATUS_GAP, 1,
-                      &truncate_for(msg, line_w), argb_to_framefang(color));
+            let room = r.rect.0 + r.rect.2 - 4 - x;
+            put_text(&mut surf, x, r.rect.1 + r.rect.3 + STATUS_GAP, &truncate_for(msg, room), color);
         }
 
         // The tab strip: the page shown is a raised tab joined to the page,
         // the others sit back on the strip's line.
         let right = WIN_W as i32 - PAD;
-        let strip_base = STRIP_Y + TAB_H;
-        fill_rect(&mut surf, PAD, strip_base - 1, right - PAD, 1, argb_to_framefang(HEADER_RULE()));
-        {
-            let hint_w = crate::keycap::line_width(TAB_HINT, 1);
-            let hint_y = STRIP_Y + (TAB_H - bitmap_font::GLYPH_H) / 2;
-            crate::keycap::draw_line_on(&mut surf, right - hint_w, hint_y, TAB_HINT, 1, TEXT_DIM());
-        }
-        let capturing = self.capturing_hotkey;
-        // The lines first, under every row: a hairline between settings, and
-        // each group's tree line to its sub-settings.
-        let mut first_group = true;
+        fill_box(&mut surf, PAD, STRIP_Y + TAB_H - 1, right - PAD, 1, HEADER_RULE());
+        let hint_x = right - crate::keycap::line_width(TAB_HINT, 1);
+        let hint_y = STRIP_Y + (TAB_H - bitmap_font::GLYPH_H) / 2;
+        crate::keycap::draw_line_on(&mut surf, hint_x, hint_y, TAB_HINT, 1, TEXT_DIM());
+        let capturing = self.rebinding;
+        // The lines go down first, under every row: a hairline above each
+        // group but the first, between settings, and each group's tree line
+        // to its sub-settings.
+        let mut groups_seen = 0;
         for row in &self.rows {
+            let (rx, ry, rw, rh) = row.rect;
             match row.kind {
                 WidgetKind::Card(sub) => {
-                    let (rx, ry, rw, _) = row.rect;
-                    if !first_group {
-                        fill_rect(&mut surf, rx, ry - CARD_GAP / 2, rw, 1, argb_to_framefang(PANEL_BORDER()));
+                    if groups_seen > 0 {
+                        fill_box(&mut surf, rx, ry - CARD_GAP / 2, rw, 1, PANEL_BORDER());
                     }
-                    first_group = false;
+                    groups_seen += 1;
                     if let Some(sy) = sub { render_tree(&mut surf, row, sy, &self.rows); }
                 }
-                WidgetKind::Divider => {
-                    let (rx, ry, rw, rh) = row.rect;
-                    fill_rect(&mut surf, rx, ry, rw, rh, argb_to_framefang(PANEL_BORDER()));
-                }
+                WidgetKind::Divider => fill_box(&mut surf, rx, ry, rw, rh, PANEL_BORDER()),
                 _ => {}
             }
         }
@@ -1362,7 +1368,7 @@ impl SettingsView {
                 continue;
             }
             if row.kind == WidgetKind::SystemShortcut {
-                if self.error.is_none() {
+                if self.notice.is_none() {
                     if self.guide_shown {
                         let guide = WindowsGuide {
                             takes:  self.system_takes_capture,
@@ -1426,139 +1432,18 @@ impl SettingsView {
             render_row(&mut surf, row, hovered, capturing, self.capture_hint.as_deref(), &self.draft);
         }
 
-        // Inline validation, in the same danger tint the convert dialogs
-        // use — but parked directly under the HOTKEYS block instead of at
-        // the window's bottom edge, because that's the section it is about
-        // and the gap under it is already reserved.
-        if let Some(msg) = &self.error {
-            if let Some(r) = self.rows.iter().rev()
-                .find(|r| matches!(r.kind, WidgetKind::HotkeyDisplay(_)))
-            {
-                draw_text(&mut surf, PAD, r.rect.1 + ROW_H + CARD_IN + 8, 1, msg,
-                          argb_to_framefang(DANGER()));
-            }
+        // The error (a refused chord, a system page that wouldn't open) goes
+        // in the gap left under the last hotkey row, since that is the block
+        // it is about.
+        let last_hotkey = self.rows.iter().rev().find(|r| matches!(r.kind, WidgetKind::HotkeyDisplay(_)));
+        if let (Some(msg), Some(r)) = (&self.notice, last_hotkey) {
+            put_text(&mut surf, PAD, r.rect.1 + ROW_H + CARD_IN + 8, msg, DANGER());
         }
 
         self.title_bar.draw(&mut frame, win_w, &buf, TITLE, BG_TOP());
         if let Err(e) = frame.present() {
-            eprintln!("settings: buf.present: {e}");
+            eprintln!("settings: could not present the frame: {e}");
         }
-    }
-
-}
-
-/// The line under HOTKEYS: what the button is for on the left, the button on
-/// the right. When the system is taking the capture binding the line says so
-/// in the warning tint and the button lights up as the thing to press.
-fn render_system_line<S: painter::Surface>(
-    surf: &mut S, row: &Row, hovered: bool,
-    page: Option<crate::system_shortcuts::Page>, takes: bool,
-) {
-    let Some(page) = page else { return };
-    let (rx, ry, rw, rh) = row.rect;
-    let text_y = ry + (rh - bitmap_font::GLYPH_H) / 2;
-    let (line, line_color) = if takes {
-        ("Print Screen opens the Snipping Tool, not Frame Fang", WARN())
-    } else {
-        (page.line, TEXT_MUTED())
-    };
-    draw_text(surf, PAD + 6, text_y, 1, line, argb_to_framefang(line_color));
-
-    let border = if takes { WARN() } else if hovered { LASER_DIM() } else { FIELD_BORDER() };
-    if hovered {
-        fill_rect(surf, rx, ry, rw, rh, argb_to_framefang(HOVER_FILL()));
-    }
-    stroke_rect_argb(surf, rx, ry, rw, rh, argb_to_framefang(border));
-    let tw = bitmap_font::measure(row.label, 1);
-    let color = if takes { WARN() } else { TEXT_BRIGHT };
-    draw_text(surf, rx + (rw - tw) / 2, text_y, 1, row.label, argb_to_framefang(color));
-}
-
-/// What the FFmpeg row shows.
-struct FfmpegRow<'a> {
-    /// The FFmpeg that will be used.
-    found: Option<&'a std::path::Path>,
-    /// The one picked in Settings, whether or not it still exists.
-    chosen: Option<&'a std::path::Path>,
-    fetch: &'a crate::ffmpeg_fetch::Fetch,
-    /// The Download button and whether it is hovered, when it can be pressed.
-    button: Option<(&'a Row, bool)>,
-    /// The Auto button, while an FFmpeg is picked.
-    auto: Option<(&'a Row, bool)>,
-    browse: Option<(&'a Row, bool)>,
-    /// Lit because recording or conversion just needed FFmpeg.
-    attention: bool,
-}
-
-/// What the FFmpeg field says, and in which color, outside a download: the
-/// pick in bright text, one found by itself muted (like the folders'
-/// defaults), and a pick that is gone in the warning color with what is
-/// used instead.
-fn ffmpeg_field_text(found: Option<&std::path::Path>, chosen: Option<&std::path::Path>) -> Option<(String, u32)> {
-    match (chosen, found) {
-        (Some(c), Some(f)) if c == f => Some((f.display().to_string(), TEXT_BRIGHT)),
-        (Some(_), Some(f)) => Some((format!("Picked FFmpeg is gone, using {}", f.display()), WARN())),
-        (Some(c), None) => Some((format!("Not found: {}", c.display()), WARN())),
-        (None, Some(f)) => Some((f.display().to_string(), TEXT_MUTED())),
-        (None, None) => None,
-    }
-}
-
-/// The FFmpeg row: its label, a read-out field, then Download (when there
-/// is nothing to use) or Auto (while one is picked), and Browse... While
-/// downloading, the field fills from the left like a progress bar.
-fn render_ffmpeg_row<S: painter::Surface>(surf: &mut S, row: &Row, ff: &FfmpegRow) {
-    use crate::ffmpeg_fetch::Fetch;
-    let (rx, ry, rw, rh) = row.rect;
-    let label_y = ry + (rh - bitmap_font::GLYPH_H) / 2;
-    let label_color = if ff.attention { LASER() } else { TEXT_BRIGHT };
-    draw_text(surf, rx + 6, label_y, 1, row.label, argb_to_framefang(label_color));
-
-    let val_x = rx + LABEL_W;
-    let (val_y, val_h) = (ry + 4, rh - 8);
-    let right = ff.button.or(ff.auto).or(ff.browse).map_or(rx + rw - 4, |(b, _)| b.rect.0 - 8);
-    let val_w = right - val_x;
-
-    let border = if ff.attention { LASER() } else { FIELD_BORDER() };
-    fill_rect(surf, val_x, val_y, val_w, val_h, argb_to_framefang(FIELD_BG()));
-    let ff_text = ffmpeg_field_text(ff.found, ff.chosen);
-    let (text, color) = match (ff.found, ff.fetch) {
-        (_, Fetch::Downloading { got, total }) => {
-            // The field fills as the download comes in.
-            if let Some(t) = total.filter(|t| *t > 0) {
-                let filled = ((val_w as f64) * (*got as f64 / t as f64)).clamp(0.0, val_w as f64) as i32;
-                fill_rect(surf, val_x, val_y, filled, val_h, argb_to_framefang(PRIMARY_FILL()));
-            }
-            (format!("Downloading FFmpeg  {}", crate::ffmpeg_fetch::progress_text(*got, *total)), TEXT_BRIGHT)
-        }
-        (_, Fetch::Installing) => ("Checking and installing...".to_owned(), TEXT_BRIGHT),
-        _ if ff_text.is_some() => ff_text.clone().unwrap_or_default(),
-        // Covered by `ff_text` above; kept so the match is complete.
-        (Some(path), _) => (path.display().to_string(), TEXT_MUTED()),
-        (None, Fetch::Failed(e)) => (format!("Download failed: {e}"), DANGER()),
-        (None, _) if crate::ffmpeg_fetch::offered() =>
-            ("Not installed. Recording and video conversion need it.".to_owned(), TEXT_MUTED()),
-        (None, _) => (crate::ffmpeg_fetch::missing_message().to_owned(), TEXT_MUTED()),
-    };
-    stroke_rect_argb(surf, val_x, val_y, val_w, val_h, argb_to_framefang(border));
-    let shown = truncate_for(&text, val_w - 16);
-    draw_text(surf, val_x + 8, val_y + (val_h - bitmap_font::GLYPH_H) / 2, 1, &shown, argb_to_framefang(color));
-
-    if let Some((b, hovered)) = ff.button {
-        let (bx, by, bw, bh) = b.rect;
-        if hovered || ff.attention { fill_rect(surf, bx, by, bw, bh, argb_to_framefang(PRIMARY_FILL())); }
-        stroke_rect_argb(surf, bx, by, bw, bh, argb_to_framefang(LASER()));
-        let label = if matches!(ff.fetch, Fetch::Failed(_)) { "RETRY" } else { b.label };
-        let tw = bitmap_font::measure(label, 1);
-        draw_text(surf, bx + (bw - tw) / 2, by + (bh - bitmap_font::GLYPH_H) / 2, 1, label, argb_to_framefang(LASER()));
-    }
-    // Auto and Browse...: the folder rows' quiet outlined buttons.
-    for (b, hovered) in ff.auto.into_iter().chain(ff.browse) {
-        let (bx, by, bw, bh) = b.rect;
-        if hovered { fill_rect(surf, bx, by, bw, bh, argb_to_framefang(HOVER_FILL())); }
-        stroke_rect_argb(surf, bx, by, bw, bh, argb_to_framefang(if hovered { LASER_DIM() } else { FIELD_BORDER() }));
-        let tw = bitmap_font::measure(b.label, 1);
-        draw_text(surf, bx + (bw - tw) / 2, by + (bh - bitmap_font::GLYPH_H) / 2, 1, b.label, argb_to_framefang(TEXT_BRIGHT));
     }
 }
 
@@ -1608,714 +1493,30 @@ fn window_height(system_page: Option<crate::system_shortcuts::Page>) -> u32 {
     pages.max().unwrap_or(0) + crate::chrome::TITLE_H as u32
 }
 
-/// The status line, the page line and the color of the card's edge for `g`.
-/// Both say plainly that the switch is about using Print Screen here.
-fn guide_text(g: &WindowsGuide) -> (String, String, u32) {
-    if g.takes {
-        (
-            "Windows is using Print Screen for its own capture".to_owned(),
-            format!("To use Print Screen here, turn this off in {}:", g.page),
-            WARN(),
-        )
-    } else {
-        (
-            "Print Screen goes straight to Frame Fang".to_owned(),
-            format!("Keep this off in {} for Print Screen to work:", g.page),
-            LASER(),
-        )
-    }
+/// Top left for a `w` x `h` window centred on `monitor` (x, y, width,
+/// height), kept on that monitor; with no monitor, a 1920 x 1080 screen at
+/// the origin.
+fn centred_origin(monitor: Option<Rect>, w: u32, h: u32) -> (i32, i32) {
+    let (mx, my, mw, mh) = monitor.unwrap_or((0, 0, 1920, 1080));
+    (mx + ((mw - w as i32) / 2).max(0), my + ((mh - h as i32) / 2).max(0))
 }
 
-/// Windows' Print Screen guide: a card a step above the page. Its edge and
-/// dot say the state at a glance; the first line says it in words beside
-/// the button; the second names the Settings page; the third shows the
-/// switch itself (a small on/off drawn like Windows' own, then its exact
-/// name in the smooth font, since those are Windows' words, not ours).
-fn render_windows_card<S: painter::Surface>(surf: &mut S, btn: &Row, hovered: bool, g: &WindowsGuide) {
-    let (bx, by, bw, bh) = btn.rect;
-    let (cx, cy) = (PAD, by - CARD_PAD);
-    let cw = WIN_W as i32 - 2 * PAD;
-    let (headline, page_line, status) = guide_text(g);
-
-    // Surface, hairline, and a status edge down the left.
-    fill_rect(surf, cx, cy, cw, CARD_H, argb_to_framefang(BG_TOP()));
-    stroke_rect_argb(surf, cx, cy, cw, CARD_H, argb_to_framefang(FIELD_BORDER()));
-    fill_rect(surf, cx, cy, 3, CARD_H, argb_to_framefang(status));
-
-    // Line 1: a status dot and the state, level with the button.
-    let tx = cx + 16;
-    let line1 = by + (bh - bitmap_font::GLYPH_H) / 2;
-    fill_rect(surf, tx, line1 + 1, 5, 5, argb_to_framefang(status));
-    draw_text(surf, tx + 12, line1, 1, &headline, argb_to_framefang(TEXT_BRIGHT));
-
-    // The button: the thing to press while Windows has the key.
-    let primary = g.takes;
-    let border = if primary { LASER() } else if hovered { LASER_DIM() } else { FIELD_BORDER() };
-    if hovered { fill_rect(surf, bx, by, bw, bh, argb_to_framefang(HOVER_FILL())); }
-    stroke_rect_argb(surf, bx, by, bw, bh, argb_to_framefang(border));
-    let lw = bitmap_font::measure(btn.label, 1);
-    draw_text(surf, bx + (bw - lw) / 2, line1, 1, btn.label,
-              argb_to_framefang(if primary { LASER() } else { TEXT_BRIGHT }));
-
-    // Line 2: where the switch is.
-    let line2 = by + bh + 10;
-    draw_text(surf, tx + 12, line2, 1, &page_line, argb_to_framefang(TEXT_MUTED()));
-
-    // Line 3: the switch, drawn, then its name.
-    let row3 = line2 + bitmap_font::GLYPH_H + 8;
-    let mut x = tx + 12;
-    if g.takes {
-        // On now, off is the goal.
-        mini_switch(surf, x, row3 + 1, true, status);
-        x += MINI_SWITCH_W + 6;
-        draw_text(surf, x, row3 + 4, 1, "->", argb_to_framefang(TEXT_MUTED()));
-        x += bitmap_font::measure("->", 1) + 6;
-        mini_switch(surf, x, row3 + 1, false, TEXT_BRIGHT);
-    } else {
-        // Off, as it should stay.
-        mini_switch(surf, x, row3 + 1, false, status);
-    }
-    x += MINI_SWITCH_W + 10;
-    let name = format!("\u{201C}{}\u{201D}", g.switch);
-    // Windows' wording in another language can run long: shrink to fit.
-    let room = (cx + cw - CARD_PAD - x) as f32;
-    let mut px = 13.0_f32;
-    let w = framefang_core::text::layout(&name, px).width();
-    if w > room { px = (px * room / w).max(9.0); }
-    let ty = row3 as f32 + (16.0 - framefang_core::text::line_height(px)) / 2.0;
-    painter::draw_unicode_text(surf, x as f32, ty, px, &name, argb_to_framefang(TEXT_BRIGHT));
-}
-
-const MINI_SWITCH_W: i32 = 26;
-
-/// A small on/off switch in the app's square style: filled with the knob at
-/// the right when on, an outline with the knob at the left when off.
-fn mini_switch<S: painter::Surface>(surf: &mut S, x: i32, y: i32, on: bool, color: u32) {
-    let h = 14;
-    let knob = h - 6;
-    if on {
-        fill_rect(surf, x, y, MINI_SWITCH_W, h, argb_to_framefang(color));
-        fill_rect(surf, x + MINI_SWITCH_W - 3 - knob, y + 3, knob, knob, argb_to_framefang(BG_BODY()));
-    } else {
-        stroke_rect_argb(surf, x, y, MINI_SWITCH_W, h, argb_to_framefang(color));
-        fill_rect(surf, x + 3, y + 3, knob, knob, argb_to_framefang(color));
-    }
-}
-
-
-fn render_row<S: painter::Surface>(
-    surf: &mut S, row: &Row,
-    hovered: bool,
-    capturing_hotkey: Option<HotkeyAction>,
-    // What the listening box says instead of "[ PRESS A KEY ]", if anything.
-    capture_hint: Option<&str>,
-    draft: &AppSettings,
-) {
-    let (rx, ry, rw, rh) = row.rect;
-
-    // ── Action-bar buttons ─────────────────────────────────────────────────
-    if matches!(row.kind, WidgetKind::ExportBtn | WidgetKind::ImportBtn | WidgetKind::OpenJson) {
-        // No primary button: nothing here commits anything.
-        let is_primary = false;
-        let border = if hovered { LASER_DIM() } else { PANEL_BORDER() };
-        let fill   = if hovered { HOVER_FILL() } else { 0x0000_0000 };
-        if fill != 0 {
-            fill_rect(surf, rx, ry, rw, rh, argb_to_framefang(fill));
-        }
-        stroke_rect_argb(surf, rx, ry, rw, rh, argb_to_framefang(border));
-        let tw = bitmap_font::measure(row.label, 1);
-        let tx = rx + (rw - tw) / 2;
-        let ty = ry + (rh - bitmap_font::GLYPH_H) / 2;
-        let color = if is_primary { LASER() } else { TEXT_BRIGHT };
-        draw_text(surf, tx, ty, 1, row.label, argb_to_framefang(color));
-        return;
-    }
-
-    // ── CLEAR button (unbinds an optional action) ──────────────────────────
-    if let WidgetKind::HotkeyClear(action) = row.kind {
-        // Dimmed when there is nothing to clear, so the row reads as
-        // "already unbound" rather than as a button that did nothing.
-        let bound  = draft.hotkey_for(action).is_some();
-        let border = if hovered && bound { LASER_DIM() } else { FIELD_BORDER() };
-        if hovered && bound {
-            fill_rect(surf, rx, ry, rw, rh, argb_to_framefang(HOVER_FILL()));
-        }
-        stroke_rect_argb(surf, rx, ry, rw, rh, argb_to_framefang(border));
-        let tw = bitmap_font::measure(row.label, 1);
-        let tx = rx + (rw - tw) / 2;
-        let ty = ry + (rh - bitmap_font::GLYPH_H) / 2;
-        let color = if bound { TEXT_BRIGHT } else { TEXT_DIM() };
-        draw_text(surf, tx, ty, 1, row.label, argb_to_framefang(color));
-        return;
-    }
-
-    // ── REBIND button (sits to the right of the HotkeyDisplay box) ─────────
-    if let WidgetKind::HotkeyRebind(action) = row.kind {
-        render_rebind_button(surf, row, capturing_hotkey == Some(action), hovered);
-        return;
-    }
-
-    // ── Setting rows ───────────────────────────────────────────────────────
-    if hovered { fill_rect(surf, rx, ry, rw, rh, argb_to_framefang(HOVER_FILL())); }
-
-    let label_y = ry + (rh - bitmap_font::GLYPH_H) / 2;
-    // A refining row sits indented under its parent, label a step quieter.
-    let (indent, label_color) = if row.kind == WidgetKind::CloseAfterCopy {
-        (SUB_INDENT, TEXT_MUTED())
-    } else {
-        (0, TEXT_BRIGHT)
-    };
-    draw_text(surf, rx + 6 + indent, label_y, 1, row.label, argb_to_framefang(label_color));
-
-    // Geometry of the value half: starts right of the label column, ends at
-    // the row edge. Folder rows reserve a "Browse…" button on the right.
-    let val_x = rx + LABEL_W;
-    let val_w = rw - LABEL_W - 4;
-    let val_y = ry + 4;
-    let val_h = rh - 8;
-
-    match row.kind {
-        WidgetKind::SaveFolder | WidgetKind::RecordingsFolder => {
-            let browse_w = 80;
-            let path_w   = val_w - browse_w - 8;
-            // path field
-            fill_rect(surf, val_x, val_y, path_w, val_h, argb_to_framefang(FIELD_BG()));
-            stroke_rect_argb(surf, val_x, val_y, path_w, val_h, argb_to_framefang(FIELD_BORDER()));
-            let val = match row.kind {
-                // Pre-populate both folder fields with the actual resolved
-                // path when no explicit value is set, so users see exactly
-                // where output is going (matches what `save_directory` /
-                // `recordings_directory_for` in tray_loop.rs pick at
-                // runtime).
-                WidgetKind::SaveFolder => folder_or_default_picture(&draft.save_directory),
-                _                      => folder_or_default_video(&draft.recordings_directory),
-            };
-            let truncated = truncate_for(&val, path_w - 16);
-            let ty = val_y + (val_h - bitmap_font::GLYPH_H) / 2;
-            // Dim the path when it's the resolved fallback (no explicit value
-            // in settings) so the user can tell at a glance "this hasn't been
-            // customized yet".
-            let user_set = match row.kind {
-                WidgetKind::SaveFolder       => !draft.save_directory.is_empty(),
-                WidgetKind::RecordingsFolder => !draft.recordings_directory.is_empty(),
-                _                            => true,
-            };
-            let color = if user_set { TEXT_BRIGHT } else { TEXT_MUTED() };
-            draw_text(surf, val_x + 8, ty, 1, &truncated, argb_to_framefang(color));
-            // Browse… button
-            let bx = val_x + path_w + 8;
-            let by = val_y;
-            let bw = browse_w;
-            let bh = val_h;
-            let b_border = if hovered { LASER_DIM() } else { FIELD_BORDER() };
-            stroke_rect_argb(surf, bx, by, bw, bh, argb_to_framefang(b_border));
-            let label = "Browse...";
-            let tw = bitmap_font::measure(label, 1);
-            let tx = bx + (bw - tw) / 2;
-            let ty = by + (bh - bitmap_font::GLYPH_H) / 2;
-            draw_text(surf, tx, ty, 1, label, argb_to_framefang(TEXT_BRIGHT));
-        }
-        WidgetKind::HotkeyDisplay(action) => {
-            // The display box sits in the value column but stops short of
-            // the REBIND button (which is its own row laid out on top of
-            // this rect, anchored right), and of CLEAR where that exists.
-            // Reserve their footprints plus an 8 px gutter each so the
-            // laser-green border doesn't run under either button.
-            let reserved = REBIND_W + 8
-                + if action.is_optional() { CLEAR_W + 8 } else { 0 };
-            let box_w = val_w - reserved;
-            let listening = capturing_hotkey == Some(action);
-            // While in capture mode the border lights up bright laser-green
-            // so the user can see the field is now listening. Otherwise we
-            // use the standard field border with a brighter hover state.
-            let border = if listening {
-                FIELD_FOCUS()
-            } else if hovered {
-                LASER_DIM()
-            } else {
-                FIELD_BORDER()
-            };
-            fill_rect(surf, val_x, val_y, box_w, val_h, argb_to_framefang(FIELD_BG()));
-            stroke_rect_argb(surf, val_x, val_y, box_w, val_h, argb_to_framefang(border));
-            let (text, color) = if listening {
-                match capture_hint {
-                    Some(hint) => (hint.to_owned(), WARN()),
-                    None => ("[ PRESS A KEY ]".to_owned(), LASER()),
-                }
-            } else {
-                match draft.hotkey_for(action) {
-                    Some(hk) => (hk.describe(), TEXT_BRIGHT),
-                    // Optional actions start out unbound; say so instead of
-                    // showing an empty box that reads as a render bug.
-                    None     => ("(not set)".to_owned(), TEXT_DIM()),
-                }
-            };
-            let ty = val_y + (val_h - bitmap_font::GLYPH_H) / 2;
-            let bound = !listening && draft.hotkey_for(action).is_some();
-            let keys = crate::keycap::chord(&text);
-            if bound && crate::keycap::line_width(&keys, 1) <= box_w - 16 {
-                // The binding as the keys themselves (`keycap`).
-                crate::keycap::draw_line_on(surf, val_x + 8, ty, &keys, 1, color);
-            } else {
-                let truncated = truncate_for(&text, box_w - 16);
-                draw_text(surf, val_x + 8, ty, 1, &truncated, argb_to_framefang(color));
-            }
-        }
-        WidgetKind::StartWithOs | WidgetKind::CloseAfterCopy | WidgetKind::CaptureCursor
-        | WidgetKind::KeepRecent => {
-            let on = match row.kind {
-                WidgetKind::KeepRecent      => draft.keep_recent,
-                WidgetKind::CloseAfterCopy   => draft.close_after_copy,
-                WidgetKind::CaptureCursor    => draft.capture_cursor,
-                _                            => draft.start_with_windows,
-            };
-            // At the row's right edge, where the other controls end.
-            draw_toggle(surf, rx + rw - 4 - TOGGLE_W, val_y, val_h, on);
-        }
-        _ => {}
-    }
-}
-
-/// A group's tree line: down from its setting's row to the middle of its
-/// last sub-setting, with a tick out to each sub-setting's words, so they
-/// read as hanging off the setting above.
-fn render_tree<S: painter::Surface>(surf: &mut S, group: &Row, sub: i32, rows: &[Row]) {
-    let (gx, gy, _, gh) = group.rect;
-    let mids: Vec<i32> = rows.iter()
-        .filter(|r| matches!(r.kind, WidgetKind::HoldLine(_) | WidgetKind::CloseAfterCopy)
-            && r.rect.1 >= sub && r.rect.1 < gy + gh)
-        .map(|r| r.rect.1 + r.rect.3 / 2).collect();
-    let Some(&last) = mids.last() else { return };
-    let color = argb_to_framefang(FIELD_BORDER());
-    let x = gx + TREE_X;
-    fill_rect(surf, x, sub - 6, 1, last - sub + 7, color);
-    for m in mids { fill_rect(surf, x, m, TREE_TICK - TREE_X, 1, color); }
-}
-
-/// A REBIND button: an outlined button that fills while it waits for a
-/// key, when it reads LISTENING (Hotkeys page and hold lines alike).
-fn render_rebind_button<S: painter::Surface>(surf: &mut S, row: &Row, active: bool, hovered: bool) {
-    let (rx, ry, rw, rh) = row.rect;
-    let border = if active { LASER() } else if hovered { LASER_DIM() } else { FIELD_BORDER() };
-    let fill   = if active { PRIMARY_FILL() } else if hovered { HOVER_FILL() } else { 0x0000_0000 };
-    if fill != 0 {
-        fill_rect(surf, rx, ry, rw, rh, argb_to_framefang(fill));
-    }
-    stroke_rect_argb(surf, rx, ry, rw, rh, argb_to_framefang(border));
-    let label = if active { "LISTENING" } else { row.label };
-    let tw = bitmap_font::measure(label, 1);
-    let tx = rx + (rw - tw) / 2;
-    let ty = ry + (rh - bitmap_font::GLYPH_H) / 2;
-    let color = if active { LASER() } else { TEXT_BRIGHT };
-    draw_text(surf, tx, ty, 1, label, argb_to_framefang(color));
-}
-
-/// A hold line: "Hold", the key as a keycap, then what holding it does,
-/// hanging off the choice above like any sub-setting, with REBIND at its
-/// right end. The key sinks under the pointer, like a press; waiting for a
-/// key it says so, and the words after it say how to give up (or why a key
-/// was refused).
-fn render_hold_line<S: painter::Surface>(surf: &mut S, line: &Row, hold: Hold, draft: &AppSettings,
-                                         listening: bool, key_hovered: bool, refused: Option<&str>) {
-    let name = hold_key_name(hold, draft, listening);
-    let (kx, ky, kw, _) = hold_key_rect(line, &name);
-    let text_y = line.rect.1 + (line.rect.3 - bitmap_font::GLYPH_H) / 2;
-    draw_text(surf, line.rect.0 + 6 + SUB_INDENT, text_y, 1, HOLD_WORD, argb_to_framefang(TEXT_MUTED()));
-    crate::keycap::draw_key_on(surf, kx, ky, &name, 1, key_hovered && !listening);
-    let (tail, color) = match (listening, refused) {
-        (true, Some(why)) => (why, WARN()),
-        (true, None) => ("Esc cancels", LASER()),
-        _ => (hold.tail(draft), TEXT_MUTED()),
-    };
-    draw_text(surf, kx + kw + HOLD_GAP, text_y, 1, tail, argb_to_framefang(color));
-}
-
-/// One tab in the strip. The one shown is a raised tab on the page's
-/// surface with the accent along its top; the rest sit back.
-fn render_tab<S: painter::Surface>(surf: &mut S, row: &Row, shown: bool, hovered: bool) {
-    let (rx, ry, rw, rh) = row.rect;
-    if shown {
-        fill_rect(surf, rx, ry, rw, rh, argb_to_framefang(BG_TOP()));
-        fill_rect(surf, rx, ry, rw, 2, argb_to_framefang(LASER()));
-        fill_rect(surf, rx, ry, 1, rh, argb_to_framefang(HEADER_RULE()));
-        fill_rect(surf, rx + rw - 1, ry, 1, rh, argb_to_framefang(HEADER_RULE()));
-    } else if hovered {
-        fill_rect(surf, rx, ry + 2, rw, rh - 3, argb_to_framefang(HOVER_FILL()));
-    }
-    let ty = ry + (rh - bitmap_font::GLYPH_H) / 2 + 1;
-    let color = if shown { TEXT_BRIGHT } else if hovered { TEXT_BRIGHT } else { TEXT_MUTED() };
-    draw_text(surf, rx + TAB_PAD, ty, 1, row.label, argb_to_framefang(color));
-}
-
-/// A row's label with one quiet line under it (the next file name, or why a
-/// choice is greyed).
-fn render_label_with_caption<S: painter::Surface>(surf: &mut S, row: &Row, caption: &str) {
-    let (rx, ry, _, rh) = row.rect;
-    let gap = rh - 2 * bitmap_font::GLYPH_H;
-    let top = ry + gap / 3;
-    draw_text(surf, rx + 6, top, 1, row.label, argb_to_framefang(TEXT_BRIGHT));
-    draw_text(surf, rx + 6, top + bitmap_font::GLYPH_H + gap / 3, 1, caption, argb_to_framefang(TEXT_MUTED()));
-}
-
-/// A chip in a row of choices. The picked one is filled and framed.
-/// `unavailable`: dim, though it still answers (GIF without
-/// FFmpeg points at where FFmpeg is set up).
-fn render_choice_chip<S: painter::Surface>(surf: &mut S, row: &Row, hovered: bool, draft: &AppSettings,
-                                           unavailable: bool) {
-    let (rx, ry, rw, rh) = row.rect;
-    let (chosen, accent) = match row.kind {
-        WidgetKind::AfterCaptureChoice(after) => (draft.after_capture() == after, LASER()),
-        WidgetKind::ScrollAfterChoice(after) => (draft.scroll_after() == after, LASER()),
-        WidgetKind::FileNameChoice(choice) =>
-            (framefang_core::file_name::preset_index(&draft.file_name_pattern) == choice, LASER()),
-        WidgetKind::RecordFormatChoice(gif) =>
-            ((draft.record_format() == framefang_core::settings::RecordFormat::Gif) == gif, LASER()),
-        WidgetKind::FrameChoice(f) => (draft.output_frame() == f, LASER()),
-        WidgetKind::QrLinksChoice(open) => (draft.open_qr_links == open, LASER()),
-        _ => return,
-    };
-    if chosen || hovered {
-        fill_rect(surf, rx, ry, rw, rh, argb_to_framefang(HOVER_FILL()));
-    }
-    let border = if chosen { accent } else if hovered { LASER_DIM() } else { FIELD_BORDER() };
-    stroke_rect_argb(surf, rx, ry, rw, rh, argb_to_framefang(border));
-    let tw = bitmap_font::measure(row.label, 1);
-    let color = if unavailable { TEXT_DIM() } else if chosen { TEXT_BRIGHT } else { TEXT_MUTED() };
-    draw_text(surf, rx + (rw - tw) / 2, ry + (rh - bitmap_font::GLYPH_H) / 2, 1,
-              row.label, argb_to_framefang(color));
-}
-
-/// A color-scheme chip: the scheme's own accent as a swatch, then its name.
-/// The chosen one is framed in its accent; the rest stay quiet until hovered.
-fn render_theme_chip<S: painter::Surface>(
-    surf: &mut S, row: &Row, scheme: crate::palette::Scheme, hovered: bool, draft: &AppSettings,
-) {
-    let (rx, ry, rw, rh) = row.rect;
-    let chosen = crate::palette::Scheme::parse(&draft.theme) == scheme;
-    if chosen || hovered {
-        fill_rect(surf, rx, ry, rw, rh, argb_to_framefang(HOVER_FILL()));
-    }
-    let border = if chosen { scheme.accent() } else if hovered { LASER_DIM() } else { FIELD_BORDER() };
-    stroke_rect_argb(surf, rx, ry, rw, rh, argb_to_framefang(border));
-
-    const SWATCH: i32 = 8;
-    const SWATCH_GAP: i32 = 6;
-    let tw = bitmap_font::measure(row.label, 1);
-    let gx = rx + (rw - (SWATCH + SWATCH_GAP + tw)) / 2;
-    fill_rect(surf, gx, ry + (rh - SWATCH) / 2, SWATCH, SWATCH, argb_to_framefang(scheme.accent()));
-    let color = if chosen { TEXT_BRIGHT } else { TEXT_MUTED() };
-    draw_text(surf, gx + SWATCH + SWATCH_GAP, ry + (rh - bitmap_font::GLYPH_H) / 2, 1,
-              row.label, argb_to_framefang(color));
-}
-
-/// Draw an ON/OFF toggle pill anchored at (x, y) with the given height; width
-/// is fixed at ~64 px. Knob slides to the right when on.
-const TOGGLE_W: i32 = 64;
-
-fn draw_toggle<S: painter::Surface>(s: &mut S, x: i32, y: i32, h: i32, on: bool) {
-    let w = TOGGLE_W;
-    let bg = if on { TOGGLE_ON() } else { TOGGLE_OFF() };
-    fill_rect(s, x, y, w, h, argb_to_framefang(bg));
-    let border = if on { LASER_DIM() } else { FIELD_BORDER() };
-    stroke_rect_argb(s, x, y, w, h, argb_to_framefang(border));
-    // Knob — small filled square that sits on left when off, right when on.
-    let knob_w = h - 8;
-    let knob_x = if on { x + w - knob_w - 4 } else { x + 4 };
-    let knob_y = y + 4;
-    let knob_color = if on { TOGGLE_KNOB() } else { TOGGLE_OFF_K() };
-    fill_rect(s, knob_x, knob_y, knob_w, knob_w, argb_to_framefang(knob_color));
-    // Label inside, opposite side of the knob.
-    let label = if on { "ON" } else { "OFF" };
-    let tw = bitmap_font::measure(label, 1);
-    let ty = y + (h - bitmap_font::GLYPH_H) / 2;
-    let tx = if on { x + 8 } else { x + w - tw - 8 };
-    let color = if on { TEXT_BRIGHT } else { TEXT_MUTED() };
-    draw_text(s, tx, ty, 1, label, argb_to_framefang(color));
-}
-
-
-/// Resolve the screenshots-folder display value: explicit `save_directory`
-/// when set, otherwise the actual XDG Pictures dir on disk (with a generic
-/// `~/Pictures` fallback if no UserDirs are available).
-fn folder_or_default_picture(v: &str) -> String {
-    if !v.is_empty() { return v.to_owned(); }
+/// Where a folder dialog opens: at the folder already chosen, or else the
+/// system's folder for that kind of file (`system_dir`), or the temp folder.
+fn folder_dialog_start(
+    chosen: &str,
+    system_dir: fn(&directories::UserDirs) -> Option<&std::path::Path>,
+) -> PathBuf {
+    if !chosen.is_empty() { return PathBuf::from(chosen); }
     directories::UserDirs::new()
-        .and_then(|u| u.picture_dir().map(|p| p.to_string_lossy().to_string()))
-        .unwrap_or_else(|| "~/Pictures".to_owned())
-}
-
-/// Resolve the recordings-folder display value: explicit
-/// `recordings_directory` when set, otherwise the actual XDG Videos dir.
-/// Mirrors `recordings_directory_for` in tray_loop.rs so what the user sees
-/// here is what the recorder will actually use.
-fn folder_or_default_video(v: &str) -> String {
-    if !v.is_empty() { return v.to_owned(); }
-    directories::UserDirs::new()
-        .and_then(|u| u.video_dir().map(|p| p.to_string_lossy().to_string()))
-        .unwrap_or_else(|| "~/Videos".to_owned())
-}
-
-// ── tiny rendering helpers, scoped to this file ─────────────────────────────
-
-struct BufferSurface<'a> {
-    buf: &'a mut [u32],
-    w:   i32,
-    h:   i32,
-}
-
-impl painter::Surface for BufferSurface<'_> {
-    fn width(&self)  -> i32 { self.w }
-    fn height(&self) -> i32 { self.h }
-    fn read(&self, x: i32, y: i32) -> [u8; 4] {
-        if x < 0 || y < 0 || x >= self.w || y >= self.h { return [0, 0, 0, 0xFF]; }
-        let p = self.buf[(y as usize) * (self.w as usize) + (x as usize)];
-        [((p >> 16) & 0xFF) as u8, ((p >> 8) & 0xFF) as u8, (p & 0xFF) as u8, 0xFF]
-    }
-    fn write(&mut self, x: i32, y: i32, rgba: [u8; 4]) {
-        if x < 0 || y < 0 || x >= self.w || y >= self.h { return; }
-        let dst = (y as usize) * (self.w as usize) + (x as usize);
-        self.buf[dst] = ((rgba[0] as u32) << 16) | ((rgba[1] as u32) << 8) | rgba[2] as u32;
-    }
-}
-
-fn argb_to_framefang(argb: u32) -> FramefangRgba {
-    FramefangRgba {
-        r: ((argb >> 16) & 0xFF) as u8,
-        g: ((argb >>  8) & 0xFF) as u8,
-        b: ( argb        & 0xFF) as u8,
-        a: 255,
-    }
-}
-
-fn fill_rect<S: painter::Surface>(s: &mut S, x: i32, y: i32, w: i32, h: i32, color: FramefangRgba) {
-    let rgba = [color.r, color.g, color.b, color.a];
-    for yy in y..y + h {
-        for xx in x..x + w {
-            s.write(xx, yy, rgba);
-        }
-    }
-}
-
-fn stroke_rect_argb<S: painter::Surface>(s: &mut S, x: i32, y: i32, w: i32, h: i32, color: FramefangRgba) {
-    let rgba = [color.r, color.g, color.b, color.a];
-    for xx in x..x + w { s.write(xx, y, rgba); s.write(xx, y + h - 1, rgba); }
-    for yy in y..y + h { s.write(x, yy, rgba); s.write(x + w - 1, yy, rgba); }
-}
-
-fn draw_text<S: painter::Surface>(s: &mut S, x: i32, y: i32, scale: i32, text: &str, color: FramefangRgba) {
-    painter::draw_text(s, x, y, scale, text, color);
-}
-
-fn centered_origin(loop_target: &winit::event_loop::ActiveEventLoop, w: u32, h: u32) -> (i32, i32) {
-    let primary = loop_target.primary_monitor()
-        .or_else(|| loop_target.available_monitors().next());
-    let (mon_x, mon_y, mon_w, mon_h) = match primary {
-        Some(m) => {
-            let pos  = m.position();
-            let size = m.size();
-            (pos.x as i32, pos.y as i32, size.width as i32, size.height as i32)
-        }
-        None => (0, 0, 1920, 1080),
-    };
-    let x = mon_x + (mon_w - w as i32) / 2;
-    let y = mon_y + (mon_h - h as i32) / 2;
-    (x.max(mon_x), y.max(mon_y))
-}
-
-/// True for `KeyCode`s that represent a bare modifier — the rebind widget
-/// rejects these because "Ctrl alone" is rarely a meaningful global hotkey
-/// and would fire on every modifier press.
-fn is_modifier_code(c: KeyCode) -> bool {
-    matches!(
-        c,
-        KeyCode::ControlLeft | KeyCode::ControlRight
-            | KeyCode::ShiftLeft | KeyCode::ShiftRight
-            | KeyCode::AltLeft   | KeyCode::AltRight
-            | KeyCode::SuperLeft | KeyCode::SuperRight
-            | KeyCode::Meta      | KeyCode::Hyper
-            | KeyCode::Fn        | KeyCode::FnLock
-            | KeyCode::CapsLock  | KeyCode::NumLock
-    )
-}
-
-/// Translate winit's `ModifiersState` mask into the framefang-core `Modifiers`
-/// flag set whose bit layout matches Win32 `MOD_*` (the JSON wire format).
-fn mods_state_to_hk(s: ModifiersState) -> HkMods {
-    let mut out = HkMods::empty();
-    if s.control_key() { out |= HkMods::CONTROL; }
-    if s.shift_key()   { out |= HkMods::SHIFT; }
-    if s.alt_key()     { out |= HkMods::ALT; }
-    if s.super_key()   { out |= HkMods::SUPER; }
-    out
-}
-
-/// Map a winit `KeyCode` to the Win32 virtual-key code we serialize in
-/// settings.json (canonical wire format shared with the C# build).
-///
-/// Covers every key in `framefang_core::settings::KEYS`: letters, digits,
-/// punctuation, F1-F24, the numpad, the navigation cluster, Print Screen,
-/// Pause, Scroll Lock, Menu, and the media, volume, browser and launch keys.
-/// Esc is not here: it cancels the rebind. A key winit can't name is read
-/// from its scancode instead (`native_vk`).
-fn keycode_to_vk(c: KeyCode) -> Option<u32> {
-    Some(match c {
-        // Punctuation (US layout names; the VK is the key's position).
-        KeyCode::Semicolon => 0xBA, KeyCode::Equal => 0xBB, KeyCode::Comma => 0xBC,
-        KeyCode::Minus => 0xBD, KeyCode::Period => 0xBE, KeyCode::Slash => 0xBF,
-        KeyCode::Backquote => 0xC0, KeyCode::BracketLeft => 0xDB, KeyCode::Backslash => 0xDC,
-        KeyCode::BracketRight => 0xDD, KeyCode::Quote => 0xDE, KeyCode::IntlBackslash => 0xE2,
-        // Typing and whitespace keys (allowed only with a modifier).
-        KeyCode::Space => 0x20, KeyCode::Tab => 0x09, KeyCode::Enter => 0x0D,
-        KeyCode::Backspace => 0x08,
-        // F13-F24
-        KeyCode::F13 => 0x7C, KeyCode::F14 => 0x7D, KeyCode::F15 => 0x7E, KeyCode::F16 => 0x7F,
-        KeyCode::F17 => 0x80, KeyCode::F18 => 0x81, KeyCode::F19 => 0x82, KeyCode::F20 => 0x83,
-        KeyCode::F21 => 0x84, KeyCode::F22 => 0x85, KeyCode::F23 => 0x86, KeyCode::F24 => 0x87,
-        // Numpad
-        KeyCode::Numpad0 => 0x60, KeyCode::Numpad1 => 0x61, KeyCode::Numpad2 => 0x62,
-        KeyCode::Numpad3 => 0x63, KeyCode::Numpad4 => 0x64, KeyCode::Numpad5 => 0x65,
-        KeyCode::Numpad6 => 0x66, KeyCode::Numpad7 => 0x67, KeyCode::Numpad8 => 0x68,
-        KeyCode::Numpad9 => 0x69, KeyCode::NumpadMultiply => 0x6A, KeyCode::NumpadAdd => 0x6B,
-        KeyCode::NumpadSubtract => 0x6D, KeyCode::NumpadDecimal => 0x6E,
-        KeyCode::NumpadDivide => 0x6F, KeyCode::NumpadEnter => 0x0D,
-        // Menu, sleep, media, volume, browser and launch keys.
-        KeyCode::ContextMenu => 0x5D, KeyCode::Sleep => 0x5F,
-        KeyCode::BrowserBack => 0xA6, KeyCode::BrowserForward => 0xA7,
-        KeyCode::BrowserRefresh => 0xA8, KeyCode::BrowserStop => 0xA9,
-        KeyCode::BrowserSearch => 0xAA, KeyCode::BrowserFavorites => 0xAB,
-        KeyCode::BrowserHome => 0xAC,
-        KeyCode::AudioVolumeMute => 0xAD, KeyCode::AudioVolumeDown => 0xAE,
-        KeyCode::AudioVolumeUp => 0xAF,
-        KeyCode::MediaTrackNext => 0xB0, KeyCode::MediaTrackPrevious => 0xB1,
-        KeyCode::MediaStop => 0xB2, KeyCode::MediaPlayPause => 0xB3,
-        KeyCode::LaunchMail => 0xB4, KeyCode::MediaSelect => 0xB5,
-        KeyCode::LaunchApp1 => 0xB6, KeyCode::LaunchApp2 => 0xB7,
-        // Letters
-        KeyCode::KeyA => 0x41, KeyCode::KeyB => 0x42, KeyCode::KeyC => 0x43,
-        KeyCode::KeyD => 0x44, KeyCode::KeyE => 0x45, KeyCode::KeyF => 0x46,
-        KeyCode::KeyG => 0x47, KeyCode::KeyH => 0x48, KeyCode::KeyI => 0x49,
-        KeyCode::KeyJ => 0x4A, KeyCode::KeyK => 0x4B, KeyCode::KeyL => 0x4C,
-        KeyCode::KeyM => 0x4D, KeyCode::KeyN => 0x4E, KeyCode::KeyO => 0x4F,
-        KeyCode::KeyP => 0x50, KeyCode::KeyQ => 0x51, KeyCode::KeyR => 0x52,
-        KeyCode::KeyS => 0x53, KeyCode::KeyT => 0x54, KeyCode::KeyU => 0x55,
-        KeyCode::KeyV => 0x56, KeyCode::KeyW => 0x57, KeyCode::KeyX => 0x58,
-        KeyCode::KeyY => 0x59, KeyCode::KeyZ => 0x5A,
-        // Digits (top row only — numpad omitted intentionally because Win32
-        // splits those into VK_NUMPAD0–9 and the rebind widget doesn't yet
-        // expose a distinction).
-        KeyCode::Digit0 => 0x30, KeyCode::Digit1 => 0x31, KeyCode::Digit2 => 0x32,
-        KeyCode::Digit3 => 0x33, KeyCode::Digit4 => 0x34, KeyCode::Digit5 => 0x35,
-        KeyCode::Digit6 => 0x36, KeyCode::Digit7 => 0x37, KeyCode::Digit8 => 0x38,
-        KeyCode::Digit9 => 0x39,
-        // F-keys
-        KeyCode::F1 => 0x70, KeyCode::F2 => 0x71, KeyCode::F3 => 0x72,
-        KeyCode::F4 => 0x73, KeyCode::F5 => 0x74, KeyCode::F6 => 0x75,
-        KeyCode::F7 => 0x76, KeyCode::F8 => 0x77, KeyCode::F9 => 0x78,
-        KeyCode::F10 => 0x79, KeyCode::F11 => 0x7A, KeyCode::F12 => 0x7B,
-        // Navigation / editing cluster
-        KeyCode::PrintScreen => 0x2C,
-        KeyCode::ScrollLock  => 0x91,
-        KeyCode::Pause       => 0x13,
-        KeyCode::Insert      => 0x2D,
-        KeyCode::Delete      => 0x2E,
-        KeyCode::Home        => 0x24,
-        KeyCode::End         => 0x23,
-        KeyCode::PageUp      => 0x21,
-        KeyCode::PageDown    => 0x22,
-        KeyCode::ArrowLeft   => 0x25,
-        KeyCode::ArrowUp     => 0x26,
-        KeyCode::ArrowRight  => 0x27,
-        KeyCode::ArrowDown   => 0x28,
-        _ => return None,
-    })
-}
-
-/// What the listening box says when a typing key was pressed without a
-/// modifier that stops it typing: what to hold, in one instruction.
-fn typing_key_hint(vk: u32) -> String {
-    let key = vk_label(vk).map(str::to_owned).unwrap_or_else(|| format!("(0x{vk:02X})"));
-    let hold = if cfg!(target_os = "macos") { "Cmd or Ctrl" } else { "Ctrl, Alt or Win" };
-    format!("Hold {hold} with {key}")
-}
-
-/// The Win32 virtual key of a key winit couldn't name, from the scancode
-/// Windows reported for it. `None` elsewhere, or when Windows has no VK for
-/// that scancode either.
-fn native_vk(key: PhysicalKey) -> Option<u32> {
-    #[cfg(windows)]
-    {
-        use winit::keyboard::NativeKeyCode;
-        use windows::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VSC_TO_VK_EX};
-        if let PhysicalKey::Unidentified(NativeKeyCode::Windows(scancode)) = key {
-            let vk = unsafe { MapVirtualKeyW(scancode as u32, MAPVK_VSC_TO_VK_EX) };
-            // Esc stays the way out of the rebind.
-            return (vk != 0 && vk != 0x1B).then_some(vk);
-        }
-        None
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = key;
-        None
-    }
-}
-
-/// The Win32 virtual-key code of any key, modifiers included (by side): for
-/// binding a hold key, and for the capture window's held keys off Windows.
-pub(crate) fn vk_of(key: PhysicalKey) -> Option<u32> {
-    if let PhysicalKey::Code(code) = key {
-        let side = match code {
-            KeyCode::ShiftLeft => Some(0xA0), KeyCode::ShiftRight => Some(0xA1),
-            KeyCode::ControlLeft => Some(0xA2), KeyCode::ControlRight => Some(0xA3),
-            KeyCode::AltLeft => Some(0xA4), KeyCode::AltRight => Some(0xA5),
-            KeyCode::SuperLeft => Some(0x5B), KeyCode::SuperRight => Some(0x5C),
-            KeyCode::Escape => Some(0x1B),
-            _ => None,
-        };
-        if let Some(vk) = side.or_else(|| keycode_to_vk(code)) { return Some(vk); }
-    }
-    native_vk(key)
-}
-
-/// Surface the `vk_label` map for any caller outside this module that needs
-/// the same label table. Currently unused at module scope but kept here so
-/// future code (e.g. tray tooltip) doesn't reach into framefang-core directly.
-#[allow(dead_code)]
-fn vk_label_or_hex(vk: u32) -> String {
-    vk_label(vk).map(str::to_owned).unwrap_or_else(|| format!("(0x{:02X})", vk))
-}
-
-/// Shrink `s` until it fits in `max_px` at scale 1, eliding the middle instead
-/// of the tail: these fields mostly hold filesystem paths, and the leaf name at
-/// the end is the part worth reading.
-fn truncate_for(s: &str, max_px: i32) -> String {
-    if bitmap_font::measure(s, 1) <= max_px { return s.to_owned(); }
-    let ellipsis = "..";
-    // A glyph advances GLYPH_W plus the one-pixel gap that follows it; `measure`
-    // drops that gap only after the very last glyph, so a run of `n` chars is
-    // `n * advance - 1` wide and `n` chars fit while `n * advance - 1 <= max_px`.
-    let advance = bitmap_font::GLYPH_W + 1;
-    let fits = (max_px + 1) / advance;
-    let ell_n = ellipsis.chars().count() as i32;
-    if fits <= ell_n {
-        return ellipsis.chars().take(fits.max(0) as usize).collect();
-    }
-    // Split the remaining budget two-thirds in favour of the tail.
-    let keep = fits - ell_n;
-    let tail = (keep * 2 / 3).max(1) as usize;
-    let head = keep as usize - tail;
-    // `fits < s.chars().count()` here (the early return covers the rest), so the
-    // head and tail slices can never overlap.
-    let chars: Vec<char> = s.chars().collect();
-    let mut out: String = chars[..head].iter().collect();
-    out.push_str(ellipsis);
-    out.extend(&chars[chars.len() - tail..]);
-    out
+        .and_then(|u| system_dir(&u).map(std::path::Path::to_path_buf))
+        .unwrap_or_else(std::env::temp_dir)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use framefang_core::Modifiers as HkMods;
 
     /// Space every label keeps before the control beside it.
     const MIN_GAP: i32 = 12;
@@ -2629,5 +1830,37 @@ mod tests {
         assert_eq!(Hold::Capture.tail(&s), "to just copy instead");
         s.set_after_capture(AfterCapture::CopyOnly);
         assert_eq!(Hold::Capture.tail(&s), "to open the editor instead");
+    }
+
+    #[test]
+    fn the_window_centres_on_its_monitor_and_never_starts_off_it() {
+        assert_eq!(centred_origin(Some((0, 0, 1920, 1080)), 640, 500), (640, 290));
+        // A second monitor to the left, offset in both directions.
+        assert_eq!(centred_origin(Some((-1280, 100, 1280, 720)), 640, 500), (-960, 210));
+        // Bigger than the screen: pinned to its top left, not off it.
+        assert_eq!(centred_origin(Some((50, 60, 500, 400)), 640, 500), (50, 60));
+        assert_eq!(centred_origin(None, 640, 500), (640, 290));
+    }
+
+    #[test]
+    fn a_folder_dialog_opens_on_the_pick_or_a_system_folder() {
+        let picked = folder_dialog_start("D:/Shots", directories::UserDirs::picture_dir);
+        assert_eq!(picked, PathBuf::from("D:/Shots"));
+        assert!(!folder_dialog_start("", directories::UserDirs::video_dir).as_os_str().is_empty());
+    }
+
+    #[test]
+    fn a_hold_key_is_found_where_it_is_drawn_with_room_around_it() {
+        let rows = SettingsView::build_rows(None, false, Tab::Captures);
+        let line = rows.iter().find(|r| r.kind == WidgetKind::HoldLine(Hold::Capture)).unwrap();
+        let name = hold_key_name(Hold::Capture, &AppSettings::default(), false);
+        let (kx, ky, kw, kh) = hold_key_rect(line, &name);
+        let inside = (kx + kw / 2, ky + kh / 2);
+        assert!(rect_has((kx - 4, ky - 4, kw + 8, kh + 8), inside.0, inside.1));
+        assert!(!rect_has((kx - 4, ky - 4, kw + 8, kh + 8), kx - 5, ky));
+        // While waiting it shows a longer word, so the key grows.
+        let waiting = hold_key_name(Hold::Capture, &AppSettings::default(), true);
+        assert_eq!(waiting, HOLD_LISTEN);
+        assert!(hold_key_rect(line, &waiting).2 > kw);
     }
 }

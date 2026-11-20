@@ -1,95 +1,86 @@
-//! Reads the running install's channel out of the real environment.
-//!
-//! All the judgement lives in `framefang_core::install_channel`; this module is
-//! just the I/O edge — environment variables, `current_exe()`, and two
-//! marker-file probes — so the classification itself stays pure and testable.
-//! The result is cached: nothing it looks at can change while we run, and the
-//! Updates dialog asks for it on every open.
+/*!
+Fills an [`InstallProbe`] from the real machine and remembers the answer.
 
-use std::path::PathBuf;
-use std::sync::OnceLock;
+The decision itself is made in `framefang_core::install_channel`, where it can
+be tested without touching the OS. This module only gathers the facts
+(environment variables, the executable path, a few files on disk). None of
+them change while the app runs, so they are read once and kept, even though
+the Updates dialog asks every time it opens.
+*/
 
-use framefang_core::install_channel::{self, HostOs, InstallChannel, InstallProbe, UpdateAction};
+use {
+    framefang_core::install_channel::{detect_action, HostOs, InstallChannel, InstallProbe, UpdateAction},
+    std::{
+        path::{Path, PathBuf},
+        sync::OnceLock,
+    },
+};
 
-static DETECTED: OnceLock<(InstallChannel, UpdateAction)> = OnceLock::new();
+static RESULT: OnceLock<(InstallChannel, UpdateAction)> = OnceLock::new();
 
-/// The channel this binary was installed from, and what the updater is
-/// allowed to do about a newer release.
+/// How this copy was installed, and what the updater may do about a newer
+/// release.
 pub fn detected() -> &'static (InstallChannel, UpdateAction) {
-    DETECTED.get_or_init(|| {
-        let probe = probe();
-        let resolved = install_channel::detect_action(&probe);
-        eprintln!(
-            "updates: install channel = {} ({:?})",
-            resolved.0.label(),
-            resolved.1
-        );
-        resolved
+    RESULT.get_or_init(|| {
+        let (channel, action) = detect_action(&gather());
+        eprintln!("updates: install channel = {} ({:?})", channel.label(), action);
+        (channel, action)
     })
 }
 
-/// The channel alone.
+/// Just the channel from [`detected`].
 pub fn channel() -> InstallChannel {
-    detected().0
+    let (channel, _) = detected();
+    *channel
 }
 
-/// `$APPIMAGE` — the `.AppImage` file the running process was launched from.
-/// This is the file an AppImage update replaces; `current_exe()` points into
-/// the read-only FUSE mount instead.
+/// `$APPIMAGE`: the `.AppImage` file this process was started from, which is
+/// what an AppImage update overwrites. (`current_exe()` points inside the
+/// read-only FUSE mount instead.)
 pub fn appimage_path() -> Option<PathBuf> {
-    non_empty_env("APPIMAGE").map(PathBuf::from)
+    env_value("APPIMAGE").map(PathBuf::from)
 }
 
-fn probe() -> InstallProbe {
-    let exe_path = std::env::current_exe()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default();
-
-    InstallProbe {
-        os: HostOs::host(),
-        exe_path,
-        snap_dir: non_empty_env("SNAP"),
-        flatpak_id: non_empty_env("FLATPAK_ID"),
-        flatpak_info_exists: std::path::Path::new("/.flatpak-info").exists(),
-        appimage_path: non_empty_env("APPIMAGE"),
-        homebrew_cask_marker: homebrew_cask_marker(),
-        os_release: read_os_release(),
-    }
+fn gather() -> InstallProbe {
+    let os = HostOs::host();
+    let probe = InstallProbe {
+        os,
+        exe_path: std::env::current_exe()
+            .map(|exe| exe.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        snap_dir: env_value("SNAP"),
+        flatpak_id: env_value("FLATPAK_ID"),
+        flatpak_info_exists: Path::new("/.flatpak-info").exists(),
+        appimage_path: env_value("APPIMAGE"),
+        homebrew_cask_marker: os == HostOs::MacOs && caskroom_has_framefang(),
+        os_release: if os == HostOs::Linux { os_release_text() } else { None },
+    };
+    probe
 }
 
-fn non_empty_env(key: &str) -> Option<String> {
-    std::env::var(key).ok().filter(|v| !v.is_empty())
+/// An environment variable, with empty treated the same as unset.
+fn env_value(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
-/// A Homebrew cask leaves its bookkeeping in `<prefix>/Caskroom/framefang` while
-/// the app bundle itself lands in `/Applications` looking hand-installed, so
-/// this directory is the only way to tell the two apart. Checked on macOS
-/// only — the cask is a macOS-only artifact.
-fn homebrew_cask_marker() -> bool {
-    if HostOs::host() != HostOs::MacOs {
-        return false;
-    }
-    let mut prefixes: Vec<PathBuf> = vec![
-        // Apple silicon and Intel default prefixes.
-        PathBuf::from("/opt/homebrew"),
-        PathBuf::from("/usr/local"),
-    ];
-    if let Some(custom) = non_empty_env("HOMEBREW_PREFIX") {
-        prefixes.insert(0, PathBuf::from(custom));
-    }
-    prefixes
-        .iter()
-        .any(|p| p.join("Caskroom").join("framefang").exists())
+/// Homebrew keeps a cask's records in `<prefix>/Caskroom/framefang` and puts
+/// the bundle in `/Applications`, where it looks hand-installed, so that
+/// folder is the only way to tell. `$HOMEBREW_PREFIX` goes first when set,
+/// then the Apple silicon and Intel defaults.
+fn caskroom_has_framefang() -> bool {
+    let custom = env_value("HOMEBREW_PREFIX").map(PathBuf::from);
+    let defaults = [PathBuf::from("/opt/homebrew"), PathBuf::from("/usr/local")];
+    custom
+        .into_iter()
+        .chain(defaults)
+        .any(|prefix| prefix.join("Caskroom").join("framefang").exists())
 }
 
-/// `/etc/os-release` names the distro family so we can print `apt` / `dnf` /
-/// `pacman`-flavoured advice instead of a shrug. Linux-only; absent or
-/// unreadable degrades to a generic hint.
-fn read_os_release() -> Option<String> {
-    if HostOs::host() != HostOs::Linux {
-        return None;
-    }
-    std::fs::read_to_string("/etc/os-release")
-        .or_else(|_| std::fs::read_to_string("/usr/lib/os-release"))
-        .ok()
+/// The distro's os-release file, so the hint can name apt, dnf, zypper or an
+/// AUR helper. `/usr/lib/os-release` is the fallback the spec allows for.
+/// Missing or unreadable just means a generic hint.
+fn os_release_text() -> Option<String> {
+    ["/etc/os-release", "/usr/lib/os-release"]
+        .into_iter()
+        .find_map(|path| std::fs::read_to_string(path).ok())
 }

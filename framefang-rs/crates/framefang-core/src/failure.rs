@@ -1,61 +1,62 @@
-//! User-facing wording for the ways a capture can fail to land anywhere.
+//! What Frame Fang tells the user when a finished capture has nowhere to go.
 //!
-//! These paths used to print to stderr and nothing else, which for a
-//! tray-resident app means "nowhere": the overlay has already closed, so a
-//! failed save, a refused clipboard, or a pin window that never opened looked
-//! exactly like success. The tray now toasts each of them, and every message
-//! is built here so the wording stays consistent — and so it can be tested
-//! without a desktop session.
+//! By the time any of these happen the overlay is gone, so a message on
+//! stderr would never be seen and a failed save would pass for a good one.
+//! The tray shows each of these as a toast instead. Keeping the text in one
+//! place keeps the tone even across them and lets the tests below check it
+//! without a desktop.
 //!
-//! House rules for every string below:
-//!   * name the thing that failed (the folder, the file, the surface),
-//!   * quote the OS reason verbatim — it is usually the actionable half,
-//!   * end with the one step the user can actually take.
+//! Each message follows the same shape:
+//!   1. say what went wrong, naming the folder or file when there is one,
+//!   2. pass the operating system's reason through untouched, since that is
+//!      usually the part that tells the user what to fix,
+//!   3. finish with the single thing the user can do next.
 
-/// The save folder itself couldn't be created or reached.
+/// Text for when the save folder can't be created or opened.
 pub fn save_folder_failure(dir: &str, reason: &str) -> String {
     format!(
-        "Couldn't use the save folder {dir}: {reason}. \
-         The screenshot was not saved. Pick a different folder under \
-         Settings > FILES > Screenshots folder, then capture again."
+        "The save folder {dir} can't be used ({reason}), so this screenshot \
+         wasn't saved. Choose another folder in Settings > FILES > \
+         Screenshots folder and take it again."
     )
 }
 
-/// The folder was fine; writing the PNG into it wasn't.
+/// Text for when the folder is usable but writing the image file into it
+/// failed.
 pub fn save_write_failure(path: &str, reason: &str) -> String {
     format!(
-        "Couldn't write {path}: {reason}. \
-         The screenshot was not saved. Check free disk space and that the \
-         folder is writable, then capture again."
+        "Writing {path} failed ({reason}), so this screenshot wasn't saved. \
+         Make sure the disk has room and the folder accepts new files, then \
+         take it again."
     )
 }
 
-/// The clipboard refused the image, so nothing was copied *and* nothing was
-/// written to disk — the copy path never touches the save folder.
+/// Text for when the clipboard rejects the image. Copying never writes a
+/// file, so the user has to hear that the shot is not on disk either.
 pub fn clipboard_failure(reason: &str) -> String {
     format!(
-        "Couldn't copy the screenshot to the clipboard: {reason}. \
-         Nothing was saved to disk either — capture again and press Enter to \
-         save the shot to your save folder instead."
+        "The clipboard wouldn't take the screenshot ({reason}). It wasn't \
+         saved to disk either. Take it again and press Enter to put it in \
+         your save folder."
     )
 }
 
-/// The pinned-image window couldn't be created.
+/// Text for when the window that pins a shot on screen can't be opened.
 pub fn pin_failure(reason: &str) -> String {
     format!(
-        "Couldn't pin the screenshot to the screen: {reason}. \
-         Nothing was saved to disk — capture again and press Enter to save it \
-         to your save folder instead."
+        "The screenshot couldn't be pinned on screen ({reason}). It wasn't \
+         saved to disk either. Take it again and press Enter to put it in \
+         your save folder."
     )
 }
 
-/// Settings were edited but couldn't be persisted, so the change is live for
-/// this session only and disappears on the next launch.
+/// Text for when changed settings can't be written out. They stay in effect
+/// until the app quits, and the user should know they won't come back.
 pub fn settings_write_failure(reason: &str) -> String {
     format!(
-        "Couldn't save your settings: {reason}. \
-         They apply for now but will be lost when Framefang restarts. Check that \
-         the config folder exists and is writable."
+        "Your settings couldn't be saved ({reason}). They work until Frame \
+         Fang restarts, then they're gone. Check that the config folder \
+         exists and can be written to."
     )
 }
 
@@ -63,51 +64,52 @@ pub fn settings_write_failure(reason: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Every message has to carry the two things a user needs to act on:
-    /// what failed (a path, where there is one) and why (the OS reason).
-    #[test]
-    fn messages_quote_path_and_reason() {
-        let m = save_folder_failure("/data/shots", "Permission denied");
-        assert!(m.contains("/data/shots"), "{m}");
-        assert!(m.contains("Permission denied"), "{m}");
-
-        let m = save_write_failure("/data/shots/framefang_1.png", "No space left on device");
-        assert!(m.contains("/data/shots/framefang_1.png"), "{m}");
-        assert!(m.contains("No space left on device"), "{m}");
-
-        let m = clipboard_failure("X11 selection owner vanished");
-        assert!(m.contains("X11 selection owner vanished"), "{m}");
-
-        let m = pin_failure("no display server");
-        assert!(m.contains("no display server"), "{m}");
-
-        let m = settings_write_failure("Read-only file system");
-        assert!(m.contains("Read-only file system"), "{m}");
+    /// One sample of every message, built with recognisable inputs.
+    fn samples() -> Vec<(String, Vec<&'static str>)> {
+        vec![
+            (save_folder_failure("/srv/caps", "Access is denied"),
+             vec!["/srv/caps", "Access is denied"]),
+            (save_write_failure("/srv/caps/framefang_7.png", "Disk full"),
+             vec!["/srv/caps/framefang_7.png", "Disk full"]),
+            (clipboard_failure("clipboard is locked"), vec!["clipboard is locked"]),
+            (pin_failure("window class missing"), vec!["window class missing"]),
+            (settings_write_failure("config is read only"), vec!["config is read only"]),
+        ]
     }
 
-    /// A toast body that runs on for a paragraph gets truncated by every
-    /// notification daemon we target, so the actionable sentence has to fit.
+    /// The user can only act on a message that says which file or folder
+    /// was involved and what the OS said about it.
     #[test]
-    fn messages_stay_short_enough_to_toast() {
-        for m in [
-            save_folder_failure("/data/shots", "Permission denied"),
-            save_write_failure("/data/shots/framefang_1.png", "No space left on device"),
-            clipboard_failure("selection owner vanished"),
-            pin_failure("no display server"),
-            settings_write_failure("Read-only file system"),
-        ] {
-            assert!(m.len() < 240, "too long to toast ({} chars): {m}", m.len());
+    fn each_message_carries_its_path_and_os_reason() {
+        for (text, needles) in samples() {
+            for needle in needles {
+                assert!(text.contains(needle), "{needle:?} missing from {text}");
+            }
         }
     }
 
-    /// The copy and pin paths discard the bitmap when they fail, so both have
-    /// to tell the user the shot is gone rather than implying it was filed
-    /// away somewhere.
+    /// Notification popups cut long bodies short, so the advice at the end
+    /// has to survive inside a toast.
     #[test]
-    fn discarding_paths_say_nothing_was_saved() {
-        assert!(clipboard_failure("x").contains("Nothing was saved"));
-        assert!(pin_failure("x").contains("Nothing was saved"));
-        assert!(save_folder_failure("/d", "x").contains("was not saved"));
-        assert!(save_write_failure("/d/f.png", "x").contains("was not saved"));
+    fn each_message_fits_in_a_toast() {
+        for (text, _) in samples() {
+            assert!(text.len() < 240, "{} chars is too long for a toast: {text}", text.len());
+        }
+    }
+
+    /// No path keeps the shot after one of these failures, so every message
+    /// must say it was not saved rather than leave the user hunting for it.
+    #[test]
+    fn each_message_says_the_shot_was_not_kept() {
+        for text in [
+            save_folder_failure("/d", "r"),
+            save_write_failure("/d/f.png", "r"),
+            clipboard_failure("r"),
+            pin_failure("r"),
+        ] {
+            assert!(text.contains("wasn't saved"), "{text}");
+        }
+        assert!(clipboard_failure("r").contains("saved to disk either"));
+        assert!(pin_failure("r").contains("saved to disk either"));
     }
 }

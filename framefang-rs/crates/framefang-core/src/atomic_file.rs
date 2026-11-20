@@ -1,268 +1,278 @@
-//! Crash-safe whole-file replacement.
+//! Replace a file so that nobody, including the next launch after a crash,
+//! ever sees it half written.
 //!
-//! `fs::write` truncates the destination and then streams into it, so a crash
-//! (or a power cut, or an OOM kill) anywhere in the middle leaves a
-//! half-written file behind. For `settings.json` that is a corrupt document:
-//! `AppSettings::load` can't parse it, silently falls back to `Default`, and
-//! the user's save folder, hotkey, tools and theme are all gone.
+//! `fs::write` empties the file first and then fills it, so dying partway
+//! (a crash, a power cut, the OOM killer) leaves a truncated file. For
+//! `settings.json` that means `AppSettings::load` fails to parse, quietly
+//! starts from defaults, and the user's save folder, hotkey, tools and theme
+//! are lost.
 //!
-//! The fix is the standard write-temp-then-rename dance. The temp file lives
-//! in the *same directory* as the destination — a rename is only atomic within
-//! a filesystem, and `/tmp` is frequently a different one — and is fsynced
-//! before the rename so the rename can't be reordered ahead of the data.
-//! After the rename the destination either holds the complete old content or
-//! the complete new content, never a splice of the two.
+//! So the new bytes go to a sibling temp file first, are flushed to disk, and
+//! only then is the temp renamed over the real name. Readers see either the
+//! complete old file or the complete new one. Three details matter:
 //!
-//! `fs::rename` is the right primitive on every platform we ship: POSIX
-//! `rename(2)` replaces atomically, and Rust's Windows implementation calls
-//! `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`.
+//! * The temp sits in the destination's own directory. A rename is only
+//!   atomic inside one filesystem, and the system temp directory is often on
+//!   another.
+//! * The data is fsynced before the rename. Otherwise the filesystem may
+//!   commit the rename first, and a crash in between leaves an empty file
+//!   under the real name.
+//! * `fs::rename` replaces an existing file atomically everywhere we ship:
+//!   `rename(2)` on Unix, and `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`
+//!   in Rust's Windows standard library.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::Duration;
 
-/// Rename attempts before giving up. Windows lets a virus scanner or the
-/// search indexer hold a transient handle on a file it just saw appear, which
-/// fails the replace with a sharing violation for a few milliseconds. Unix
-/// never needs the retries and never pays for them.
-const RENAME_ATTEMPTS: u32 = 4;
-const RENAME_BACKOFF_MS: u64 = 40;
+/// How many times to try the final rename. On Windows an antivirus scanner
+/// or the search indexer often opens a file the moment it appears, and the
+/// rename fails with a sharing violation until it lets go a few milliseconds
+/// later. On Unix the first attempt always settles it.
+const RENAME_TRIES: u32 = 4;
 
-/// Monotonic suffix so two writers in one process can't pick the same temp
-/// name. The pid covers writers in different processes.
-static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+/// Pause between rename attempts.
+const RENAME_BACKOFF: Duration = Duration::from_millis(40);
 
-/// Temp-file name for a destination, in the destination's own directory.
+/// Per-process counter that makes every temp name distinct. The process id
+/// in the name separates writers in different processes.
+static TEMP_SERIAL: AtomicU64 = AtomicU64::new(0);
+
+/// Where the bytes for `dest` are staged before the rename.
 ///
-/// Dot-prefixed so it doesn't show up in a file listing during the split
-/// second it exists, and suffixed with pid + counter so concurrent writers
-/// never collide on it.
-fn temp_path_for(dest: &Path) -> PathBuf {
-    let dir = dest.parent().unwrap_or_else(|| Path::new("."));
-    let stem = dest
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "file".to_owned());
-    let n = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-    dir.join(format!(".{stem}.tmp-{}-{n}", std::process::id()))
+/// Same directory as `dest`, hidden on Unix by a leading dot, and unique per
+/// call: `.{name}.tmp-{pid}-{serial}`.
+fn staging_path(dest: &Path) -> PathBuf {
+    let name = match dest.file_name() {
+        Some(n) => n.to_string_lossy().into_owned(),
+        None => String::from("file"),
+    };
+    let serial = TEMP_SERIAL.fetch_add(1, Ordering::Relaxed);
+    let staged = format!(".{name}.tmp-{}-{serial}", std::process::id());
+    match dest.parent() {
+        Some(dir) => dir.join(staged),
+        None => Path::new(".").join(staged),
+    }
 }
 
-/// Replace `dest` with `bytes`, atomically.
+/// Create `path` (it must not exist yet), write `bytes` into it and flush
+/// them to the disk. The handle is closed on return, which Windows needs
+/// before it will rename the file.
+fn write_and_flush(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file: File = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+/// Rename `from` over `to`, retrying a few times for transient Windows
+/// sharing violations. Returns the error from the final attempt.
+fn rename_with_retries(from: &Path, to: &Path) -> io::Result<()> {
+    let mut attempt = 1;
+    loop {
+        match fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt >= RENAME_TRIES => return Err(e),
+            Err(_) => {
+                attempt += 1;
+                thread::sleep(RENAME_BACKOFF);
+            }
+        }
+    }
+}
+
+/// Atomically replace the contents of `dest` with `bytes`.
 ///
-/// The destination's parent directory must already exist — this is a file
-/// primitive, not a directory one, and callers who need the directory created
-/// know better than this function whether that's appropriate.
+/// The parent directory has to exist already. Whether it should be created
+/// is the caller's decision, not this function's.
 ///
-/// On any failure the temp file is removed and `dest` is left exactly as it
-/// was, so a failed save never destroys the previous good copy.
+/// If anything fails, the staged temp file is deleted and `dest` keeps
+/// whatever it held before, so a failed save never costs the last good copy.
 pub fn write_atomic(dest: &Path, bytes: &[u8]) -> io::Result<()> {
-    let tmp = temp_path_for(dest);
-
-    // Scoped so the handle is closed before the rename: Windows refuses to
-    // rename a file that still has an open handle in some sharing modes.
-    let write_result = (|| -> io::Result<()> {
-        let mut f: File = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
-        f.write_all(bytes)?;
-        // Without this the rename can land before the data does, which on a
-        // crash gives us an atomically-renamed *empty* file — the exact
-        // corruption we're trying to avoid.
-        f.sync_all()?;
-        Ok(())
-    })();
-
-    if let Err(e) = write_result {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
-    }
-
-    let mut last = None;
-    for attempt in 0..RENAME_ATTEMPTS {
-        match fs::rename(&tmp, dest) {
-            Ok(()) => {
-                sync_parent_dir(dest);
-                return Ok(());
-            }
-            Err(e) => {
-                last = Some(e);
-                if attempt + 1 < RENAME_ATTEMPTS {
-                    std::thread::sleep(std::time::Duration::from_millis(RENAME_BACKOFF_MS));
-                }
-            }
+    let staged = staging_path(dest);
+    let result = write_and_flush(&staged, bytes).and_then(|()| rename_with_retries(&staged, dest));
+    match result {
+        Ok(()) => {
+            flush_directory_entry(dest);
+            Ok(())
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&staged);
+            Err(e)
         }
     }
-
-    let _ = fs::remove_file(&tmp);
-    Err(last.unwrap_or_else(|| io::Error::other("rename failed")))
 }
 
-/// Persist the directory entry the rename just created.
+/// Make the rename itself durable by syncing the directory that holds it.
 ///
-/// Best-effort: a rename is atomic with respect to readers either way, and
-/// this only guards the narrower case of a power loss immediately afterwards.
-/// Unix-only — Windows has no directory handle to fsync, and `MoveFileExW`
-/// already orders the metadata write for us.
+/// Best effort only: readers already see the rename atomically, and this
+/// just narrows the window where a power cut right afterwards could lose it.
+/// Windows has nothing equivalent to sync (and `MoveFileExW` already orders
+/// the metadata), so there it does nothing.
 #[cfg(unix)]
-fn sync_parent_dir(dest: &Path) {
-    if let Some(dir) = dest.parent() {
-        if let Ok(d) = File::open(dir) {
-            let _ = d.sync_all();
-        }
+fn flush_directory_entry(dest: &Path) {
+    let Some(dir) = dest.parent() else { return };
+    if let Ok(handle) = File::open(dir) {
+        let _ = handle.sync_all();
     }
 }
 
 #[cfg(not(unix))]
-fn sync_parent_dir(_dest: &Path) {}
+fn flush_directory_entry(_dest: &Path) {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Each test gets its own directory under the OS temp dir. No `tempfile`
-    /// dependency: framefang-core deliberately carries almost none.
-    fn scratch_dir(tag: &str) -> PathBuf {
-        let n = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-        let d = std::env::temp_dir()
-            .join(format!("framefang-atomic-{}-{tag}-{n}", std::process::id()));
-        let _ = fs::remove_dir_all(&d);
-        fs::create_dir_all(&d).unwrap();
-        d
-    }
+    /// A fresh empty directory under the OS temp dir, removed on drop.
+    /// framefang-core keeps its dependency list short, so no `tempfile`.
+    struct Scratch(PathBuf);
 
-    /// Files the caller didn't ask for, i.e. leaked temps.
-    fn stray_entries(dir: &Path, expected: &str) -> Vec<String> {
-        fs::read_dir(dir)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n != expected)
-            .collect()
-    }
-
-    #[test]
-    fn writes_a_new_file() {
-        let dir = scratch_dir("new");
-        let dest = dir.join("settings.json");
-        write_atomic(&dest, b"{\"a\":1}").unwrap();
-        assert_eq!(fs::read_to_string(&dest).unwrap(), "{\"a\":1}");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn replaces_existing_content_wholesale() {
-        let dir = scratch_dir("replace");
-        let dest = dir.join("settings.json");
-        write_atomic(&dest, b"old content that is quite long").unwrap();
-        write_atomic(&dest, b"new").unwrap();
-        // Not "newcontent that is quite long" — the replace is whole-file, so
-        // no tail of the previous write survives.
-        assert_eq!(fs::read_to_string(&dest).unwrap(), "new");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn leaves_no_temp_file_behind() {
-        let dir = scratch_dir("clean");
-        let dest = dir.join("settings.json");
-        for i in 0..5 {
-            write_atomic(&dest, format!("{i}").as_bytes()).unwrap();
+    impl Scratch {
+        fn new(label: &str) -> Scratch {
+            let serial = TEMP_SERIAL.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("framefang-atomic-{}-{label}-{serial}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            Scratch(dir)
         }
-        assert_eq!(
-            stray_entries(&dir, "settings.json"),
-            Vec::<String>::new(),
-            "temp files leaked into the destination directory"
-        );
-        let _ = fs::remove_dir_all(&dir);
+
+        fn settings(&self) -> PathBuf {
+            self.0.join("settings.json")
+        }
+
+        /// Names in the directory other than `settings.json`: anything here
+        /// is a temp file that should have been cleaned up.
+        fn leftovers(&self) -> Vec<String> {
+            let mut names: Vec<String> = fs::read_dir(&self.0)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n != "settings.json")
+                .collect();
+            names.sort();
+            names
+        }
     }
 
-    /// The whole point: the destination is only ever the old bytes or the new
-    /// bytes. Approximated by checking that the temp file, not the
-    /// destination, is what gets opened for writing — the destination's inode
-    /// content is untouched until the rename.
-    #[test]
-    fn temp_lands_in_the_destination_directory() {
-        let dir = scratch_dir("samedir");
-        let dest = dir.join("settings.json");
-        let tmp = temp_path_for(&dest);
-        assert_eq!(tmp.parent(), dest.parent(),
-            "temp must share a filesystem with the destination for rename to be atomic");
-        assert_ne!(tmp.file_name(), dest.file_name());
-        let _ = fs::remove_dir_all(&dir);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 
-    #[test]
-    fn temp_names_are_unique_per_call() {
-        let dest = Path::new("/nowhere/settings.json");
-        let a = temp_path_for(dest);
-        let b = temp_path_for(dest);
-        assert_ne!(a, b);
-    }
-
-    /// A missing parent directory is an error, and — critically — it doesn't
-    /// leave a stray temp anywhere.
-    #[test]
-    fn missing_parent_directory_is_an_error() {
-        let dir = scratch_dir("noparent");
-        let dest = dir.join("does-not-exist").join("settings.json");
-        assert!(write_atomic(&dest, b"x").is_err());
-        assert!(!dest.exists());
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// A failed write must not take the previous good copy with it. The
-    /// unwritable case is hard to force portably, so this covers the shape we
-    /// can force: the old file survives a write whose destination directory
-    /// was swapped out from under it.
-    #[test]
-    fn failed_write_preserves_previous_content() {
-        let dir = scratch_dir("preserve");
-        let dest = dir.join("settings.json");
-        write_atomic(&dest, b"good").unwrap();
-
-        let doomed = dir.join("gone").join("settings.json");
-        assert!(write_atomic(&doomed, b"bad").is_err());
-
-        assert_eq!(fs::read_to_string(&dest).unwrap(), "good");
-        assert_eq!(stray_entries(&dir, "settings.json"), Vec::<String>::new());
-        let _ = fs::remove_dir_all(&dir);
+    fn read(path: &Path) -> String {
+        fs::read_to_string(path).unwrap()
     }
 
     #[test]
-    fn handles_empty_content() {
-        let dir = scratch_dir("empty");
-        let dest = dir.join("settings.json");
-        write_atomic(&dest, b"seeded").unwrap();
-        write_atomic(&dest, b"").unwrap();
-        assert_eq!(fs::read_to_string(&dest).unwrap(), "");
-        let _ = fs::remove_dir_all(&dir);
+    fn creates_a_file_that_did_not_exist() {
+        let s = Scratch::new("create");
+        write_atomic(&s.settings(), b"{\"a\":1}").unwrap();
+        assert_eq!(read(&s.settings()), "{\"a\":1}");
     }
 
-    /// Concurrent writers must never collide on a temp name or corrupt the
-    /// destination: whoever renames last wins, and the file is one of the
-    /// candidate payloads in full.
     #[test]
-    fn concurrent_writers_leave_one_intact_payload() {
-        let dir = scratch_dir("threads");
-        let dest = dir.join("settings.json");
-        let payloads = ["aaaa".repeat(64), "bbbb".repeat(64), "cccc".repeat(64)];
+    fn a_shorter_write_leaves_no_tail_of_the_old_one() {
+        let s = Scratch::new("shorter");
+        write_atomic(&s.settings(), b"a long first version of the file").unwrap();
+        write_atomic(&s.settings(), b"v2").unwrap();
+        assert_eq!(read(&s.settings()), "v2");
+    }
 
-        std::thread::scope(|s| {
-            for p in &payloads {
-                let dest = dest.clone();
-                s.spawn(move || {
-                    for _ in 0..10 {
-                        write_atomic(&dest, p.as_bytes()).unwrap();
+    #[test]
+    fn repeated_saves_clean_up_their_temp_files() {
+        let s = Scratch::new("tidy");
+        for round in 0..5 {
+            write_atomic(&s.settings(), round.to_string().as_bytes()).unwrap();
+        }
+        assert_eq!(read(&s.settings()), "4");
+        assert!(s.leftovers().is_empty(), "stray temps: {:?}", s.leftovers());
+    }
+
+    #[test]
+    fn staging_happens_beside_the_destination() {
+        // Same directory means same filesystem, which the atomic rename needs.
+        let dest = Path::new("some").join("dir").join("settings.json");
+        let staged = staging_path(&dest);
+        assert_eq!(staged.parent(), dest.parent());
+        assert_ne!(staged.file_name(), dest.file_name());
+    }
+
+    #[test]
+    fn staged_names_are_hidden_and_never_repeat() {
+        let target = Path::new("/not/a/real/dir/config.json");
+        let first = staging_path(target);
+        let second = staging_path(target);
+        assert_ne!(first, second);
+        let name = first.file_name().unwrap().to_string_lossy().into_owned();
+        let prefix = format!(".config.json.tmp-{}-", std::process::id());
+        assert!(name.starts_with(&prefix), "{name}");
+    }
+
+    #[test]
+    fn a_missing_directory_is_reported_not_created() {
+        let s = Scratch::new("nodir");
+        let orphan = s.0.join("absent").join("settings.json");
+        assert!(write_atomic(&orphan, b"lost").is_err());
+        assert!(!orphan.try_exists().unwrap(), "nothing may appear at the destination");
+        assert!(!s.0.join("absent").is_dir(), "the folder must not be created");
+    }
+
+    #[test]
+    fn a_failed_save_keeps_the_last_good_copy() {
+        let s = Scratch::new("keep");
+        write_atomic(&s.settings(), b"good").unwrap();
+        let unreachable = s.0.join("missing").join("settings.json");
+        assert!(write_atomic(&unreachable, b"bad").is_err());
+        assert_eq!(read(&s.settings()), "good");
+        assert!(s.leftovers().is_empty());
+    }
+
+    #[test]
+    fn a_rename_that_keeps_failing_cleans_up_after_itself() {
+        // A directory squatting on the destination name makes every rename
+        // attempt fail on all platforms, which exercises the retry path.
+        let s = Scratch::new("squat");
+        let dest = s.0.join("taken");
+        fs::create_dir(&dest).unwrap();
+        assert!(write_atomic(&dest, b"payload").is_err());
+        assert!(dest.is_dir(), "the existing directory must be left alone");
+        let others: Vec<String> = s.leftovers().into_iter().filter(|n| n != "taken").collect();
+        assert!(others.is_empty(), "stray temps: {others:?}");
+    }
+
+    #[test]
+    fn empty_content_is_a_valid_save() {
+        let s = Scratch::new("empty");
+        write_atomic(&s.settings(), b"something").unwrap();
+        write_atomic(&s.settings(), b"").unwrap();
+        assert_eq!(read(&s.settings()), "");
+    }
+
+    #[test]
+    fn parallel_writers_never_produce_a_mixed_file() {
+        // The last rename wins, and the result is one whole payload.
+        let s = Scratch::new("race");
+        let dest = s.settings();
+        let payloads: Vec<String> = ["x", "y", "z"].iter().map(|c| c.repeat(256)).collect();
+
+        thread::scope(|scope| {
+            for body in &payloads {
+                let dest = &dest;
+                scope.spawn(move || {
+                    for _round in 0..12 {
+                        write_atomic(dest, body.as_bytes()).unwrap();
                     }
                 });
             }
         });
 
-        let got = fs::read_to_string(&dest).unwrap();
-        assert!(payloads.iter().any(|p| *p == got), "torn write: {} bytes", got.len());
-        assert_eq!(stray_entries(&dir, "settings.json"), Vec::<String>::new());
-        let _ = fs::remove_dir_all(&dir);
+        let landed = read(&dest);
+        assert!(payloads.contains(&landed), "torn write of {} bytes", landed.len());
+        assert!(s.leftovers().is_empty());
     }
 }

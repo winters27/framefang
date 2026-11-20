@@ -1,50 +1,48 @@
-//! Framefang — native cross-platform screenshot tool.
+//! Frame Fang: a screenshot, annotation and screen recording tool that lives
+//! in the system tray.
 //!
-//! Tray-resident lifecycle:
-//!   - tray icon stays visible
-//!   - global hotkey + tray "Capture" both call `start_capture`
-//!   - capture grabs every monitor and stitches into a single bitmap
-//!   - bitmap saved to the user's `SaveDirectory` (or `~/Pictures` if unset)
+//! This file only decides whether this process gets to be the running copy.
+//! Everything after that (the tray icon, the hotkeys, the capture window and
+//! the dialogs) is driven by `tray_loop::run`.
 //!
-//! The full overlay editor (region selection, 9 annotation tools, undo/redo,
-//! save/copy/pin) is the next slice of work — see PLAN.md § R7.
-//!
-//! On Windows we hide the console window so this runs as a true tray app.
+//! Release builds on Windows use the GUI subsystem, so no console window
+//! opens next to the tray icon.
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-mod backdrop;
-mod bitmap_font;
-mod chrome;
-mod editor;
-mod icons;
-mod install_source;
-mod painter;
 mod about_form;
 mod autostart;
+mod backdrop;
+mod bitmap_font;
 mod brand_icon;
+mod chrome;
 mod convert_image_form;
 mod convert_video_form;
+mod dialog;
+mod editor;
 mod ffmpeg_fetch;
 mod firstrun_form;
 mod frame;
 mod gif;
 mod hud;
+mod icons;
+mod install_source;
 mod keycap;
+mod page_map;
+mod painter;
 mod palette;
 mod pick;
 mod pin;
 mod read_text;
 mod recent;
-mod scroll;
-mod page_map;
-mod scroll_hud;
-mod scroll_probe;
-mod stitch;
 mod recording_indicator;
 mod reveal;
+mod scroll;
+mod scroll_hud;
+mod scroll_probe;
 mod self_updater;
 mod settings_form;
+mod stitch;
 mod system_shortcuts;
 mod toast;
 mod tray_loop;
@@ -57,69 +55,94 @@ use std::time::Duration;
 use anyhow::Result;
 use framefang_platform::instance::{self, Instance};
 
-/// How long a relaunch spawned by the self-updater waits for the outgoing
-/// process to release the single-instance lock. The predecessor exits
-/// immediately after spawning us, so this is generous by an order of
-/// magnitude; the cap only exists so a wedged predecessor can't hang us
-/// forever.
-const RELAUNCH_HANDOVER_GRACE: Duration = Duration::from_secs(10);
+/// The longest a copy started by the self-updater waits for the copy it
+/// replaces to give up the single-instance lock. The old copy quits right
+/// after starting us, so the wait is normally a few milliseconds; the limit
+/// only stops a hung old copy from keeping us waiting for ever.
+const UPDATE_HANDOFF_WAIT: Duration = Duration::from_secs(10);
+
+/// What the person asked for on the command line.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LaunchRequest {
+    /// Plain launch.
+    Default,
+    /// `framefang --settings`: show the Settings dialog.
+    Settings,
+}
+
+impl LaunchRequest {
+    fn from_args() -> Self {
+        if std::env::args().skip(1).any(|arg| arg == "--settings") {
+            LaunchRequest::Settings
+        } else {
+            LaunchRequest::Default
+        }
+    }
+}
+
+/// Hands this launch's request to the copy that is already running, which
+/// watches for these requests, and says on stderr what happened.
+fn forward_to_running_copy(request: LaunchRequest) {
+    match request {
+        LaunchRequest::Settings => {
+            instance::request_settings();
+            eprintln!("Frame Fang is running already; its Settings window will open.");
+        }
+        LaunchRequest::Default => {
+            instance::request_capture();
+            eprintln!(
+                "Frame Fang is running already; it will start a capture. \
+                 Its tray icon has the full menu."
+            );
+        }
+    }
+}
 
 fn main() -> Result<()> {
-    // After a self-update on Windows the previous .exe was renamed to
-    // `<current_exe>.old` and couldn't be deleted until our PID exited.
-    // We're that new PID now — clean it up. No-op on Linux / macOS.
+    // A Windows self-update renames the old executable to `<exe>.old`, which
+    // stays locked until the old process is gone. By now it is, so remove
+    // it. Does nothing on macOS and Linux.
     self_updater::cleanup_stale_old_binary();
 
-    // One Framefang per user session. A second launch used to add a second tray
-    // icon, a second (silently refused) hotkey registration, and a second
-    // recorder racing the first for the same output filenames.
-    //
-    // The one legitimate overlap is a self-update relaunch: our predecessor
-    // spawns us and only then exits, so we wait for the handover instead of
-    // quitting as a duplicate.
-    let grace = if std::env::var_os(self_updater::RELAUNCH_ENV).is_some() {
-        RELAUNCH_HANDOVER_GRACE
+    let request = LaunchRequest::from_args();
+
+    // Only one copy runs per login session: two would mean two tray icons,
+    // a hotkey the system refuses the second time, and two recorders
+    // writing to the same file names. A copy started by the self-updater is
+    // the exception, since its parent is still on the way out, so it waits.
+    let handoff_wait = if std::env::var_os(self_updater::RELAUNCH_ENV).is_some() {
+        UPDATE_HANDOFF_WAIT
     } else {
         Duration::ZERO
     };
-    // `framefang --settings` opens Settings: in the running copy if there
-    // is one, else in this one once it is up.
-    let wants_settings = std::env::args().skip(1).any(|a| a == "--settings");
-    // Held for the whole process: dropping it releases the lock.
-    let _instance = match instance::acquire_waiting(grace) {
+
+    // The guard holds the lock until the process ends.
+    let _single_instance = match instance::acquire_waiting(handoff_wait) {
         Instance::Primary(guard) => Some(guard),
         Instance::AlreadyRunning => {
-            // Make the extra launch do the useful thing rather than nothing:
-            // the running instance polls for this and opens the overlay (or
-            // Settings, when asked for).
-            if wants_settings {
-                instance::request_settings();
-                eprintln!("Frame Fang is already running. Asked it to open Settings.");
-            } else {
-                instance::request_capture();
-                eprintln!(
-                    "Frame Fang is already running. Asked it to capture. \
-                     Use its tray icon to reach the menu."
-                );
-            }
+            // A second launch should still do something useful, so pass
+            // the request along instead of quitting silently.
+            forward_to_running_copy(request);
             return Ok(());
         }
-        // No usable per-app directory to lock in. Start anyway: refusing to
-        // launch is far worse than a duplicate tray icon.
+        // There is no per-user folder to hold the lock. Running without it
+        // risks a second tray icon, which beats not starting at all.
         Instance::Unsupported => None,
     };
 
-    // A recording only survives our death if we died without cleaning up
-    // (crash, SIGKILL, power loss). The pid was recorded when it started, so
-    // stop it now rather than leaving an encoder running with no UI attached
-    // to it. Safe here and nowhere else: we hold the instance lock, so there
-    // is no live sibling whose recorder this could be.
+    // A recorder pid left on disk means an earlier run ended without its
+    // cleanup (a crash, a kill, a power cut) and its ffmpeg may still be
+    // going with nothing to stop it. With the lock held, no other running
+    // copy can own that recorder, so stopping it here is safe.
     if let Some(pid) = framefang_platform::reap_orphaned_recorder() {
-        eprintln!("Stopped a screen recording left over from a previous run (pid {pid}).");
+        eprintln!("An earlier run left a screen recording going (pid {pid}); it has been stopped.");
     }
 
-    // After the lock (which clears stale requests): this copy answers it.
-    if wants_settings { instance::request_settings(); }
+    // Taking the lock clears old requests, so a Settings request for this
+    // copy is filed only now, for the tray loop to pick up.
+    if request == LaunchRequest::Settings {
+        instance::request_settings();
+    }
 
     tray_loop::run()
 }

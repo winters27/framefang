@@ -102,9 +102,14 @@ fn spawn(cmd: &str, args: &[&str]) -> Result<(), String> {
         .map_err(|e| format!("Couldn't open {cmd}: {e}"))
 }
 
+// The index parsing below is pure text, so it is tested on every OS, but only
+// Windows calls it.
+
 /// Where the Print Screen switch lives before newer builds moved it.
+#[cfg_attr(not(windows), allow(dead_code))]
 const PRINT_SCREEN_PAGE_OLD: &str = "ms-settings:easeofaccess-keyboard";
 /// Bluetooth & devices > Keyboard, where newer Windows 11 builds put it.
+#[cfg_attr(not(windows), allow(dead_code))]
 const PRINT_SCREEN_PAGE_NEW: &str = "ms-settings:devices-keyboard";
 
 /// The Settings page one index file (`AllSystemSettings_*.xml`) puts the
@@ -112,6 +117,7 @@ const PRINT_SCREEN_PAGE_NEW: &str = "ms-settings:devices-keyboard";
 /// `None` when the file lacks the switch or names its page some other way
 /// (newer builds ship an extra index whose PageIDs are GUIDs; reading that
 /// one as "the old page" sent the button to Accessibility on build 26300).
+#[cfg_attr(not(windows), allow(dead_code))]
 fn print_screen_page_in(index_xml: &str) -> Option<&'static str> {
     let at = index_xml.find("UsePrintScreenKeyForSnippingEnabled")?;
     let rest = &index_xml[at..];
@@ -129,6 +135,7 @@ fn print_screen_page_in(index_xml: &str) -> Option<&'static str> {
 /// (the switch moved there, and no file names it otherwise), else the
 /// Accessibility page if one does, else the newer page, which is where
 /// current Windows 11 keeps it.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn print_screen_page_from<'a>(index_files: impl IntoIterator<Item = &'a str>) -> &'static str {
     let found: Vec<&'static str> = index_files.into_iter().filter_map(print_screen_page_in).collect();
     if found.contains(&PRINT_SCREEN_PAGE_NEW) || found.is_empty() {
@@ -161,6 +168,7 @@ const SWITCH_NAME_EN: &str = "Use the Print screen key to open screen capture";
 
 /// The resource reference Windows' index gives as the switch's name, e.g.
 /// `@{windows?ms-resource://.../UsePrintScreenKeyForSnippingEnabled3/Description}`.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn switch_name_resource(index_xml: &str) -> Option<&str> {
     let at = index_xml.find("UsePrintScreenKeyForSnippingEnabled")?;
     let rest = &index_xml[at..];

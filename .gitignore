@@ -1,54 +1,25 @@
-# Build output (C#)
-**/bin/
-**/obj/
-*.user
-*.suo
-
-# Build output (Rust)
-**/target/
-Cargo.lock.*
-
-# Rust packaging staging — only the framefang-rs/dist/ subdir, NOT root /dist/
-# (root /dist/ holds package-channel metadata: winget, choco, scoop, brew, etc.)
-/framefang-rs/dist/
-
-# Visual Studio
-.vs/
-*.swp
-
-# Published artifacts
-publish/
-*.pdb
+# Build output: Cargo's target folders, and the folder the release steps
+# stage installers and bundles in (framefang-rs/dist, not the top-level dist/
+# that holds the packaging sources).
+target/
+framefang-rs/dist/
 *.msi
+*.wixobj
 *.wixpdb
-*.snap
+*.pdb
 *.AppImage
-preview.png
+*.dmg
 
-# OS
-Thumbs.db
-.DS_Store
-
-# Editor
-.idea/
-.vscode/
-
-# Local dev
-*.log
-
-# Local-only files: deployment runbooks, DNS / domain notes,
-# editor / agent session state, anything specific to the
-# maintainer's environment. Never push.
+# Machine-local: icon tools and notes (.local), agent and editor state.
 .local/
-*.local
-*.local.*
 .claude/
-.cursor/
-.aider*
-.copilot/
-DEPLOY.md
-DEPLOY-*.md
-deploy.md
-SECRETS.md
+.vs/
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Secrets never belong in the repository.
 .env
 .env.*

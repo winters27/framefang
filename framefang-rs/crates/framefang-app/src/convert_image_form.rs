@@ -1,711 +1,562 @@
-//! Themed "Convert image" dialog. Same skin as Settings / About / Updates.
+//! The Convert image dialog, and the form pieces it shares with Convert
+//! video.
 //!
-//! Flow:
-//!   1. Pick a source image (Browse… opens a native file dialog).
-//!   2. Pick a target format (PNG · JPG · WEBP · BMP).
-//!   3. (Optional) drag the quality slider for JPG / WEBP.
-//!   4. Click Convert → writes the result next to the source as
-//!      `<stem>.framefang.<ext>` and shows a success message.
+//! The user picks a picture, a format to save it as (PNG, JPG, WEBP or
+//! BMP), optionally a smaller size and, for the formats that have one, a
+//! quality. Convert writes `<name>.framefang.<ext>` beside the original,
+//! which is never touched, and says where it went. Everything is done with
+//! the `image` crate in-process; nothing has to be installed.
 //!
-//! Encoding is done entirely via the `image` crate, which is already a
-//! workspace dep. No bundled binary required.
+//! The shared half ([`Form`], [`Status`], [`draw_pill`], [`draw_source`],
+//! [`output_beside`], [`choose_file`]) is the layout both Convert dialogs
+//! use: numbered groups of controls down a column, a file field at the
+//! top, and the Convert button with a status line along the bottom.
 
-use std::num::NonZeroU32;
-use std::path::PathBuf;
-use std::rc::Rc;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 
-use anyhow::{anyhow, Result};
-use softbuffer::{Context, Surface};
-use winit::dpi::{PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use anyhow::Result;
+use image::imageops::FilterType;
+use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
-use winit::keyboard::{Key, NamedKey};
-use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
+use winit::keyboard::NamedKey;
+use winit::window::WindowId;
 
-use framefang_core::color::Rgba as FramefangRgba;
-
-use crate::bitmap_font;
-use crate::painter;
-
-// Colors: the app's one palette (cyan and magenta on blue-black).
-#[allow(unused_imports)]
+use crate::dialog::{fit_middle, inside, Input, Page, Rect, Shell};
+use crate::bitmap_font::{measure, GLYPH_H};
 use crate::palette::*;
 
-const WIN_W: u32 = 720;
-const WIN_H: u32 = 571;
-const PAD:   i32 = 24;
-const ROW_H: i32 = 36;
-const LABEL_W: i32 = 150;
-const BTN_H: i32 = 34;
-/// The first row's top, right under the title bar (which holds the
-/// heading); its section header sits above it.
-const BODY_Y: i32 = 44;
-/// Convert now, in the bar along the bottom with the status beside it.
-const CONVERT_W: i32 = 140;
-/// Tall label-only format pill (no LABEL_W indent).
-const FMT_PILL_H: i32 = 46;
+const CARD_W: u32 = 720;
+const CARD_H: u32 = 571;
+const CARD: (u32, u32) = (CARD_W, CARD_H);
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ImgFormat { Png, Jpg, Webp, Bmp }
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ImgFormat { Png, Jpg, Webp, Bmp }
 
-/// Image downscale preset. Downscale-only — picking 50 % on a 320 px source
-/// halves it; "Source" leaves dimensions untouched. We don't expose upscale
-/// because resampling-up on a screenshot just adds blur.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ImgResize { Source, P50, P25 }
+const FORMATS: [ImgFormat; 4] = [ImgFormat::Png, ImgFormat::Jpg, ImgFormat::Webp, ImgFormat::Bmp];
 
 impl ImgFormat {
-    fn label(&self) -> &'static str {
+    fn ext(self) -> &'static str {
         match self {
-            ImgFormat::Png  => "PNG",
-            ImgFormat::Jpg  => "JPG",
-            ImgFormat::Webp => "WEBP",
-            ImgFormat::Bmp  => "BMP",
-        }
-    }
-    fn ext(&self) -> &'static str {
-        match self {
-            ImgFormat::Png  => "png",
-            ImgFormat::Jpg  => "jpg",
+            ImgFormat::Png => "png",
+            ImgFormat::Jpg => "jpg",
             ImgFormat::Webp => "webp",
-            ImgFormat::Bmp  => "bmp",
+            ImgFormat::Bmp => "bmp",
         }
     }
-    fn supports_quality(&self) -> bool {
-        matches!(self, ImgFormat::Jpg | ImgFormat::Webp)
+
+    fn caption(self) -> &'static str {
+        match self {
+            ImgFormat::Png => "PNG",
+            ImgFormat::Jpg => "JPG",
+            ImgFormat::Webp => "WEBP",
+            ImgFormat::Bmp => "BMP",
+        }
+    }
+
+    /// Whether the Quality slider means anything for this format, and so
+    /// whether it is shown at all.
+    fn has_quality(self) -> bool { matches!(self, ImgFormat::Jpg | ImgFormat::Webp) }
+}
+
+/// Output size. Shrinking only: scaling a screenshot up adds nothing but
+/// blur, so there is no option for it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ImgResize { Source, P50, P25 }
+
+const SIZES: [ImgResize; 3] = [ImgResize::Source, ImgResize::P50, ImgResize::P25];
+
+impl ImgResize {
+    /// What both sides are divided by, or `None` to keep the size.
+    fn divisor(self) -> Option<u32> {
+        match self {
+            ImgResize::Source => None,
+            ImgResize::P50 => Some(2),
+            ImgResize::P25 => Some(4),
+        }
+    }
+
+    fn caption(self) -> &'static str {
+        match self {
+            ImgResize::Source => "Full size",
+            ImgResize::P50 => "50%",
+            ImgResize::P25 => "25%",
+        }
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum WidgetKind {
-    Source,             // path display row + Browse button
-    FormatPng,
-    FormatJpg,
-    FormatWebp,
-    FormatBmp,
-    Quality,            // slider
-    ResizeSource,
-    Resize50,
-    Resize25,
-    Convert,
-}
-
-struct Row {
-    kind:  WidgetKind,
-    label: &'static str,
-    rect:  (i32, i32, i32, i32),
-}
-
-#[derive(Clone)]
-enum Status {
-    Idle,
-    Ok(PathBuf),
-    Err(String),
-}
+enum Control { Convert, Source, Format(ImgFormat), Resize(ImgResize), Quality }
 
 pub enum ConvertImageOutcome {
     Closed,
 }
 
 pub struct ConvertImageView {
-    window:  Rc<Window>,
-    _ctx:    Context<Rc<Window>>,
-    surface: Surface<Rc<Window>, Rc<Window>>,
-    source:  Option<PathBuf>,
-    format:  ImgFormat,
-    quality: u8,            // 0..=100 (JPG / WEBP)
-    resize:  ImgResize,
-    rows:    Vec<Row>,
-    cursor:  (i32, i32),
-    hover:   Option<usize>,
-    dragging_quality: bool,
-    status:  Status,
-    /// The title strip drawn above the dialog (minimize, close, drag).
-    title_bar: crate::chrome::TitleBar,
+    shell: Shell,
+    form: Form<Control>,
+    source: Option<PathBuf>,
+    format: ImgFormat,
+    /// 0 to 100; used by JPG.
+    quality: u8,
+    resize: ImgResize,
+    hover: Option<Control>,
+    /// The Quality knob is held down.
+    dragging: bool,
+    status: Status,
     pub outcome: Option<ConvertImageOutcome>,
 }
 
 impl ConvertImageView {
     pub fn new(loop_target: &ActiveEventLoop) -> Result<Self> {
-        let win_h = WIN_H + crate::chrome::TITLE_H as u32;
-        let (cx, cy) = centered_origin(loop_target, WIN_W, win_h);
-        let attrs = crate::chrome::frameless(WindowAttributes::default())
-            .with_title("Frame Fang: Convert image")
-            .with_resizable(false)
-            .with_inner_size(PhysicalSize::new(WIN_W, win_h))
-            .with_position(PhysicalPosition::new(cx, cy))
-            .with_window_icon(crate::brand_icon::shared());
-
-        let window = loop_target
-            .create_window(attrs)
-            .map(Rc::new)
-            .map_err(|e| anyhow!("create_window (convert-image): {e}"))?;
-        crate::chrome::finish(&window);
-        // Framefang runs as a menu-bar/tray agent, so on macOS there is no Dock
-        // icon to click if this opens behind the frontmost app. Ask for focus
-        // explicitly; on Windows/Linux it is a harmless raise.
-        window.focus_window();
-        window.set_cursor(CursorIcon::Default);
-
-        let ctx = Context::new(window.clone())
-            .map_err(|e| anyhow!("softbuffer Context::new (convert-image): {e}"))?;
-        let surface = Surface::new(&ctx, window.clone())
-            .map_err(|e| anyhow!("softbuffer Surface::new (convert-image): {e}"))?;
-
-        let mut me = ConvertImageView {
-            window, _ctx: ctx, surface,
-            source: None,
-            format: ImgFormat::Png,
-            quality: 90,
-            resize:  ImgResize::Source,
-            rows: Vec::new(),
-            cursor: (0, 0),
-            hover: None,
-            dragging_quality: false,
-            status: Status::Idle,
-            title_bar: Default::default(),
-            outcome: None,
+        let shell = Shell::open(loop_target, "Frame Fang: Convert image", "// CONVERT IMAGE", "convert-image", CARD)?;
+        let form = Form::new(CARD_W)
+            .field("INPUT", Control::Source)
+            .pills("OUTPUT FORMAT", &FORMATS.map(Control::Format))
+            .pills("SIZE  (can only shrink)", &SIZES.map(Control::Resize))
+            .field("QUALITY", Control::Quality);
+        // Starts on PNG at full size; JPG's quality starts at 90.
+        let mut view = ConvertImageView {
+            shell, form, quality: 90,
+            format: ImgFormat::Png, resize: ImgResize::Source,
+            source: None, hover: None, dragging: false, status: Status::Idle, outcome: None,
         };
-        me.rows = me.build_rows();
-        me.redraw();
-        Ok(me)
+        view.paint();
+        Ok(view)
     }
 
-    pub fn window_id(&self) -> WindowId { self.window.id() }
+    pub fn window_id(&self) -> WindowId { self.shell.id() }
 
     pub fn handle_event(&mut self, event: WindowEvent) {
-        match event {
-            WindowEvent::CloseRequested => self.outcome = Some(ConvertImageOutcome::Closed),
-            WindowEvent::KeyboardInput {
-                event: winit::event::KeyEvent {
-                    logical_key: Key::Named(NamedKey::Escape),
-                    state: ElementState::Pressed, ..
-                }, ..
-            } => self.outcome = Some(ConvertImageOutcome::Closed),
-            WindowEvent::CursorLeft { .. } => {
-                if self.title_bar.leave() { self.window.request_redraw(); }
+        match self.shell.input(event) {
+            Input::Close | Input::Key(NamedKey::Escape) => self.outcome = Some(ConvertImageOutcome::Closed),
+            Input::Moved => {
+                if self.dragging { self.quality_follows_pointer(); }
+                let now = self.control_at(self.shell.cursor);
+                self.shell.track_hover(&mut self.hover, now, now.is_some());
             }
-            WindowEvent::CursorMoved { position, .. } => {
-                let raw = (position.x as i32, position.y as i32);
-                if self.title_bar.hover_at(&self.window, raw) { self.window.request_redraw(); }
-                // The dialog's own coordinates start below the title strip.
-                self.cursor = (raw.0, raw.1 - crate::chrome::TITLE_H);
-                if self.dragging_quality {
-                    self.set_quality_from_cursor();
-                }
-                let new_hover = self.hit_test(self.cursor.0, self.cursor.1);
-                self.window.set_cursor(if new_hover.is_some() { CursorIcon::Pointer } else { CursorIcon::Default });
-                if new_hover != self.hover {
-                    self.hover = new_hover;
-                    self.window.request_redraw();
+            Input::Press => {
+                if let Some(control) = self.control_at(self.shell.cursor) {
+                    self.press(control);
+                    self.shell.repaint();
                 }
             }
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Left, ..
-            } => {
-                match self.title_bar.press(&self.window, self.cursor) {
-                    Some(crate::chrome::TitlePart::Close) => return self.handle_event(WindowEvent::CloseRequested),
-                    Some(_) => return,
-                    None => {}
-                }
-                if let Some(i) = self.hit_test(self.cursor.0, self.cursor.1) {
-                    self.activate(i);
-                }
+            Input::Release if self.dragging => {
+                self.dragging = false;
+                self.shell.repaint();
             }
-            WindowEvent::MouseInput {
-                state: ElementState::Released,
-                button: MouseButton::Left, ..
-            } => {
-                if self.dragging_quality {
-                    self.dragging_quality = false;
-                    self.window.request_redraw();
-                }
-            }
-            WindowEvent::Resized(_) | WindowEvent::RedrawRequested => self.redraw(),
+            Input::Paint => self.paint(),
             _ => {}
         }
     }
 
-    fn hit_test(&self, x: i32, y: i32) -> Option<usize> {
-        self.rows.iter().position(|r| {
-            // The QUALITY row is rendered + active only when the chosen
-            // format supports a quality knob; otherwise it's invisible
-            // and shouldn't catch clicks.
-            if r.kind == WidgetKind::Quality && !self.format.supports_quality() {
-                return false;
-            }
-            let (rx, ry, rw, rh) = r.rect;
-            x >= rx && x < rx + rw && y >= ry && y < ry + rh
-        })
+    /// Controls hidden for the chosen format neither draw nor take clicks.
+    fn shows(&self, control: Control) -> bool {
+        control != Control::Quality || self.format.has_quality()
     }
 
-    fn activate(&mut self, idx: usize) {
-        let kind = self.rows[idx].kind;
-        match kind {
-            WidgetKind::Source => {
-                let starting = self.source.clone()
-                    .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-                    .unwrap_or_else(|| {
-                        directories::UserDirs::new()
-                            .and_then(|u| u.picture_dir().map(|p| p.to_path_buf()))
-                            .unwrap_or_else(std::env::temp_dir)
-                    });
-                if let Some(p) = rfd::FileDialog::new()
-                    .set_title("Pick an image")
-                    .set_directory(&starting)
-                    .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tiff", "tif"])
-                    .pick_file()
-                {
-                    self.source = Some(p);
-                    self.status = Status::Idle;
+    fn control_at(&self, p: (i32, i32)) -> Option<Control> {
+        if inside(convert_button(CARD), p) { return Some(Control::Convert); }
+        self.form.hit(p, |c| self.shows(c))
+    }
+
+    fn press(&mut self, control: Control) {
+        match control {
+            Control::Source => {
+                let picked = choose_file("Choose an image", self.source.as_deref(), directories::UserDirs::picture_dir,
+                    "Images", &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tiff", "tif"]);
+                // A new choice clears the last result line.
+                if picked.is_some() { (self.source, self.status) = (picked, Status::Idle); }
+            }
+            Control::Format(f) => (self.format, self.status) = (f, Status::Idle),
+            Control::Resize(r) => self.resize = r,
+            Control::Quality => {
+                self.dragging = true;
+                self.quality_follows_pointer();
+            }
+            Control::Convert => self.convert(),
+        }
+    }
+
+    fn quality_follows_pointer(&mut self) {
+        let Some(row) = self.form.rect_of(Control::Quality) else { return };
+        if let Some(q) = quality_at(self.shell.cursor.0, row) {
+            self.quality = q;
+            self.shell.repaint();
+        }
+    }
+
+    /// Write the converted copy and leave the result in `status` for the
+    /// next paint, good or bad.
+    fn convert(&mut self) {
+        self.status = match &self.source {
+            None => Status::Failed("Choose an image to convert first.".to_owned()),
+            Some(src) => {
+                let dst = output_beside(src, self.format.ext());
+                match write_converted(src, &dst, self.format, self.quality, self.resize) {
+                    Ok(()) => Status::Saved(dst),
+                    Err(e) => Status::Failed(e),
                 }
             }
-            WidgetKind::FormatPng  => { self.format = ImgFormat::Png;  self.status = Status::Idle; }
-            WidgetKind::FormatJpg  => { self.format = ImgFormat::Jpg;  self.status = Status::Idle; }
-            WidgetKind::FormatWebp => { self.format = ImgFormat::Webp; self.status = Status::Idle; }
-            WidgetKind::FormatBmp  => { self.format = ImgFormat::Bmp;  self.status = Status::Idle; }
-            WidgetKind::Quality => {
-                self.dragging_quality = true;
-                self.set_quality_from_cursor();
-            }
-            WidgetKind::ResizeSource => { self.resize = ImgResize::Source; }
-            WidgetKind::Resize50     => { self.resize = ImgResize::P50;    }
-            WidgetKind::Resize25     => { self.resize = ImgResize::P25;    }
-            WidgetKind::Convert => {
-                self.run_conversion();
-            }
-        }
-        self.window.request_redraw();
-    }
-
-    fn quality_track(&self) -> Option<(i32, i32, i32, i32)> {
-        let row = self.rows.iter().find(|r| r.kind == WidgetKind::Quality)?;
-        let (rx, ry, rw, rh) = row.rect;
-        let vx = rx + LABEL_W;
-        let vy = ry + 4;
-        let vw = rw - LABEL_W - 4;
-        let vh = rh - 8;
-        Some((vx, vy, vw, vh))
-    }
-
-    fn set_quality_from_cursor(&mut self) {
-        let Some((tx, _ty, tw, _th)) = self.quality_track() else { return; };
-        if tw <= 1 { return; }
-        let cx = self.cursor.0;
-        let mut t = (cx - tx) as f32 / (tw - 1) as f32;
-        if !t.is_finite() { t = 0.0; }
-        t = t.clamp(0.0, 1.0);
-        self.quality = (t * 100.0).round() as u8;
-        self.window.request_redraw();
-    }
-
-    /// Run the conversion. Best-effort — populates `self.status` for the
-    /// next paint pass so the user gets feedback either way. Output path
-    /// is `<input-stem>.framefang.<ext>` next to the source, which keeps the
-    /// original untouched and is obvious enough that the user can find it.
-    fn run_conversion(&mut self) {
-        let Some(src) = self.source.clone() else {
-            self.status = Status::Err("Pick a source image first.".to_owned());
-            return;
         };
-        let dst = {
-            let stem = src.file_stem().map(|s| s.to_string_lossy().to_string())
-                                       .unwrap_or_else(|| "framefang".to_owned());
-            let parent = src.parent().map(|p| p.to_path_buf())
-                                     .unwrap_or_else(std::env::temp_dir);
-            parent.join(format!("{stem}.framefang.{}", self.format.ext()))
-        };
+    }
 
-        match image::open(&src) {
-            Ok(img) => {
-                // Apply the user's resize choice before we encode. Lanczos3
-                // is the highest-quality downsample image-rs offers — worth
-                // it because users will sometimes use this for shrinking a
-                // 4K screenshot down to embed in a doc.
-                let img = match self.resize {
-                    ImgResize::Source => img,
-                    ImgResize::P50 => img.resize(
-                        (img.width()  / 2).max(1),
-                        (img.height() / 2).max(1),
-                        image::imageops::FilterType::Lanczos3,
-                    ),
-                    ImgResize::P25 => img.resize(
-                        (img.width()  / 4).max(1),
-                        (img.height() / 4).max(1),
-                        image::imageops::FilterType::Lanczos3,
-                    ),
-                };
-                let res = match self.format {
-                    // PNG / BMP — use the trait save which infers the format
-                    // from the extension; both encoders are always-on in the
-                    // `image` crate.
-                    ImgFormat::Png | ImgFormat::Bmp => img.save(&dst).map_err(|e| e.to_string()),
-                    ImgFormat::Jpg => {
-                        // JpegEncoder lets us pick a quality factor (1..=100).
-                        let mut buf: Vec<u8> = Vec::new();
-                        let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, self.quality);
-                        let rgb = img.to_rgb8();
-                        enc.encode(rgb.as_raw(), rgb.width(), rgb.height(), image::ExtendedColorType::Rgb8)
-                            .map_err(|e| e.to_string())
-                            .and_then(|_| std::fs::write(&dst, &buf).map_err(|e| e.to_string()))
-                    }
-                    ImgFormat::Webp => {
-                        // The `image` crate ships a lossless WEBP encoder.
-                        // It doesn't expose a quality knob today; the slider
-                        // is shown for parity but ignored for now.
-                        img.save_with_format(&dst, image::ImageFormat::WebP).map_err(|e| e.to_string())
-                    }
-                };
-                self.status = match res {
-                    Ok(_)  => Status::Ok(dst),
-                    Err(e) => Status::Err(format!("Encode failed: {e}")),
-                };
+    fn paint(&mut self) {
+        let Some(mut page) = self.shell.page() else { return };
+        self.form.paint(&mut page, |c| self.shows(c), |page, control, r| {
+            let hovered = self.hover == Some(control);
+            match control {
+                Control::Source => draw_source(page, r, "Image file", self.source.as_deref(), "(choose an image)", hovered),
+                Control::Format(f) => draw_pill(page, r, f.caption(), true, f == self.format, hovered),
+                Control::Resize(s) => draw_pill(page, r, s.caption(), false, s == self.resize, hovered),
+                Control::Quality => draw_quality(page, r, self.quality),
+                Control::Convert => {}
             }
-            Err(e) => self.status = Status::Err(format!("Couldn't open image: {e}")),
-        }
-    }
-
-    fn build_rows(&self) -> Vec<Row> {
-        let mut rows = Vec::new();
-        let row_w = WIN_W as i32 - PAD * 2;
-
-        // Convert now at the bottom right, where a dialog's commit goes; the
-        // title bar's own button closes the window.
-        rows.push(Row { kind: WidgetKind::Convert, label: "Convert now",
-                        rect: (WIN_W as i32 - PAD - CONVERT_W, WIN_H as i32 - PAD - BTN_H, CONVERT_W, BTN_H) });
-
-        // Section: SOURCE
-        let mut y = BODY_Y;
-        rows.push(Row { kind: WidgetKind::Source, label: "Source image", rect: (PAD, y, row_w, ROW_H) });
-        y += ROW_H + 22;
-
-        // Section: FORMAT — four big pills spanning the full content width
-        // (FORMAT section header already names the section; no left-column
-        // indent needed).
-        y += 18;
-        let fmt_y = y;
-        let fmt_gap = 14;
-        let count = 4;
-        let content_w = WIN_W as i32 - PAD * 2;
-        let _ = content_w; // used both here and by RESIZE row below
-        let fmt_w = (content_w - fmt_gap * (count - 1)) / count;
-        let fmt_x0 = PAD;
-        rows.push(Row { kind: WidgetKind::FormatPng,  label: "PNG",  rect: (fmt_x0 + 0 * (fmt_w + fmt_gap), fmt_y, fmt_w, FMT_PILL_H) });
-        rows.push(Row { kind: WidgetKind::FormatJpg,  label: "JPG",  rect: (fmt_x0 + 1 * (fmt_w + fmt_gap), fmt_y, fmt_w, FMT_PILL_H) });
-        rows.push(Row { kind: WidgetKind::FormatWebp, label: "WEBP", rect: (fmt_x0 + 2 * (fmt_w + fmt_gap), fmt_y, fmt_w, FMT_PILL_H) });
-        rows.push(Row { kind: WidgetKind::FormatBmp,  label: "BMP",  rect: (fmt_x0 + 3 * (fmt_w + fmt_gap), fmt_y, fmt_w, FMT_PILL_H) });
-        y += FMT_PILL_H + 22;
-
-        // Section: RESIZE (always available, downscale only).
-        y += 18;
-        let r_y = y;
-        let r_gap = 14;
-        let r_count = 3;
-        let r_content_w = WIN_W as i32 - PAD * 2;
-        let r_w = (r_content_w - r_gap * (r_count - 1)) / r_count;
-        let r_x0 = PAD;
-        rows.push(Row { kind: WidgetKind::ResizeSource, label: "Source", rect: (r_x0 + 0 * (r_w + r_gap), r_y, r_w, FMT_PILL_H) });
-        rows.push(Row { kind: WidgetKind::Resize50,     label: "50%",    rect: (r_x0 + 1 * (r_w + r_gap), r_y, r_w, FMT_PILL_H) });
-        rows.push(Row { kind: WidgetKind::Resize25,     label: "25%",    rect: (r_x0 + 2 * (r_w + r_gap), r_y, r_w, FMT_PILL_H) });
-        y += FMT_PILL_H + 22;
-
-        // Section: QUALITY — visible only when format supports it
-        // (rendering + hit-test gate this row below).
-        y += 18;
-        rows.push(Row { kind: WidgetKind::Quality, label: "Quality", rect: (PAD, y, row_w, ROW_H) });
-        rows
-    }
-
-    fn redraw(&mut self) {
-        let phys = self.window.inner_size();
-        let (Some(w), Some(h)) = (NonZeroU32::new(phys.width), NonZeroU32::new(phys.height))
-            else { return; };
-        if let Err(e) = self.surface.resize(w, h) { eprintln!("convert-image: surface.resize: {e}"); return; }
-        let mut frame = match self.surface.buffer_mut() {
-            Ok(b) => b,
-            Err(e) => { eprintln!("convert-image: buffer_mut: {e}"); return; }
-        };
-        let win_w = w.get() as usize;
-        // The dialog draws into its own buffer, placed below the title strip.
-        let win_h = (h.get() as usize).saturating_sub(crate::chrome::TITLE_H as usize);
-        let mut buf = vec![0u32; win_w * win_h];
-        // The title bar holds the heading; the glowing rule runs along the
-        // body's top.
-        crate::hud::backdrop(&mut buf, win_w, win_h, 0);
-
-        let mut surf = BufferSurface { buf: &mut buf, w: win_w as i32, h: win_h as i32 };
-
-        // Section headers, numbered in the order shown.
-        let mut sec = 0;
-        if let Some(r) = self.rows.iter().find(|r| r.kind == WidgetKind::Source) {
-            section_header(&mut surf, &mut sec, "SOURCE", r.rect.1 - 22);
-        }
-        if let Some(r) = self.rows.iter().find(|r| r.kind == WidgetKind::FormatPng) {
-            section_header(&mut surf, &mut sec, "FORMAT", r.rect.1 - 22);
-        }
-        if let Some(r) = self.rows.iter().find(|r| r.kind == WidgetKind::ResizeSource) {
-            section_header(&mut surf, &mut sec, "RESIZE  (downscale only)", r.rect.1 - 22);
-        }
-        // QUALITY section is meaningful only for formats with a quality
-        // knob (JPG / WEBP). For PNG / BMP we skip both the section
-        // header and the slider row entirely so the dialog doesn't show
-        // a permanently-disabled control with an "n/a" placeholder.
-        if self.format.supports_quality() {
-            if let Some(r) = self.rows.iter().find(|r| r.kind == WidgetKind::Quality) {
-                section_header(&mut surf, &mut sec, "QUALITY", r.rect.1 - 22);
-            }
-        }
-
-        for (i, row) in self.rows.iter().enumerate() {
-            if row.kind == WidgetKind::Quality && !self.format.supports_quality() { continue; }
-            let hovered = self.hover == Some(i);
-            render_row(&mut surf, row, hovered, &self.source, self.format, self.quality, self.resize);
-        }
-
-        // Status in the bottom bar, level with Convert now and clear of it.
-        let footer_y = WIN_H as i32 - PAD - (BTN_H + bitmap_font::GLYPH_H) / 2;
-        let footer_w = WIN_W as i32 - PAD - CONVERT_W - 16 - PAD;
-        match &self.status {
-            Status::Idle => {}
-            Status::Ok(path) => {
-                let msg = format!("Saved: {}", path.display());
-                draw_text(&mut surf, PAD, footer_y, 1, &truncate_for(&msg, footer_w), argb_to_framefang(OK_TINT));
-            }
-            Status::Err(e) => {
-                draw_text(&mut surf, PAD, footer_y, 1, &truncate_for(e, footer_w), argb_to_framefang(DANGER()));
-            }
-        }
-
-        self.title_bar.draw(&mut frame, win_w, &buf, "// CONVERT IMAGE", BG_TOP());
-        if let Err(e) = frame.present() { eprintln!("convert-image: buf.present: {e}"); }
+        });
+        page.button(convert_button(CARD), "Convert", true, self.hover == Some(Control::Convert));
+        self.status.paint(&mut page, CARD);
+        self.shell.show(page);
     }
 }
 
-/// The next section label (`hud::section`), numbered in the order they
-/// appear: `n` counts the ones already drawn this frame.
-fn section_header(surf: &mut BufferSurface, n: &mut usize, text: &str, y: i32) {
-    *n += 1;
-    crate::hud::section(surf.buf, surf.w as usize, surf.h as usize, PAD, WIN_W as i32 - PAD, y, *n, text);
+const TRACK_H: i32 = 6;
+const KNOB: i32 = 14;
+
+/// The Quality row: its name, a track filled up to the value, a knob, and
+/// the value as a percentage at the right.
+fn draw_quality(page: &mut Page, r: Rect, quality: u8) {
+    page.text(r.0 + 6, r.1 + (r.3 - GLYPH_H) / 2, "Quality", TEXT_BRIGHT);
+    let (vx, vy, vw, vh) = value_area(r);
+    let readout = format!("{quality}%");
+    let track = (vx + 4, vy + (vh - TRACK_H) / 2, vw - 8 - (measure(&readout, 1) + 14), TRACK_H);
+    page.fill(track, FIELD_BG());
+    page.outline(track, FIELD_BORDER());
+    let t = f32::from(quality.min(100)) / 100.0;
+    let filled = (track.2 as f32 * t).round() as i32;
+    if filled > 0 { page.fill((track.0, track.1, filled, TRACK_H), LASER_DIM()); }
+    let knob_x = track.0 + ((track.2 - 1) as f32 * t).round() as i32 - KNOB / 2;
+    let knob_x = knob_x.clamp(track.0 - 1, track.0 + track.2 - KNOB + 1);
+    let knob = (knob_x, track.1 + (TRACK_H - KNOB) / 2, KNOB, KNOB);
+    page.fill(knob, LASER());
+    page.outline(knob, TEXT_BRIGHT);
+    page.text(track.0 + track.2 + 10, vy + (vh - GLYPH_H) / 2, &readout, TEXT_BRIGHT);
 }
 
-fn render_row<S: painter::Surface>(
-    surf: &mut S, row: &Row,
-    hovered: bool,
-    source: &Option<PathBuf>,
-    format: ImgFormat,
-    quality: u8,
-    resize:  ImgResize,
-) {
-    let (rx, ry, rw, rh) = row.rect;
+/// The quality a press or drag at `x` picks on the Quality row `row`: the
+/// row's value area, left edge 0 and right edge 100.
+fn quality_at(x: i32, row: Rect) -> Option<u8> {
+    let (left, _, span, _) = value_area(row);
+    if span <= 1 { return None; }
+    let t = ((x - left) as f32 / (span - 1) as f32).clamp(0.0, 1.0);
+    Some((t * 100.0).round() as u8)
+}
 
-    // Action-bar buttons.
-    if row.kind == WidgetKind::Convert {
-        let is_primary = true;
-        let border = if is_primary { LASER() } else if hovered { LASER_DIM() } else { PANEL_BORDER() };
-        let fill   = if is_primary && hovered { PRIMARY_FILL() } else if hovered { HOVER_FILL() } else { 0x0000_0000 };
-        if fill != 0 { fill_rect(surf, rx, ry, rw, rh, argb_to_framefang(fill)); }
-        stroke_rect_argb(surf, rx, ry, rw, rh, argb_to_framefang(border));
-        let tw = bitmap_font::measure(row.label, 1);
-        let tx = rx + (rw - tw) / 2;
-        let ty = ry + (rh - bitmap_font::GLYPH_H) / 2;
-        let color = if is_primary { LASER() } else { TEXT_BRIGHT };
-        draw_text(surf, tx, ty, 1, row.label, argb_to_framefang(color));
-        return;
+/// Read `src`, shrink it if asked, and save it to `dst` as `format`.
+fn write_converted(src: &Path, dst: &Path, format: ImgFormat, quality: u8, size: ImgResize) -> Result<(), String> {
+    let mut picture = image::open(src).map_err(|e| format!("Couldn't read the image: {e}"))?;
+    if let Some(d) = size.divisor() {
+        // Lanczos3 is the sharpest downscale the crate has, worth it when a
+        // 4K screenshot is being shrunk to drop into a document.
+        let (w, h) = ((picture.width() / d).max(1), (picture.height() / d).max(1));
+        picture = picture.resize(w, h, FilterType::Lanczos3);
     }
-
-    // Format + resize pills — common look, common picker.
-    let format_pill = matches!(row.kind,
-        WidgetKind::FormatPng | WidgetKind::FormatJpg
-        | WidgetKind::FormatWebp | WidgetKind::FormatBmp);
-    let resize_pill = matches!(row.kind,
-        WidgetKind::ResizeSource | WidgetKind::Resize50 | WidgetKind::Resize25);
-    if format_pill || resize_pill {
-        let selected = match row.kind {
-            WidgetKind::FormatPng  => format == ImgFormat::Png,
-            WidgetKind::FormatJpg  => format == ImgFormat::Jpg,
-            WidgetKind::FormatWebp => format == ImgFormat::Webp,
-            WidgetKind::FormatBmp  => format == ImgFormat::Bmp,
-            WidgetKind::ResizeSource => resize == ImgResize::Source,
-            WidgetKind::Resize50     => resize == ImgResize::P50,
-            WidgetKind::Resize25     => resize == ImgResize::P25,
-            _                         => false,
-        };
-        let border = if selected { LASER() } else if hovered { LASER_DIM() } else { FIELD_BORDER() };
-        let fill   = if selected { 0x000c_2820 } else if hovered { HOVER_FILL() } else { FIELD_BG() };
-        fill_rect(surf, rx, ry, rw, rh, argb_to_framefang(fill));
-        stroke_rect_argb(surf, rx, ry, rw, rh, argb_to_framefang(border));
-        // Format keeps the big 2x label; resize uses scale=1 so the
-        // secondary control is visually subordinate to the format choice.
-        let label_scale = if format_pill { 2 } else { 1 };
-        let tw = bitmap_font::measure(row.label, label_scale);
-        let tx = rx + (rw - tw) / 2;
-        let ty = ry + (rh - bitmap_font::GLYPH_H * label_scale) / 2;
-        let color = if selected { LASER() } else { TEXT_BRIGHT };
-        draw_text(surf, tx, ty, label_scale, row.label, argb_to_framefang(color));
-        return;
-    }
-
-    // Setting rows (Source, Quality) — label on the left.
-    if hovered && row.kind == WidgetKind::Source {
-        fill_rect(surf, rx, ry, rw, rh, argb_to_framefang(HOVER_FILL()));
-    }
-    let label_y = ry + (rh - bitmap_font::GLYPH_H) / 2;
-    draw_text(surf, rx + 6, label_y, 1, row.label, argb_to_framefang(TEXT_BRIGHT));
-
-    let val_x = rx + LABEL_W;
-    let val_w = rw - LABEL_W - 4;
-    let val_y = ry + 4;
-    let val_h = rh - 8;
-
-    match row.kind {
-        WidgetKind::Source => {
-            let browse_w = 90;
-            let path_w   = val_w - browse_w - 8;
-            fill_rect(surf, val_x, val_y, path_w, val_h, argb_to_framefang(FIELD_BG()));
-            stroke_rect_argb(surf, val_x, val_y, path_w, val_h, argb_to_framefang(FIELD_BORDER()));
-            let val = source.as_ref()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|| "(pick an image)".to_owned());
-            let truncated = truncate_for(&val, path_w - 14);
-            let ty = val_y + (val_h - bitmap_font::GLYPH_H) / 2;
-            let color = if source.is_some() { TEXT_BRIGHT } else { TEXT_DIM() };
-            draw_text(surf, val_x + 7, ty, 1, &truncated, argb_to_framefang(color));
-            let bx = val_x + path_w + 8;
-            let by = val_y;
-            let bw = browse_w;
-            let bh = val_h;
-            stroke_rect_argb(surf, bx, by, bw, bh, argb_to_framefang(if hovered { LASER_DIM() } else { FIELD_BORDER() }));
-            let label = "Browse...";
-            let tw = bitmap_font::measure(label, 1);
-            let tx = bx + (bw - tw) / 2;
-            let ty = by + (bh - bitmap_font::GLYPH_H) / 2;
-            draw_text(surf, tx, ty, 1, label, argb_to_framefang(TEXT_BRIGHT));
+    let saved = match format {
+        // Both encoders are always built in; the extension picks which.
+        ImgFormat::Png | ImgFormat::Bmp => picture.save(dst).map_err(|e| e.to_string()),
+        ImgFormat::Jpg => {
+            let rgb = picture.to_rgb8();
+            let mut bytes = Vec::new();
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, quality)
+                .encode(rgb.as_raw(), rgb.width(), rgb.height(), image::ExtendedColorType::Rgb8)
+                .map_err(|e| e.to_string())
+                .and_then(|()| std::fs::write(dst, &bytes).map_err(|e| e.to_string()))
         }
-        WidgetKind::Quality => {
-            let enabled = format.supports_quality();
-            let label_color = if enabled { TEXT_BRIGHT } else { TEXT_DIM() };
-            draw_text(surf, rx + 6, label_y, 1, row.label, argb_to_framefang(label_color));
-            let val_label = if enabled { format!("{}%", quality) } else { "n/a".to_owned() };
-            let label_w   = bitmap_font::measure(&val_label, 1);
-            let track_pad_r = label_w + 14;
-            let track_x = val_x + 4;
-            let track_w = val_w - 8 - track_pad_r;
-            let track_h = 6;
-            let track_y = val_y + (val_h - track_h) / 2;
-            fill_rect(surf, track_x, track_y, track_w, track_h, argb_to_framefang(FIELD_BG()));
-            stroke_rect_argb(surf, track_x, track_y, track_w, track_h, argb_to_framefang(FIELD_BORDER()));
-            if enabled {
-                let t = (quality as f32 / 100.0).clamp(0.0, 1.0);
-                let fill_w = (track_w as f32 * t).round() as i32;
-                if fill_w > 0 { fill_rect(surf, track_x, track_y, fill_w, track_h, argb_to_framefang(LASER_DIM())); }
-                let knob_w = 14;
-                let knob_h = 14;
-                let kx = track_x + ((track_w - 1) as f32 * t).round() as i32 - knob_w / 2;
-                let kx = kx.clamp(track_x - 1, track_x + track_w - knob_w + 1);
-                let ky = track_y + (track_h - knob_h) / 2;
-                fill_rect(surf, kx, ky, knob_w, knob_h, argb_to_framefang(LASER()));
-                stroke_rect_argb(surf, kx, ky, knob_w, knob_h, argb_to_framefang(TEXT_BRIGHT));
-            }
-            let lx = track_x + track_w + 10;
-            let ly = val_y + (val_h - bitmap_font::GLYPH_H) / 2;
-            draw_text(surf, lx, ly, 1, &val_label, argb_to_framefang(label_color));
-        }
-        _ => {}
-    }
-}
-
-// ── tiny rendering helpers ──────────────────────────────────────────────────
-
-struct BufferSurface<'a> {
-    buf: &'a mut [u32],
-    w:   i32,
-    h:   i32,
-}
-
-impl painter::Surface for BufferSurface<'_> {
-    fn width(&self)  -> i32 { self.w }
-    fn height(&self) -> i32 { self.h }
-    fn read(&self, x: i32, y: i32) -> [u8; 4] {
-        if x < 0 || y < 0 || x >= self.w || y >= self.h { return [0, 0, 0, 0xFF]; }
-        let p = self.buf[(y as usize) * (self.w as usize) + (x as usize)];
-        [((p >> 16) & 0xFF) as u8, ((p >> 8) & 0xFF) as u8, (p & 0xFF) as u8, 0xFF]
-    }
-    fn write(&mut self, x: i32, y: i32, rgba: [u8; 4]) {
-        if x < 0 || y < 0 || x >= self.w || y >= self.h { return; }
-        let dst = (y as usize) * (self.w as usize) + (x as usize);
-        self.buf[dst] = ((rgba[0] as u32) << 16) | ((rgba[1] as u32) << 8) | rgba[2] as u32;
-    }
-}
-
-fn argb_to_framefang(argb: u32) -> FramefangRgba {
-    FramefangRgba {
-        r: ((argb >> 16) & 0xFF) as u8,
-        g: ((argb >>  8) & 0xFF) as u8,
-        b: ( argb        & 0xFF) as u8,
-        a: 255,
-    }
-}
-
-
-fn fill_rect<S: painter::Surface>(s: &mut S, x: i32, y: i32, w: i32, h: i32, color: FramefangRgba) {
-    let rgba = [color.r, color.g, color.b, color.a];
-    for yy in y..y + h { for xx in x..x + w { s.write(xx, yy, rgba); } }
-}
-
-fn stroke_rect_argb<S: painter::Surface>(s: &mut S, x: i32, y: i32, w: i32, h: i32, color: FramefangRgba) {
-    let rgba = [color.r, color.g, color.b, color.a];
-    for xx in x..x + w { s.write(xx, y, rgba); s.write(xx, y + h - 1, rgba); }
-    for yy in y..y + h { s.write(x, yy, rgba); s.write(x + w - 1, yy, rgba); }
-}
-
-fn draw_text<S: painter::Surface>(s: &mut S, x: i32, y: i32, scale: i32, text: &str, color: FramefangRgba) {
-    painter::draw_text(s, x, y, scale, text, color);
-}
-
-/// Compute the top-left corner that centers a `(w, h)` window on the
-/// primary monitor. Falls back to (140, 140) if no monitor info is
-/// available (headless, very early in WM bring-up, etc).
-fn centered_origin(loop_target: &ActiveEventLoop, w: u32, h: u32) -> (i32, i32) {
-    let primary = loop_target.primary_monitor()
-        .or_else(|| loop_target.available_monitors().next());
-    let (mon_x, mon_y, mon_w, mon_h) = match primary {
-        Some(m) => {
-            let pos  = m.position();
-            let size = m.size();
-            (pos.x as i32, pos.y as i32, size.width as i32, size.height as i32)
-        }
-        None => (0, 0, 1920, 1080),
+        // The crate's WEBP encoder is lossless only, so the slider shows
+        // but has no effect here yet.
+        ImgFormat::Webp => picture.save_with_format(dst, image::ImageFormat::WebP).map_err(|e| e.to_string()),
     };
-    let x = mon_x + (mon_w - w as i32) / 2;
-    let y = mon_y + (mon_h - h as i32) / 2;
-    (x.max(mon_x), y.max(mon_y))
+    saved.map_err(|e| format!("Couldn't save the image: {e}"))
 }
 
-/// Shrink `s` until it fits in `max_px` at scale 1, eliding the middle instead
-/// of the tail: these fields mostly hold filesystem paths, and the leaf name at
-/// the end is the part worth reading.
-fn truncate_for(s: &str, max_px: i32) -> String {
-    if bitmap_font::measure(s, 1) <= max_px { return s.to_owned(); }
-    let ellipsis = "..";
-    // A glyph advances GLYPH_W plus the one-pixel gap that follows it; `measure`
-    // drops that gap only after the very last glyph, so a run of `n` chars is
-    // `n * advance - 1` wide and `n` chars fit while `n * advance - 1 <= max_px`.
-    let advance = bitmap_font::GLYPH_W + 1;
-    let fits = (max_px + 1) / advance;
-    let ell_n = ellipsis.chars().count() as i32;
-    if fits <= ell_n {
-        return ellipsis.chars().take(fits.max(0) as usize).collect();
+// ── Shared by both Convert dialogs ──────────────────────────────────────────
+
+/// Space between the body's edges and its content.
+pub(crate) const EDGE: i32 = 24;
+/// The first group's controls; its heading sits `HEADING_LIFT` above.
+const FIRST_ROW_Y: i32 = 44;
+const HEADING_LIFT: i32 = 22;
+/// From the bottom of one group's controls to the top of the next group's.
+const GROUP_GAP: i32 = 40;
+/// A file field row.
+const FIELD_H: i32 = 36;
+/// The width of a field row's name, before its value starts.
+const LABEL_W: i32 = 150;
+const PILL_H: i32 = 46;
+const PILL_GAP: i32 = 14;
+const BROWSE_W: i32 = 90;
+const BTN_H: i32 = 34;
+const CONVERT_W: i32 = 140;
+/// Behind the chosen pill.
+const PICKED_FILL: u32 = 0x000C_2820;
+
+/// A column of numbered groups, each a heading with its controls under it.
+pub(crate) struct Form<C> {
+    left: i32,
+    span: i32,
+    next_y: i32,
+    groups: Vec<(&'static str, Vec<(C, Rect)>)>,
+}
+
+impl<C: Copy + PartialEq> Form<C> {
+    /// An empty column filling a card `card_w` wide.
+    pub(crate) fn new(card_w: u32) -> Self {
+        Form { left: EDGE, span: card_w as i32 - 2 * EDGE, next_y: FIRST_ROW_Y, groups: Vec::new() }
     }
-    // Split the remaining budget two-thirds in favour of the tail.
-    let keep = fits - ell_n;
-    let tail = (keep * 2 / 3).max(1) as usize;
-    let head = keep as usize - tail;
-    // `fits < s.chars().count()` here (the early return covers the rest), so the
-    // head and tail slices can never overlap.
-    let chars: Vec<char> = s.chars().collect();
-    let mut out: String = chars[..head].iter().collect();
-    out.push_str(ellipsis);
-    out.extend(&chars[chars.len() - tail..]);
-    out
+
+    fn group(mut self, title: &'static str, items: Vec<(C, Rect)>, h: i32) -> Self {
+        self.groups.push((title, items));
+        self.next_y += h + GROUP_GAP;
+        self
+    }
+
+    /// A group holding one full-width field row.
+    pub(crate) fn field(self, title: &'static str, control: C) -> Self {
+        let r = (self.left, self.next_y, self.span, FIELD_H);
+        self.group(title, vec![(control, r)], FIELD_H)
+    }
+
+    /// A group of equal pills side by side across the full width.
+    pub(crate) fn pills(self, title: &'static str, controls: &[C]) -> Self {
+        let n = controls.len() as i32;
+        let w = (self.span - PILL_GAP * (n - 1)) / n;
+        let items = controls.iter().zip(0..)
+            .map(|(&c, i)| (c, (self.left + i * (w + PILL_GAP), self.next_y, w, PILL_H)))
+            .collect();
+        self.group(title, items, PILL_H)
+    }
+
+    pub(crate) fn rect_of(&self, control: C) -> Option<Rect> {
+        self.items().find(|&(c, _)| c == control).map(|(_, r)| r)
+    }
+
+    /// The shown control under `p`.
+    pub(crate) fn hit(&self, p: (i32, i32), shows: impl Fn(C) -> bool) -> Option<C> {
+        self.items().find(|&(c, r)| shows(c) && inside(r, p)).map(|(c, _)| c)
+    }
+
+    /// Draw every shown group: its heading, numbered among the shown ones,
+    /// then each control through `draw`. A group is shown when its first
+    /// control is.
+    pub(crate) fn paint(&self, page: &mut Page, shows: impl Fn(C) -> bool, mut draw: impl FnMut(&mut Page, C, Rect)) {
+        let mut number = 0;
+        for (title, items) in &self.groups {
+            let Some(&(first, r)) = items.first() else { continue };
+            if !shows(first) { continue; }
+            number += 1;
+            page.section(self.left, self.left + self.span, r.1 - HEADING_LIFT, number, title);
+            for &(c, r) in items.iter().filter(|(c, _)| shows(*c)) {
+                draw(page, c, r);
+            }
+        }
+    }
+
+    fn items(&self) -> impl Iterator<Item = (C, Rect)> + '_ {
+        self.groups.iter().flat_map(|(_, items)| items.iter().copied())
+    }
+}
+
+/// Where a Convert dialog's main button goes: the bottom-right corner.
+pub(crate) fn convert_button(card: (u32, u32)) -> Rect {
+    (card.0 as i32 - EDGE - CONVERT_W, card.1 as i32 - EDGE - BTN_H, CONVERT_W, BTN_H)
+}
+
+/// A choice pill: filled and lettered in the accent when chosen. `big`
+/// letters are for the main choice (the format), so the other rows read
+/// as secondary.
+pub(crate) fn draw_pill(page: &mut Page, r: Rect, caption: &str, big: bool, chosen: bool, hovered: bool) {
+    let (fill, edge, ink) = if chosen {
+        (PICKED_FILL, LASER(), LASER())
+    } else if hovered {
+        (HOVER_FILL(), LASER_DIM(), TEXT_BRIGHT)
+    } else {
+        (FIELD_BG(), FIELD_BORDER(), TEXT_BRIGHT)
+    };
+    page.fill(r, fill);
+    page.outline(r, edge);
+    page.centered(r, caption, if big { 2 } else { 1 }, ink);
+}
+
+/// The value part of a field row: right of its name, inset a little.
+fn value_area(r: Rect) -> Rect { (r.0 + LABEL_W, r.1 + 4, r.2 - LABEL_W - 4, r.3 - 8) }
+
+/// The file row: its name, the chosen path (or `placeholder`) in a field,
+/// and a Browse button. The whole row is one click target.
+pub(crate) fn draw_source(page: &mut Page, r: Rect, caption: &str, chosen: Option<&Path>, placeholder: &str, hovered: bool) {
+    if hovered { page.fill(r, HOVER_FILL()); }
+    page.text(r.0 + 6, r.1 + (r.3 - GLYPH_H) / 2, caption, TEXT_BRIGHT);
+    let (x, y, w, h) = value_area(r);
+    let field = (x, y, w - BROWSE_W - 8, h);
+    page.fill(field, FIELD_BG());
+    page.outline(field, FIELD_BORDER());
+    let (shown, ink) = match chosen {
+        Some(p) => (p.to_string_lossy().into_owned(), TEXT_BRIGHT),
+        None => (placeholder.to_owned(), TEXT_DIM()),
+    };
+    page.text(x + 7, y + (h - GLYPH_H) / 2, &fit_middle(&shown, field.2 - 14), ink);
+    let browse = (x + field.2 + 8, y, BROWSE_W, h);
+    page.outline(browse, if hovered { LASER_DIM() } else { FIELD_BORDER() });
+    page.centered(browse, "Browse...", 1, TEXT_BRIGHT);
+}
+
+/// What the last Convert press came to.
+pub(crate) enum Status {
+    Idle,
+    /// Running in the background since then.
+    Working(Instant),
+    Saved(PathBuf),
+    Failed(String),
+}
+
+impl Status {
+    /// The status line, left of the Convert button and level with it.
+    pub(crate) fn paint(&self, page: &mut Page, card: (u32, u32)) {
+        let (line, ink) = match self {
+            Status::Idle => return,
+            Status::Working(since) => {
+                let ms = since.elapsed().as_millis();
+                let dots = ".".repeat((ms / 400 % 4) as usize);
+                (format!("working{dots}  {}s  (keep using the app meanwhile)", ms / 1000), TEXT_MUTED())
+            }
+            Status::Saved(path) => (format!("Saved to {}", path.display()), OK_TINT),
+            Status::Failed(why) => (why.clone(), DANGER()),
+        };
+        let y = card.1 as i32 - EDGE - (BTN_H + GLYPH_H) / 2;
+        let room = card.0 as i32 - EDGE - CONVERT_W - 16 - EDGE;
+        page.text(EDGE, y, &fit_middle(&line, room), ink);
+    }
+}
+
+/// Where a converted copy of `src` goes: beside it, as
+/// `<stem>.framefang.<ext>`, so the original stays as it was.
+pub(crate) fn output_beside(src: &Path, ext: &str) -> PathBuf {
+    let stem = src.file_stem().map_or_else(|| "framefang".into(), |s| s.to_string_lossy());
+    let folder = src.parent().map_or_else(std::env::temp_dir, Path::to_path_buf);
+    folder.join(format!("{stem}.framefang.{ext}"))
+}
+
+/// Ask for one file with the system's picker, opening in the current
+/// file's folder, else the user's `usual` folder, else the temp folder.
+pub(crate) fn choose_file(
+    title: &str,
+    current: Option<&Path>,
+    usual: fn(&directories::UserDirs) -> Option<&Path>,
+    kind: &str,
+    extensions: &[&str],
+) -> Option<PathBuf> {
+    let start = current
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .or_else(|| directories::UserDirs::new().and_then(|dirs| usual(&dirs).map(Path::to_path_buf)))
+        .unwrap_or_else(std::env::temp_dir);
+    rfd::FileDialog::new()
+        .set_title(title)
+        .set_directory(&start)
+        .add_filter(kind, extensions)
+        .pick_file()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn layout() -> Form<Control> {
+        Form::new(CARD_W)
+            .field("INPUT", Control::Source)
+            .pills("OUTPUT FORMAT", &FORMATS.map(Control::Format))
+            .pills("SIZE", &SIZES.map(Control::Resize))
+            .field("QUALITY", Control::Quality)
+    }
+
+    #[test]
+    fn the_form_stacks_its_groups_forty_pixels_apart() {
+        let form = layout();
+        assert_eq!(form.rect_of(Control::Source), Some((24, 44, 672, 36)));
+        assert_eq!(form.rect_of(Control::Format(ImgFormat::Png)), Some((24, 120, 157, 46)));
+        assert_eq!(form.rect_of(Control::Format(ImgFormat::Bmp)), Some((24 + 3 * 171, 120, 157, 46)));
+        assert_eq!(form.rect_of(Control::Resize(ImgResize::P25)), Some((24 + 2 * 228, 206, 214, 46)));
+        assert_eq!(form.rect_of(Control::Quality), Some((24, 292, 672, 36)));
+        assert_eq!(convert_button(CARD), (556, 513, 140, 34));
+    }
+
+    #[test]
+    fn hidden_controls_take_no_clicks() {
+        let form = layout();
+        let quality = form.rect_of(Control::Quality).unwrap();
+        let p = (quality.0 + 200, quality.1 + 5);
+        assert!(form.hit(p, |_| true) == Some(Control::Quality));
+        assert!(form.hit(p, |c| c != Control::Quality).is_none());
+        // Between two pills is nothing.
+        assert!(form.hit((24 + 157 + 5, 130), |_| true).is_none());
+    }
+
+    #[test]
+    fn quality_runs_from_the_left_of_the_value_area_to_its_right() {
+        let row = (24, 292, 672, 36);
+        let (left, _, span, _) = value_area(row);
+        assert_eq!(quality_at(left, row), Some(0));
+        assert_eq!(quality_at(left - 50, row), Some(0));
+        assert_eq!(quality_at(left + span - 1, row), Some(100));
+        assert_eq!(quality_at(left + span + 50, row), Some(100));
+        assert_eq!(quality_at(left + (span - 1) / 2, row), Some(50));
+        assert_eq!(quality_at(0, (0, 0, LABEL_W + 5, 36)), None, "no room to drag in");
+        assert!(ImgFormat::Jpg.has_quality() && ImgFormat::Webp.has_quality());
+        assert!(!ImgFormat::Png.has_quality() && !ImgFormat::Bmp.has_quality());
+    }
+
+    #[test]
+    fn the_copy_goes_beside_the_original_with_a_framefang_tag() {
+        let src = Path::new("shots").join("cat.final.png");
+        assert_eq!(output_beside(&src, "webp"), Path::new("shots").join("cat.final.framefang.webp"));
+        assert_eq!(output_beside(Path::new(""), "jpg"), std::env::temp_dir().join("framefang.framefang.jpg"));
+    }
+
+    #[test]
+    fn every_format_round_trips_and_shrinks_on_request() {
+        let dir = std::env::temp_dir().join(format!("ff-convert-image-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("in.png");
+        image::RgbaImage::from_fn(16, 12, |x, y| image::Rgba([x as u8 * 15, y as u8 * 20, 90, 255]))
+            .save(&src).unwrap();
+
+        for (format, size, want, kind) in [
+            (ImgFormat::Png, ImgResize::Source, (16, 12), image::ImageFormat::Png),
+            (ImgFormat::Jpg, ImgResize::P50, (8, 6), image::ImageFormat::Jpeg),
+            (ImgFormat::Webp, ImgResize::P50, (8, 6), image::ImageFormat::WebP),
+            (ImgFormat::Bmp, ImgResize::P25, (4, 3), image::ImageFormat::Bmp),
+        ] {
+            let dst = output_beside(&src, format.ext());
+            write_converted(&src, &dst, format, 90, size).unwrap();
+            let bytes = std::fs::read(&dst).unwrap();
+            assert_eq!(image::guess_format(&bytes).unwrap(), kind, "{format:?} wrote the wrong kind of file");
+            let back = image::load_from_memory(&bytes).unwrap();
+            assert_eq!((back.width(), back.height()), want, "{format:?}");
+        }
+
+        let missing = write_converted(&dir.join("gone.png"), &dir.join("x.png"), ImgFormat::Png, 90, ImgResize::Source);
+        assert!(missing.unwrap_err().starts_with("Couldn't read the image"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn captions_fit_their_pills() {
+        let form = layout();
+        for (c, r) in form.items() {
+            let (caption, scale) = match c {
+                Control::Format(f) => (f.caption(), 2),
+                Control::Resize(s) => (s.caption(), 1),
+                _ => continue,
+            };
+            assert!(measure(caption, scale) < r.2 - 8, "{caption}");
+        }
+    }
 }

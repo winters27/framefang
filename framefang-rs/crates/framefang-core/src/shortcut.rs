@@ -1,225 +1,282 @@
-//! Rendering a [`Hotkey`] as an XDG "shortcuts" trigger string.
-//!
-//! Every platform Framefang ships on takes its global hotkey in a different
-//! alphabet. Windows and macOS take a Win32 virtual-key code (which is what
-//! `settings.json` stores) straight through `global-hotkey`. Wayland does not:
-//! there is no key grab to take, so the shortcut is *requested* from the
-//! compositor through the `org.freedesktop.portal.GlobalShortcuts` portal, and
-//! the portal describes shortcuts as strings in the [shortcuts XDG
-//! specification] — modifier names and an XKB keysym name joined by `+`:
-//!
-//! ```text
-//! CTRL+SHIFT+p        SUPER+SHIFT+s        Print
-//! ```
-//!
-//! [shortcuts XDG specification]: https://specifications.freedesktop.org/shortcuts-spec/latest/
-//!
-//! The translation is pure string work with no system call in it, so it lives
-//! here rather than in `framefang-platform`: it can then be unit-tested on any
-//! host, including the Windows and macOS CI runners that will never speak to a
-//! portal. Keep the key table in sync with `vk_to_code` in
-//! `framefang-platform::hotkey` and with `vk_label` in [`crate::settings`] —
-//! anything those accept should resolve here too, so a hotkey the rebind widget
-//! lets a user pick is a hotkey Wayland can actually be asked for.
+/*!
+Turning a [`Hotkey`] into the trigger text the XDG GlobalShortcuts portal
+understands.
 
-use crate::settings::{Hotkey, Modifiers};
+On Windows and macOS the stored Win32 virtual-key code goes straight to
+`global-hotkey`. Wayland has no global key grab, so Frame Fang has to ask the
+compositor for the shortcut through `org.freedesktop.portal.GlobalShortcuts`,
+and that portal wants a string in the
+[shortcuts XDG specification](https://specifications.freedesktop.org/shortcuts-spec/latest/):
+modifier names and one XKB keysym name, joined with `+`, such as `Print`,
+`CTRL+SHIFT+p` or `SUPER+SHIFT+s`.
 
-/// The XKB keysym name for a Win32 virtual-key code, as the shortcuts
-/// specification wants it.
-///
-/// `None` for two distinct reasons, both of which mean "can't be a trigger":
-///
-/// * the code isn't one we know how to name (the rebind widget shouldn't be
-///   able to produce these, but `settings.json` is user-editable), and
-/// * the code is a bare modifier (`VK_SHIFT`, `VK_CONTROL`, `VK_MENU`). Those
-///   are valid keys elsewhere in the codebase — `vk_to_code` maps them — but a
-///   trigger whose key half is a modifier is not a shortcut, and the portal
-///   would reject or silently drop it.
+Nothing here touches the system, which is why it sits in core instead of
+`framefang-platform`: the tests run on every CI host, including the ones that
+never see a portal. The keys named here must cover everything `vk_to_code` in
+`framefang-platform::hotkey` and `vk_label` in [`crate::settings`] accept, so
+any hotkey the rebind widget can produce can also be requested on Wayland. A
+test below holds the second half of that.
+*/
+
+use crate::settings::{Modifiers, Hotkey};
+
+/// Consecutive virtual-key codes whose keysym names are listed in order:
+/// `(first code, names)`.
+const KEY_RUNS: [(u32, &[&str]); 4] = [
+    // VK_0 to VK_9. Digits are their own keysym names.
+    (0x30, &["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]),
+    // VK_A to VK_Z. Win32 names these after the capitals, XKB after the
+    // unshifted key, hence lowercase.
+    (0x41, &[
+        "a", "b", "c", "d", "e", "f", "g", "h", "i",
+        "j", "k", "l", "m", "n", "o", "p", "q", "r",
+        "s", "t", "u", "v", "w", "x", "y", "z",
+    ]),
+    // VK_NUMPAD0 to VK_NUMPAD9.
+    (0x60, &[
+        "KP_0", "KP_1", "KP_2", "KP_3", "KP_4",
+        "KP_5", "KP_6", "KP_7", "KP_8", "KP_9",
+    ]),
+    // VK_F1 to VK_F24.
+    (0x70, &[
+        "F1",  "F2",  "F3",  "F4",  "F5",  "F6",  "F7",  "F8",
+        "F9",  "F10", "F11", "F12", "F13", "F14", "F15", "F16",
+        "F17", "F18", "F19", "F20", "F21", "F22", "F23", "F24",
+    ]),
+];
+
+/// Every other key with a keysym name, sorted by virtual-key code so it can be
+/// binary searched (a test checks the order).
+const NAMED_KEYS: &[(u32, &str)] = &[
+    (0x08, "BackSpace"),
+    (0x09, "Tab"),
+    (0x0D, "Return"),
+    (0x13, "Pause"),
+    (0x14, "Caps_Lock"),
+    (0x1B, "Escape"),
+    (0x20, "space"),
+    // X11 kept the old terminal names for the paging keys. "PageUp" is not
+    // a keysym, and a portal that checks the string would refuse it.
+    (0x21, "Prior"),
+    (0x22, "Next"),
+    (0x23, "End"),
+    (0x24, "Home"),
+    (0x25, "Left"),
+    (0x26, "Up"),
+    (0x27, "Right"),
+    (0x28, "Down"),
+    (0x2C, "Print"),
+    (0x2D, "Insert"),
+    (0x2E, "Delete"),
+    (0x5D, "Menu"),
+    // Media, browser and launcher keys go by their XFree86 names in XKB.
+    (0x5F, "XF86Sleep"),
+    (0x6A, "KP_Multiply"),
+    (0x6B, "KP_Add"),
+    (0x6D, "KP_Subtract"),
+    (0x6E, "KP_Decimal"),
+    (0x6F, "KP_Divide"),
+    (0x90, "Num_Lock"),
+    (0x91, "Scroll_Lock"),
+    (0xA6, "XF86Back"),
+    (0xA7, "XF86Forward"),
+    (0xA8, "XF86Refresh"),
+    (0xA9, "XF86Stop"),
+    (0xAA, "XF86Search"),
+    (0xAB, "XF86Favorites"),
+    (0xAC, "XF86HomePage"),
+    (0xAD, "XF86AudioMute"),
+    (0xAE, "XF86AudioLowerVolume"),
+    (0xAF, "XF86AudioRaiseVolume"),
+    (0xB0, "XF86AudioNext"),
+    (0xB1, "XF86AudioPrev"),
+    (0xB2, "XF86AudioStop"),
+    (0xB3, "XF86AudioPlay"),
+    (0xB4, "XF86Mail"),
+    (0xB5, "XF86AudioMedia"),
+    (0xB6, "XF86MyComputer"),
+    (0xB7, "XF86Calculator"),
+    // Punctuation, named for the unshifted character on a US layout.
+    (0xBA, "semicolon"),
+    (0xBB, "equal"),
+    (0xBC, "comma"),
+    (0xBD, "minus"),
+    (0xBE, "period"),
+    (0xBF, "slash"),
+    (0xC0, "grave"),
+    (0xDB, "bracketleft"),
+    (0xDC, "backslash"),
+    (0xDD, "bracketright"),
+    (0xDE, "apostrophe"),
+    // The extra key next to left Shift on European keyboards.
+    (0xE2, "less"),
+];
+
+/// Modifier names in the order the specification lists them.
+const MODIFIER_NAMES: [(Modifiers, &str); 4] = [
+    (Modifiers::CONTROL, "CTRL"),
+    (Modifiers::ALT, "ALT"),
+    (Modifiers::SHIFT, "SHIFT"),
+    (Modifiers::SUPER, "SUPER"),
+];
+
+/// The XKB keysym name the shortcuts specification expects for a Win32
+/// virtual-key code, or `None` when the code cannot be the key half of a
+/// trigger: either we have no name for it (`settings.json` can be
+/// hand-edited) or it is a bare modifier (`VK_SHIFT`, `VK_CONTROL`,
+/// `VK_MENU`). `vk_to_code` does accept those, but a shortcut whose key is a
+/// modifier is not a shortcut, and a portal would reject or quietly drop it,
+/// so they are simply absent from the tables above.
 pub fn keysym_name(vk: u32) -> Option<&'static str> {
-    /// Keysym names for `VK_0`..`VK_9` (0x30..=0x39). Digits are their own
-    /// keysym names in XKB.
-    const DIGITS: [&str; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
-    /// Keysym names for `VK_A`..`VK_Z` (0x41..=0x5A). XKB names the unshifted
-    /// letter, so these are lowercase even though the Win32 codes are named
-    /// after the capitals.
-    const LETTERS: [&str; 26] = [
-        "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m",
-        "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z",
-    ];
-    /// Keysym names for `VK_F1`..`VK_F24` (0x70..=0x87).
-    const FKEYS: [&str; 24] = [
-        "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
-        "F13", "F14", "F15", "F16", "F17", "F18", "F19", "F20", "F21", "F22", "F23", "F24",
-    ];
-    /// Keysym names for `VK_NUMPAD0`..`VK_NUMPAD9` (0x60..=0x69).
-    const KEYPAD: [&str; 10] = ["KP_0", "KP_1", "KP_2", "KP_3", "KP_4", "KP_5", "KP_6", "KP_7", "KP_8", "KP_9"];
-
-    Some(match vk {
-        0x08 => "BackSpace",
-        0x09 => "Tab",
-        0x0D => "Return",
-        0x13 => "Pause",
-        0x14 => "Caps_Lock",
-        0x1B => "Escape",
-        0x20 => "space",
-        // X11 kept the pre-PC names for the paging keys; "PageUp" is not a
-        // keysym and a portal that validates the string will refuse it.
-        0x21 => "Prior",
-        0x22 => "Next",
-        0x23 => "End",
-        0x24 => "Home",
-        0x25 => "Left",
-        0x26 => "Up",
-        0x27 => "Right",
-        0x28 => "Down",
-        0x2C => "Print",
-        0x2D => "Insert",
-        0x2E => "Delete",
-        0x91 => "Scroll_Lock",
-        0x30..=0x39 => DIGITS[(vk - 0x30) as usize],
-        0x41..=0x5A => LETTERS[(vk - 0x41) as usize],
-        0x70..=0x87 => FKEYS[(vk - 0x70) as usize],
-        0x60..=0x69 => KEYPAD[(vk - 0x60) as usize],
-        0x6A => "KP_Multiply",
-        0x6B => "KP_Add",
-        0x6D => "KP_Subtract",
-        0x6E => "KP_Decimal",
-        0x6F => "KP_Divide",
-        0x90 => "Num_Lock",
-        0x5D => "Menu",
-        // Media, browser and launch keys carry XFree86 names in XKB.
-        0x5F => "XF86Sleep",
-        0xA6 => "XF86Back",
-        0xA7 => "XF86Forward",
-        0xA8 => "XF86Refresh",
-        0xA9 => "XF86Stop",
-        0xAA => "XF86Search",
-        0xAB => "XF86Favorites",
-        0xAC => "XF86HomePage",
-        0xAD => "XF86AudioMute",
-        0xAE => "XF86AudioLowerVolume",
-        0xAF => "XF86AudioRaiseVolume",
-        0xB0 => "XF86AudioNext",
-        0xB1 => "XF86AudioPrev",
-        0xB2 => "XF86AudioStop",
-        0xB3 => "XF86AudioPlay",
-        0xB4 => "XF86Mail",
-        0xB5 => "XF86AudioMedia",
-        0xB6 => "XF86MyComputer",
-        0xB7 => "XF86Calculator",
-        // Punctuation: the unshifted keysym on a US layout.
-        0xBA => "semicolon",
-        0xBB => "equal",
-        0xBC => "comma",
-        0xBD => "minus",
-        0xBE => "period",
-        0xBF => "slash",
-        0xC0 => "grave",
-        0xDB => "bracketleft",
-        0xDC => "backslash",
-        0xDD => "bracketright",
-        0xDE => "apostrophe",
-        // The extra key beside left Shift on European keyboards.
-        0xE2 => "less",
-        _ => return None,
+    let from_run = KEY_RUNS.iter().find_map(|&(first, names)| {
+        let offset = vk.checked_sub(first)?;
+        names.get(usize::try_from(offset).ok()?).copied()
+    });
+    from_run.or_else(|| {
+        NAMED_KEYS
+            .binary_search_by_key(&vk, |&(code, _)| code)
+            .ok()
+            .map(|at| NAMED_KEYS[at].1)
     })
 }
 
-/// Render `hk` as a shortcuts-specification trigger string, or `None` when its
-/// key half has no keysym name (see [`keysym_name`]).
-///
-/// Modifiers are emitted in the specification's own listing order — CTRL, ALT,
-/// SHIFT, SUPER — rather than the Windows-facing order [`Modifiers::describe`]
-/// uses. Nothing parses the string back, but compositors show it to the user in
-/// their shortcut settings, and matching the spec's order is what makes it look
-/// like every other shortcut in that list.
-///
-/// A trigger with no modifiers at all is legal (`Print` is the Linux default),
-/// so an empty modifier set yields the bare key name rather than `None`.
+/// The trigger string for `hk`, or `None` when its key has no keysym name
+/// (see [`keysym_name`]). Modifiers come out in the specification's order
+/// (CTRL, ALT, SHIFT, SUPER), not the order [`Modifiers::describe`] uses for
+/// Windows: nothing parses the string back, but compositors show it in their
+/// shortcut settings, and the spec order makes it look like its neighbours
+/// there. No modifiers at all is fine (`Print` is the Linux default) and
+/// gives just the key name.
 pub fn portal_trigger(hk: &Hotkey) -> Option<String> {
-    let key = keysym_name(hk.virtual_key)?;
-    let mut parts: Vec<&str> = Vec::with_capacity(5);
-    if hk.modifiers.contains(Modifiers::CONTROL) { parts.push("CTRL"); }
-    if hk.modifiers.contains(Modifiers::ALT)     { parts.push("ALT"); }
-    if hk.modifiers.contains(Modifiers::SHIFT)   { parts.push("SHIFT"); }
-    if hk.modifiers.contains(Modifiers::SUPER)   { parts.push("SUPER"); }
-    parts.push(key);
-    Some(parts.join("+"))
+    let key_name = keysym_name(hk.virtual_key)?;
+    let mut trigger = String::with_capacity(24);
+    for (flag, name) in MODIFIER_NAMES {
+        if hk.modifiers.contains(flag) {
+            trigger.push_str(name);
+            trigger.push('+');
+        }
+    }
+    trigger.push_str(key_name);
+    Some(trigger)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod checks {
+    use super::{keysym_name, portal_trigger, Hotkey, Modifiers, KEY_RUNS, NAMED_KEYS};
+    use crate::settings::vk_label;
 
-    fn hk(mods: Modifiers, vk: u32) -> Hotkey {
-        Hotkey { modifiers: mods, virtual_key: vk }
+    /// `VK_SHIFT`, `VK_CONTROL` and `VK_MENU`.
+    const BARE_MODIFIERS: [u32; 3] = [0x10, 0x11, 0x12];
+
+    fn trigger(modifiers: Modifiers, virtual_key: u32) -> Option<String> {
+        portal_trigger(&Hotkey { modifiers, virtual_key })
     }
 
     #[test]
-    fn bare_key_needs_no_modifiers() {
-        // The Linux/Windows default hotkey is an unmodified Print Screen.
-        assert_eq!(portal_trigger(&hk(Modifiers::empty(), 0x2C)).unwrap(), "Print");
+    fn print_screen_alone_is_a_valid_trigger() {
+        // The Linux and Windows default is Print Screen with no modifiers.
+        assert_eq!(trigger(Modifiers::empty(), 0x2C).as_deref(), Some("Print"));
     }
 
     #[test]
-    fn modifiers_render_in_spec_order() {
-        // Requested in a deliberately "wrong" order to prove the output order
-        // comes from the renderer and not from the caller.
-        let all = Modifiers::SUPER | Modifiers::SHIFT | Modifiers::ALT | Modifiers::CONTROL;
-        assert_eq!(portal_trigger(&hk(all, 0x50)).unwrap(), "CTRL+ALT+SHIFT+SUPER+p");
+    fn modifier_order_comes_from_the_spec_not_the_caller() {
+        let every = Modifiers::SUPER | Modifiers::SHIFT | Modifiers::ALT | Modifiers::CONTROL;
+        assert_eq!(trigger(every, 0x50).as_deref(), Some("CTRL+ALT+SHIFT+SUPER+p"));
+        assert_eq!(
+            trigger(Modifiers::SUPER | Modifiers::SHIFT, 0x53).as_deref(),
+            Some("SHIFT+SUPER+s")
+        );
     }
 
     #[test]
-    fn letters_are_lowercase_keysyms() {
-        // Win32 names the codes after capitals; XKB names the unshifted key.
-        assert_eq!(portal_trigger(&hk(Modifiers::CONTROL, 0x41)).unwrap(), "CTRL+a");
-        assert_eq!(portal_trigger(&hk(Modifiers::CONTROL, 0x5A)).unwrap(), "CTRL+z");
+    fn letter_keys_use_lowercase_keysyms() {
+        assert_eq!(trigger(Modifiers::CONTROL, 0x41).as_deref(), Some("CTRL+a"));
+        assert_eq!(trigger(Modifiers::CONTROL, 0x5A).as_deref(), Some("CTRL+z"));
     }
 
     #[test]
-    fn digits_and_function_keys_span_their_whole_range() {
-        assert_eq!(keysym_name(0x30), Some("0"));
-        assert_eq!(keysym_name(0x39), Some("9"));
-        assert_eq!(keysym_name(0x70), Some("F1"));
-        assert_eq!(keysym_name(0x7B), Some("F12"));
-    }
-
-    #[test]
-    fn paging_keys_use_the_x11_names() {
-        // "PageUp"/"PageDown" are the Windows labels, not keysyms — emitting
-        // them would produce a trigger no compositor can bind.
-        assert_eq!(keysym_name(0x21), Some("Prior"));
-        assert_eq!(keysym_name(0x22), Some("Next"));
-    }
-
-    #[test]
-    fn bare_modifiers_are_not_triggers() {
-        // `vk_to_code` maps these to real `Code`s, so the only thing stopping a
-        // hand-edited settings.json from asking for "SHIFT" alone is this.
-        for vk in [0x10u32, 0x11, 0x12] {
-            assert_eq!(keysym_name(vk), None, "vk 0x{vk:02X} should not be a trigger key");
-            assert_eq!(portal_trigger(&hk(Modifiers::CONTROL, vk)), None);
+    fn each_run_covers_its_whole_range_and_stops() {
+        let edges = [
+            (0x30, Some("0")),
+            (0x39, Some("9")),
+            (0x3A, None),
+            (0x5B, None),
+            (0x60, Some("KP_0")),
+            (0x69, Some("KP_9")),
+            (0x70, Some("F1")),
+            (0x7B, Some("F12")),
+            (0x87, Some("F24")),
+            (0x88, None),
+        ];
+        for (vk, name) in edges {
+            assert_eq!(keysym_name(vk), name, "vk 0x{vk:02X}");
         }
     }
 
     #[test]
-    fn unknown_key_has_no_trigger() {
-        // 0xFF is not in any of the ranges; the caller must fall back to an
-        // error rather than sending the portal a string it invented.
-        assert_eq!(portal_trigger(&hk(Modifiers::CONTROL, 0xFF)), None);
+    fn paging_keys_get_their_x11_names() {
+        // The Windows labels are PageUp and PageDown, which are not keysyms.
+        assert_eq!([keysym_name(0x21), keysym_name(0x22)], [Some("Prior"), Some("Next")]);
     }
 
     #[test]
-    fn every_labelled_key_can_be_a_trigger() {
-        // The rebind widget only offers keys `vk_label` can name. If one of
-        // those has no keysym here, a user could pick a hotkey that works on
-        // X11 and silently can't be requested on Wayland.
-        for vk in 0u32..=0xFF {
-            if matches!(vk, 0x10 | 0x11 | 0x12) { continue; } // bare modifiers
-            if crate::settings::vk_label(vk).is_some() {
-                assert!(keysym_name(vk).is_some(),
-                    "vk 0x{vk:02X} has a UI label but no keysym name");
-            }
+    fn modifier_keys_cannot_be_the_trigger_key() {
+        // `vk_to_code` maps these, so this is what stops a hand-edited
+        // settings.json from asking the portal for Shift on its own.
+        for vk in BARE_MODIFIERS {
+            assert_eq!(keysym_name(vk), None, "vk 0x{vk:02X}");
+            assert_eq!(trigger(Modifiers::CONTROL, vk), None, "vk 0x{vk:02X}");
+        }
+    }
+
+    #[test]
+    fn unnamed_codes_give_no_trigger() {
+        // The caller reports an error instead of sending an invented string.
+        assert_eq!(trigger(Modifiers::CONTROL, 0xFF), None);
+        assert_eq!(trigger(Modifiers::empty(), 0), None);
+        assert_eq!(keysym_name(u32::MAX), None);
+    }
+
+    #[test]
+    fn named_key_table_is_sorted_without_duplicates() {
+        for pair in NAMED_KEYS.windows(2) {
+            assert!(pair[0].0 < pair[1].0, "0x{:02X} is out of order", pair[1].0);
+        }
+        // And no code is named twice across the tables.
+        for &(first, names) in &KEY_RUNS {
+            let last = first + names.len() as u32 - 1;
+            assert!(
+                NAMED_KEYS.iter().all(|&(code, _)| code < first || code > last),
+                "run at 0x{first:02X} overlaps the named keys"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sample_of_named_keys() {
+        let expected = [
+            (0x08, "BackSpace"),
+            (0x20, "space"),
+            (0x5D, "Menu"),
+            (0x6F, "KP_Divide"),
+            (0x91, "Scroll_Lock"),
+            (0xAD, "XF86AudioMute"),
+            (0xC0, "grave"),
+            (0xE2, "less"),
+        ];
+        for (vk, name) in expected {
+            assert_eq!(keysym_name(vk), Some(name), "vk 0x{vk:02X}");
+        }
+    }
+
+    #[test]
+    fn every_key_the_ui_can_label_has_a_keysym() {
+        // The rebind widget only offers keys `vk_label` can name. A gap here
+        // would be a hotkey that works on X11 but cannot be asked for on
+        // Wayland.
+        let labelled = (0u32..=0xFF).filter(|vk| !BARE_MODIFIERS.contains(vk) && vk_label(*vk).is_some());
+        for vk in labelled {
+            assert!(keysym_name(vk).is_some(), "vk 0x{vk:02X} has a label but no keysym");
         }
     }
 }

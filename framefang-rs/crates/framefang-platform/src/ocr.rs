@@ -134,7 +134,8 @@ pub fn read_words(img: &RgbaImage) -> Result<Vec<WordBox>, OcrError> {
 
 /// Words of a line whose box is known only as a whole, each given the share
 /// of it its characters take (spaces included).
-#[cfg_attr(windows, allow(dead_code))]
+// Only the macOS reader calls it (the tests run it everywhere).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn split_line(text: &str, (x, y, w, h): (f32, f32, f32, f32), line: usize) -> Vec<WordBox> {
     let n = text.chars().count().max(1) as f32;
     let mut out = Vec::new();

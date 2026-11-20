@@ -1,20 +1,40 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-                        "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Bundle description for Frame Fang.app; make-app.sh fills in the version. -->
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key>            <string>Frame Fang</string>
-  <key>CFBundleDisplayName</key>     <string>Frame Fang</string>
-  <key>CFBundleIdentifier</key>      <string>io.github.winters27.framefang</string>
-  <key>CFBundleVersion</key>         <string>@VERSION@</string>
-  <key>CFBundleShortVersionString</key><string>@VERSION@</string>
-  <key>CFBundleExecutable</key>      <string>framefang</string>
-  <key>CFBundleIconFile</key>        <string>framefang</string>
-  <key>CFBundlePackageType</key>     <string>APPL</string>
-  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-  <key>LSMinimumSystemVersion</key>  <string>11.0</string>
-  <key>LSUIElement</key>             <true/>
-  <key>NSHighResolutionCapable</key> <true/>
-  <key>NSMicrophoneUsageDescription</key><string>Frame Fang records your microphone when you pick a microphone for a screen recording.</string>
+	<!-- Identity -->
+	<key>CFBundleIdentifier</key>
+	<string>io.github.winters27.framefang</string>
+	<key>CFBundleName</key>
+	<string>Frame Fang</string>
+	<key>CFBundleDisplayName</key>
+	<string>Frame Fang</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@VERSION@</string>
+
+	<!-- What make-app.sh copies into the bundle -->
+	<key>CFBundleExecutable</key>
+	<string>framefang</string>
+	<key>CFBundleIconFile</key>
+	<string>framefang</string>
+
+	<!-- A menu-bar app: no Dock icon, sharp on Retina, macOS 11 or later -->
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+
+	<!-- Shown by macOS the first time a recording uses the microphone -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Frame Fang records your microphone when you pick a microphone for a screen recording.</string>
 </dict>
 </plist>

@@ -1,16 +1,18 @@
-//! Polymorphic annotation hierarchy. Each variant draws into a graphics target
-//! supplied by the renderer — `framefang-app` provides the iced::Canvas backend.
+//! The marks a user draws on a capture, as plain data.
 //!
-//! Mirrors the C# `Annotation` hierarchy in `Framefang/Annotations.cs`. When you
-//! add a new annotation type, also update:
-//!  * `tool::Tool` enum
-//!  * `tool::Tool::ALL` array
-//!  * the renderer (`framefang-app/src/overlay/render.rs`)
+//! Nothing here draws anything: the app's painter turns these into pixels,
+//! and [`crate::edit`] does the click and move geometry. A new kind of mark
+//! means a new [`AnnotationKind`] variant, a new [`crate::tool::Tool`] (and
+//! its place in `Tool::ALL`), and a case in the app's painter.
+//!
+//! The serde forms of these types (field names, variant names, the shape of
+//! each variant) are a data format, so they stay as they are.
 
 use serde::{Deserialize, Serialize};
 
 use crate::color::Rgba;
 
+/// A point on the canvas, in canvas pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Point2 {
     pub x: f32,
@@ -18,9 +20,10 @@ pub struct Point2 {
 }
 
 impl Point2 {
-    pub const fn new(x: f32, y: f32) -> Self { Self { x, y } }
+    pub const fn new(x: f32, y: f32) -> Self { Point2 { x, y } }
 }
 
+/// An upright rectangle: its top left corner and its size.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Rect {
     pub x: f32,
@@ -30,253 +33,288 @@ pub struct Rect {
 }
 
 impl Rect {
+    /// The rectangle with `a` and `b` as opposite corners, whichever way
+    /// round they were given.
     pub fn from_corners(a: Point2, b: Point2) -> Self {
-        let x = a.x.min(b.x);
-        let y = a.y.min(b.y);
-        Rect { x, y, w: (b.x - a.x).abs(), h: (b.y - a.y).abs() }
+        Rect {
+            x: a.x.min(b.x),
+            y: a.y.min(b.y),
+            w: (b.x - a.x).abs(),
+            h: (b.y - a.y).abs(),
+        }
     }
 
+    /// Whether `p` is inside, edges included.
     pub fn contains(self, p: Point2) -> bool {
-        p.x >= self.x && p.x <= self.x + self.w && p.y >= self.y && p.y <= self.y + self.h
+        let inside_x = p.x >= self.x && p.x <= self.x + self.w;
+        let inside_y = p.y >= self.y && p.y <= self.y + self.h;
+        inside_x && inside_y
     }
 
+    /// Whether it has no area: a side of zero or less.
     pub fn is_empty(self) -> bool {
-        self.w <= 0.0 || self.h <= 0.0
+        self.w.min(self.h) <= 0.0
     }
 }
 
-/// Common style fields shared across most annotations.
+/// The colour and width of a drawn line, shared by most kinds of mark.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Stroke {
-    pub color:     Rgba,
+    pub color: Rgba,
     pub thickness: f32,
 }
 
 impl Default for Stroke {
+    /// Red, 3 px wide.
     fn default() -> Self {
-        Stroke { color: Rgba::RED, thickness: 3.0 }
+        Self { thickness: 3.0, color: Rgba::RED }
     }
 }
 
+/// What a mark is, with the points and style it needs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AnnotationKind {
-    Pen        { stroke: Stroke, points: Vec<Point2> },
-    Line       { stroke: Stroke, start: Point2, end: Point2 },
-    Arrow      { stroke: Stroke, start: Point2, end: Point2 },
-    Rectangle  { stroke: Stroke, start: Point2, end: Point2 },
-    Ellipse    { stroke: Stroke, start: Point2, end: Point2 },
-    Marker     { stroke: Stroke, points: Vec<Point2> },
-    Text       { color: Rgba, position: Point2, text: String, font_size: f32 },
-    /// Words highlighted: a rectangle per line (see [`crate::mark`]).
-    TextMark   { rects: Vec<Rect>, look: crate::mark::MarkLook },
+    /// A freehand line through every point the mouse passed.
+    Pen { stroke: Stroke, points: Vec<Point2> },
+    /// A straight line.
+    Line { stroke: Stroke, start: Point2, end: Point2 },
+    /// A straight line with a head at `end`.
+    Arrow { stroke: Stroke, start: Point2, end: Point2 },
+    /// A hollow box with `start` and `end` as corners.
+    Rectangle { stroke: Stroke, start: Point2, end: Point2 },
+    /// A hollow ellipse filling the box from `start` to `end`.
+    Ellipse { stroke: Stroke, start: Point2, end: Point2 },
+    /// A freehand highlighter stroke, wide and see-through.
+    Marker { stroke: Stroke, points: Vec<Point2> },
+    /// Words typed onto the picture, `font_size` being a pixel em-size.
+    Text { color: Rgba, position: Point2, text: String, font_size: f32 },
+    /// Highlighted words: one box per line of text (see [`crate::mark`]).
+    TextMark { rects: Vec<Rect>, look: crate::mark::MarkLook },
     /// A numbered step, placed by its anchor (see [`crate::step`]).
-    Step       { center: Point2, number: u32, look: crate::step::StepLook },
-    Pixelate   { start: Point2, end: Point2, block_size: u32 },
-    /// Everything of the picture outside this rectangle (and any other
-    /// spotlight) is dimmed; ink stays bright.
-    Spotlight  { start: Point2, end: Point2 },
-    /// A round lens at `center` reaching to `edge`, showing what is drawn
-    /// under it `zoom` times larger, ringed in the stroke.
-    Magnify    { stroke: Stroke, center: Point2, edge: Point2, zoom: u32 },
+    Step { center: Point2, number: u32, look: crate::step::StepLook },
+    /// A box whose picture is blurred into blocks of `block_size` pixels.
+    Pixelate { start: Point2, end: Point2, block_size: u32 },
+    /// Dims the picture outside this box (and outside any other spotlight);
+    /// other marks stay at full brightness.
+    Spotlight { start: Point2, end: Point2 },
+    /// A round lens centred on `center` and reaching to `edge`, showing what
+    /// lies under it `zoom` times larger inside a ring drawn with `stroke`.
+    Magnify { stroke: Stroke, center: Point2, edge: Point2, zoom: u32 },
 }
 
-/// The largest lens Magnify draws: a bigger one costs every frame and shows
-/// little more.
+/// The biggest radius a Magnify lens gets. A larger lens costs time on
+/// every frame and shows hardly anything more.
 pub const MAGNIFY_MAX_RADIUS: f32 = 400.0;
 
-/// A Magnify lens's radius: from its center to the dragged edge, capped.
+/// A Magnify lens's radius: the distance from `center` to `edge`, held to
+/// [`MAGNIFY_MAX_RADIUS`].
 pub fn magnify_radius(center: Point2, edge: Point2) -> f32 {
-    ((edge.x - center.x).powi(2) + (edge.y - center.y).powi(2)).sqrt().min(MAGNIFY_MAX_RADIUS)
+    let (dx, dy) = (edge.x - center.x, edge.y - center.y);
+    (dx.powi(2) + dy.powi(2)).sqrt().min(MAGNIFY_MAX_RADIUS)
 }
 
+/// One mark on the canvas.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Annotation {
     pub kind: AnnotationKind,
-    /// Video-mode visibility window in clip seconds: start inclusive, end
-    /// exclusive. `end` may be `f32::INFINITY` for "visible until the clip
-    /// ends". `None` = whole clip — screenshot mode and the static video
-    /// default, so a session that never touches the timeline carries no
-    /// windows at all and burns exactly like before. `#[serde(default)]`
-    /// keeps any future session-file format readable across this change
-    /// (nothing persists `Annotation` today).
+    /// When a mark shows in a video, in seconds of the clip: from the first
+    /// number (included) up to the second (not included), which may be
+    /// `f32::INFINITY` for "to the end". `None` means the whole clip, which
+    /// is what screenshots and untouched video marks have, so they export
+    /// exactly as they would without a timeline. The serde default lets
+    /// data saved without this field load (no saved form of a mark exists
+    /// today, but one may).
     #[serde(default)]
     pub time: Option<(f32, f32)>,
 }
 
+impl AnnotationKind {
+    /// This kind as a mark shown for the whole clip.
+    fn into_mark(self) -> Annotation {
+        Annotation { kind: self, time: None }
+    }
+}
+
 impl Annotation {
+    /// A freehand pen line, starting as the single point `p`.
     pub fn pen(stroke: Stroke, p: Point2) -> Annotation {
-        Annotation { kind: AnnotationKind::Pen { stroke, points: vec![p] }, time: None }
-    }
-    pub fn line(stroke: Stroke, a: Point2) -> Annotation {
-        Annotation { kind: AnnotationKind::Line { stroke, start: a, end: a }, time: None }
-    }
-    pub fn arrow(stroke: Stroke, a: Point2) -> Annotation {
-        Annotation { kind: AnnotationKind::Arrow { stroke, start: a, end: a }, time: None }
-    }
-    pub fn rectangle(stroke: Stroke, a: Point2) -> Annotation {
-        Annotation { kind: AnnotationKind::Rectangle { stroke, start: a, end: a }, time: None }
-    }
-    pub fn ellipse(stroke: Stroke, a: Point2) -> Annotation {
-        Annotation { kind: AnnotationKind::Ellipse { stroke, start: a, end: a }, time: None }
-    }
-    pub fn marker(stroke: Stroke, p: Point2, alpha: u8) -> Annotation {
-        // Marker thickness is 6× the configured thickness; alpha is the
-        // user-controlled value from `AppSettings::marker_opacity` (default
-        // `0xC8`). The editor's per-tool slider mutates that setting live
-        // and passes the current value in here on every new marker stroke.
-        let stroke = Stroke {
-            thickness: stroke.thickness * 6.0,
-            color:     stroke.color.with_alpha(alpha),
-        };
-        Annotation { kind: AnnotationKind::Marker { stroke, points: vec![p] }, time: None }
-    }
-    /// Text at the default em-size. `font_size` is a pixel em-size handed
-    /// straight to the rasterizer (`crate::text`), not a point size.
-    pub fn text(color: Rgba, p: Point2, text: impl Into<String>) -> Annotation {
-        Annotation::text_sized(color, p, text, crate::text::DEFAULT_PX)
-    }
-    /// Text at an explicit em-size — the editor derives it from the current
-    /// stroke thickness via `crate::text::font_size_for_thickness`.
-    pub fn text_sized(color: Rgba, p: Point2, text: impl Into<String>, font_size: f32) -> Annotation {
-        let font_size = crate::text::clamp_px(font_size);
-        Annotation { kind: AnnotationKind::Text { color, position: p, text: text.into(), font_size }, time: None }
-    }
-    /// A plain disc step in `color`.
-    pub fn step(color: Rgba, center: Point2, number: u32) -> Annotation {
-        Annotation::step_styled(center, number, crate::step::StepLook::recipe(crate::step::StepShape::Disc, color))
-    }
-    pub fn step_styled(center: Point2, number: u32, look: crate::step::StepLook) -> Annotation {
-        Annotation { kind: AnnotationKind::Step { center, number, look }, time: None }
-    }
-    pub fn pixelate(a: Point2) -> Annotation {
-        Annotation { kind: AnnotationKind::Pixelate { start: a, end: a, block_size: 10 }, time: None }
-    }
-    pub fn spotlight(a: Point2) -> Annotation {
-        Annotation { kind: AnnotationKind::Spotlight { start: a, end: a }, time: None }
-    }
-    pub fn magnify(stroke: Stroke, center: Point2, zoom: u32) -> Annotation {
-        Annotation { kind: AnnotationKind::Magnify { stroke, center, edge: center, zoom: zoom.clamp(2, 4) }, time: None }
+        AnnotationKind::Pen { stroke, points: vec![p] }.into_mark()
     }
 
-    /// Too small to be anything the user meant: a click with Spotlight or
-    /// Magnify in hand. Dropped on release, never recorded.
+    /// A line that begins and ends at `a` until it is dragged.
+    pub fn line(stroke: Stroke, a: Point2) -> Annotation {
+        AnnotationKind::Line { stroke, start: a, end: a }.into_mark()
+    }
+
+    /// An arrow that begins and ends at `a` until it is dragged.
+    pub fn arrow(stroke: Stroke, a: Point2) -> Annotation {
+        AnnotationKind::Arrow { stroke, start: a, end: a }.into_mark()
+    }
+
+    /// A box with both corners at `a` until it is dragged.
+    pub fn rectangle(stroke: Stroke, a: Point2) -> Annotation {
+        AnnotationKind::Rectangle { stroke, start: a, end: a }.into_mark()
+    }
+
+    /// An ellipse with both box corners at `a` until it is dragged.
+    pub fn ellipse(stroke: Stroke, a: Point2) -> Annotation {
+        AnnotationKind::Ellipse { stroke, start: a, end: a }.into_mark()
+    }
+
+    /// A highlighter stroke starting at `p`. It is drawn six times as wide
+    /// as `stroke` asks, and its opacity is `alpha` whatever the colour's
+    /// own: the editor passes the Marker opacity setting
+    /// (`AppSettings::marker_opacity`) as it stands, so the slider's preview
+    /// and the finished stroke always agree.
+    pub fn marker(stroke: Stroke, p: Point2, alpha: u8) -> Annotation {
+        let wide = Stroke { color: stroke.color.with_alpha(alpha), thickness: 6.0 * stroke.thickness };
+        AnnotationKind::Marker { stroke: wide, points: vec![p] }.into_mark()
+    }
+
+    /// Text at the standard size. Sizes here are pixel em-sizes passed
+    /// straight to `crate::text`, not points.
+    pub fn text(color: Rgba, p: Point2, text: impl Into<String>) -> Annotation {
+        Self::text_sized(color, p, text, crate::text::DEFAULT_PX)
+    }
+
+    /// Text at `font_size` pixels, brought into the range the text layout
+    /// accepts (the editor picks the size from the stroke width with
+    /// `crate::text::font_size_for_thickness`).
+    pub fn text_sized(color: Rgba, p: Point2, text: impl Into<String>, font_size: f32) -> Annotation {
+        AnnotationKind::Text {
+            color,
+            position: p,
+            text: text.into(),
+            font_size: crate::text::clamp_px(font_size),
+        }
+        .into_mark()
+    }
+
+    /// A step drawn as a plain disc of `color`.
+    pub fn step(color: Rgba, center: Point2, number: u32) -> Annotation {
+        let disc = crate::step::StepLook::recipe(crate::step::StepShape::Disc, color);
+        Self::step_styled(center, number, disc)
+    }
+
+    /// A step with a chosen look.
+    pub fn step_styled(center: Point2, number: u32, look: crate::step::StepLook) -> Annotation {
+        AnnotationKind::Step { center, number, look }.into_mark()
+    }
+
+    /// A blur box starting at `a`, with 10 px blocks.
+    pub fn pixelate(a: Point2) -> Annotation {
+        AnnotationKind::Pixelate { start: a, end: a, block_size: 10 }.into_mark()
+    }
+
+    /// A spotlight box starting at `a`.
+    pub fn spotlight(a: Point2) -> Annotation {
+        AnnotationKind::Spotlight { start: a, end: a }.into_mark()
+    }
+
+    /// A lens at `center` with no size yet, enlarging by `zoom` held to 2
+    /// through 4.
+    pub fn magnify(stroke: Stroke, center: Point2, zoom: u32) -> Annotation {
+        AnnotationKind::Magnify { stroke, center, edge: center, zoom: zoom.clamp(2, 4) }.into_mark()
+    }
+
+    /// Whether the mark is too small to be on purpose: a click, rather than
+    /// a drag, with Spotlight or Magnify. Such a mark is thrown away when
+    /// the mouse is let go and never reaches the undo history.
     pub fn is_degenerate(&self) -> bool {
         match &self.kind {
-            AnnotationKind::Spotlight { start, end } => (end.x - start.x).abs() < 4.0 || (end.y - start.y).abs() < 4.0,
+            AnnotationKind::Spotlight { start, end } => {
+                let r = Rect::from_corners(*start, *end);
+                r.w < 4.0 || r.h < 4.0
+            }
             AnnotationKind::Magnify { center, edge, .. } => magnify_radius(*center, *edge) < 8.0,
             _ => false,
         }
     }
 
-    /// Update the in-progress annotation with the latest mouse position.
+    /// Follow the mouse to `p` while the mark is being drawn: freehand marks
+    /// gain a point, dragged shapes move their far corner, and a lens grows
+    /// to reach it. Text and steps are placed by a click and ignore this,
+    /// as does a highlight, whose words the editor fills in itself.
     pub fn extend(&mut self, p: Point2) {
+        use AnnotationKind as K;
         match &mut self.kind {
-            AnnotationKind::Pen { points, .. }      => points.push(p),
-            AnnotationKind::Marker { points, .. }   => points.push(p),
-            AnnotationKind::Line { end, .. }        => *end = p,
-            AnnotationKind::Arrow { end, .. }       => *end = p,
-            AnnotationKind::Rectangle { end, .. }   => *end = p,
-            AnnotationKind::Ellipse { end, .. }     => *end = p,
-            AnnotationKind::Pixelate { end, .. }    => *end = p,
-            AnnotationKind::Spotlight { end, .. }   => *end = p,
-            AnnotationKind::Magnify { edge, .. }    => *edge = p,
-            AnnotationKind::Text { .. }             => {}
-            AnnotationKind::Step { .. }             => {}
-            // The editor sets its words as the drag goes.
-            AnnotationKind::TextMark { .. }         => {}
+            K::Pen { points, .. } | K::Marker { points, .. } => points.push(p),
+            K::Line { end, .. }
+            | K::Arrow { end, .. }
+            | K::Rectangle { end, .. }
+            | K::Ellipse { end, .. }
+            | K::Pixelate { end, .. }
+            | K::Spotlight { end, .. }
+            | K::Magnify { edge: end, .. } => *end = p,
+            K::Text { .. } | K::Step { .. } | K::TextMark { .. } => {}
         }
     }
 }
 
-// ── Color palettes ─────────────────────────────────────────────────────────
-
+/// A named set of 16 swatches for the toolbar.
 #[derive(Debug, Clone)]
 pub struct ColorPalette {
-    pub name:   &'static str,
+    pub name: &'static str,
     pub colors: [Rgba; 16],
 }
 
+/// An opaque colour from a `0xRRGGBB` number.
+const fn rgb(hex: u32) -> Rgba {
+    Rgba::new_opaque((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
+}
+
+/// A highlighter swatch from a `0xRRGGBB` number: two thirds opaque.
+const fn tint(hex: u32) -> Rgba {
+    Rgba::new((hex >> 16) as u8, (hex >> 8) as u8, hex as u8, 170)
+}
+
+/// The palettes the toolbar offers.
 pub struct Palettes;
 
 impl Palettes {
     pub const ALL: [ColorPalette; 4] = [
-        ColorPalette { name: "Vivid", colors: [
-            Rgba::new_opaque(220,  38,  38),
-            Rgba::new_opaque(255, 100,   0),
-            Rgba::new_opaque(255, 180,   0),
-            Rgba::new_opaque(255, 230,   0),
-            Rgba::new_opaque(130, 220,   0),
-            Rgba::new_opaque(  0, 180,  80),
-            Rgba::new_opaque(  0, 200, 200),
-            Rgba::new_opaque(  0, 180, 240),
-            Rgba::new_opaque(  0, 100, 255),
-            Rgba::new_opaque( 80,  80, 220),
-            Rgba::new_opaque(160,  60, 240),
-            Rgba::new_opaque(240,  60, 220),
-            Rgba::new_opaque(255, 100, 200),
-            Rgba::new_opaque(255,  80,  80),
-            Rgba::new_opaque(255, 255, 255),
-            Rgba::new_opaque(  0,   0,   0),
-        ] },
-        ColorPalette { name: "Highlighter", colors: [
-            Rgba::new(255, 235,   0, 170),
-            Rgba::new(100, 255, 100, 170),
-            Rgba::new(255, 100, 200, 170),
-            Rgba::new(100, 230, 255, 170),
-            Rgba::new(255, 150,   0, 170),
-            Rgba::new(200, 100, 255, 170),
-            Rgba::new( 50, 220,  50, 170),
-            Rgba::new(100, 150, 255, 170),
-            Rgba::new(255,  80,  80, 170),
-            Rgba::new(240,  60, 220, 170),
-            Rgba::new(  0, 200, 200, 170),
-            Rgba::new(255, 180, 100, 170),
-            Rgba::new(180, 255, 100, 170),
-            Rgba::new(100, 100, 255, 170),
-            Rgba::new(230, 230, 230, 170),
-            Rgba::new( 80,  80,  80, 170),
-        ] },
-        ColorPalette { name: "Pastel", colors: [
-            Rgba::new_opaque(255, 200, 200),
-            Rgba::new_opaque(255, 220, 180),
-            Rgba::new_opaque(255, 235, 180),
-            Rgba::new_opaque(255, 245, 200),
-            Rgba::new_opaque(230, 255, 200),
-            Rgba::new_opaque(200, 255, 220),
-            Rgba::new_opaque(200, 245, 245),
-            Rgba::new_opaque(200, 230, 255),
-            Rgba::new_opaque(200, 215, 255),
-            Rgba::new_opaque(220, 200, 255),
-            Rgba::new_opaque(240, 200, 255),
-            Rgba::new_opaque(255, 200, 235),
-            Rgba::new_opaque(255, 215, 215),
-            Rgba::new_opaque(240, 240, 240),
-            Rgba::new_opaque(200, 200, 210),
-            Rgba::new_opaque(100, 100, 110),
-        ] },
-        ColorPalette { name: "Pro", colors: [
-            Rgba::new_opaque(220,  38,  38),
-            Rgba::new_opaque( 30, 100, 220),
-            Rgba::new_opaque( 30, 160,  60),
-            Rgba::new_opaque(240, 120,   0),
-            Rgba::new_opaque(138,  43, 226),
-            Rgba::new_opaque(220, 180,   0),
-            Rgba::new_opaque(  0, 160, 200),
-            Rgba::new_opaque(200,  60, 130),
-            Rgba::new_opaque(100,  30,  30),
-            Rgba::new_opaque( 30,  30, 100),
-            Rgba::new_opaque( 30,  80,  30),
-            Rgba::new_opaque(100,  60,   0),
-            Rgba::new_opaque(  0,   0,   0),
-            Rgba::new_opaque( 80,  80,  80),
-            Rgba::new_opaque(200, 200, 200),
-            Rgba::new_opaque(255, 255, 255),
-        ] },
+        ColorPalette {
+            name: "Vivid",
+            colors: [
+                rgb(0xDC2626), rgb(0xFF6400), rgb(0xFFB400), rgb(0xFFE600),
+                rgb(0x82DC00), rgb(0x00B450), rgb(0x00C8C8), rgb(0x00B4F0),
+                rgb(0x0064FF), rgb(0x5050DC), rgb(0xA03CF0), rgb(0xF03CDC),
+                rgb(0xFF64C8), rgb(0xFF5050), rgb(0xFFFFFF), rgb(0x000000),
+            ],
+        },
+        ColorPalette {
+            name: "Highlighter",
+            colors: [
+                tint(0xFFEB00), tint(0x64FF64), tint(0xFF64C8), tint(0x64E6FF),
+                tint(0xFF9600), tint(0xC864FF), tint(0x32DC32), tint(0x6496FF),
+                tint(0xFF5050), tint(0xF03CDC), tint(0x00C8C8), tint(0xFFB464),
+                tint(0xB4FF64), tint(0x6464FF), tint(0xE6E6E6), tint(0x505050),
+            ],
+        },
+        ColorPalette {
+            name: "Pastel",
+            colors: [
+                rgb(0xFFC8C8), rgb(0xFFDCB4), rgb(0xFFEBB4), rgb(0xFFF5C8),
+                rgb(0xE6FFC8), rgb(0xC8FFDC), rgb(0xC8F5F5), rgb(0xC8E6FF),
+                rgb(0xC8D7FF), rgb(0xDCC8FF), rgb(0xF0C8FF), rgb(0xFFC8EB),
+                rgb(0xFFD7D7), rgb(0xF0F0F0), rgb(0xC8C8D2), rgb(0x64646E),
+            ],
+        },
+        ColorPalette {
+            name: "Pro",
+            colors: [
+                rgb(0xDC2626), rgb(0x1E64DC), rgb(0x1EA03C), rgb(0xF07800),
+                rgb(0x8A2BE2), rgb(0xDCB400), rgb(0x00A0C8), rgb(0xC83C82),
+                rgb(0x641E1E), rgb(0x1E1E64), rgb(0x1E501E), rgb(0x643C00),
+                rgb(0x000000), rgb(0x505050), rgb(0xC8C8C8), rgb(0xFFFFFF),
+            ],
+        },
     ];
 
+    /// The palette at `index`, or the last one when `index` is past the end.
     pub fn get(index: usize) -> &'static ColorPalette {
-        let i = index.min(Self::ALL.len() - 1);
-        &Self::ALL[i]
+        let last = Self::ALL.len() - 1;
+        &Self::ALL[index.min(last)]
     }
 }
 
@@ -284,109 +322,134 @@ impl Palettes {
 mod tests {
     use super::*;
 
+    const ORIGIN: Point2 = Point2::new(0.0, 0.0);
+
     #[test]
-    fn rect_from_corners_normalizes() {
-        let r = Rect::from_corners(Point2::new(50.0, 80.0), Point2::new(10.0, 20.0));
-        assert_eq!(r, Rect { x: 10.0, y: 20.0, w: 40.0, h: 60.0 });
+    fn corners_given_either_way_round_make_the_same_rect() {
+        let (a, b) = (Point2::new(50.0, 80.0), Point2::new(10.0, 20.0));
+        let expected = Rect { x: 10.0, y: 20.0, w: 40.0, h: 60.0 };
+        assert_eq!(Rect::from_corners(a, b), expected);
+        assert_eq!(Rect::from_corners(b, a), expected);
+        assert!(expected.contains(Point2::new(50.0, 80.0)), "edges count as inside");
+        assert!(!expected.contains(Point2::new(50.1, 80.0)));
+        assert!(Rect { x: 0.0, y: 0.0, w: 5.0, h: 0.0 }.is_empty());
     }
 
     #[test]
-    fn pen_extension_appends_points() {
-        let mut a = Annotation::pen(Stroke::default(), Point2::new(1.0, 2.0));
-        a.extend(Point2::new(3.0, 4.0));
-        a.extend(Point2::new(5.0, 6.0));
-        match a.kind {
-            AnnotationKind::Pen { points, .. } => assert_eq!(points.len(), 3),
-            _ => panic!("wrong variant"),
+    fn a_pen_line_gains_a_point_per_mouse_move() {
+        let mut pen = Annotation::pen(Stroke::default(), Point2::new(1.0, 2.0));
+        pen.extend(Point2::new(3.0, 4.0));
+        pen.extend(Point2::new(5.0, 6.0));
+        let AnnotationKind::Pen { points, .. } = &pen.kind else { panic!("not a pen line") };
+        assert_eq!(points, &[Point2::new(1.0, 2.0), Point2::new(3.0, 4.0), Point2::new(5.0, 6.0)]);
+    }
+
+    #[test]
+    fn dragged_shapes_move_only_their_far_end() {
+        let mut arrow = Annotation::arrow(Stroke::default(), ORIGIN);
+        arrow.extend(Point2::new(9.0, 9.0));
+        arrow.extend(Point2::new(20.0, 5.0));
+        let AnnotationKind::Arrow { start, end, .. } = arrow.kind else { panic!("not an arrow") };
+        assert_eq!((start, end), (ORIGIN, Point2::new(20.0, 5.0)));
+        let mut step = Annotation::step(Rgba::RED, ORIGIN, 1);
+        let before = step.clone();
+        step.extend(Point2::new(50.0, 50.0));
+        assert_eq!(step, before, "a step stays where it was clicked");
+    }
+
+    fn font_size_of(text: Annotation) -> f32 {
+        match text.kind {
+            AnnotationKind::Text { font_size, .. } => font_size,
+            other => panic!("not text: {other:?}"),
         }
     }
 
     #[test]
-    fn text_font_size_is_a_rasterizable_pixel_size() {
-        // Serialization shape is unchanged — `font_size` is still one f32 on
-        // the Text variant — but it now means pixels, and the constructors
-        // guarantee the rasterizer will accept it.
-        let p = Point2::new(0.0, 0.0);
-        match Annotation::text(Rgba::RED, p, "hi").kind {
-            AnnotationKind::Text { font_size, .. } => {
-                assert_eq!(font_size, crate::text::DEFAULT_PX);
-            }
-            _ => panic!("wrong variant"),
-        }
-        match Annotation::text_sized(Rgba::RED, p, "hi", 1.0e9).kind {
-            AnnotationKind::Text { font_size, .. } => {
-                assert_eq!(font_size, crate::text::MAX_PX);
-            }
-            _ => panic!("wrong variant"),
-        }
-        match Annotation::text_sized(Rgba::RED, p, "hi", f32::NAN).kind {
-            AnnotationKind::Text { font_size, .. } => {
-                assert_eq!(font_size, crate::text::DEFAULT_PX);
-            }
-            _ => panic!("wrong variant"),
-        }
+    fn text_sizes_are_kept_in_the_range_the_layout_accepts() {
+        // The size is a pixel em-size and always one the layout can draw.
+        assert_eq!(font_size_of(Annotation::text(Rgba::RED, ORIGIN, "hi")), crate::text::DEFAULT_PX);
+        assert_eq!(font_size_of(Annotation::text_sized(Rgba::RED, ORIGIN, "hi", 1.0e9)), crate::text::MAX_PX);
+        assert_eq!(font_size_of(Annotation::text_sized(Rgba::RED, ORIGIN, "hi", f32::NAN)), crate::text::DEFAULT_PX);
+    }
+
+    /// Order-sensitive fingerprint of a palette: changes if any swatch, or
+    /// the order of the swatches, changes.
+    fn fingerprint(palette: &ColorPalette) -> (u64, u64) {
+        palette.colors.iter().fold((0, 0), |(sum, hash), c| {
+            let (r, g, b, a) = (c.r as u64, c.g as u64, c.b as u64, c.a as u64);
+            (sum + r + g + b + a, (hash * 31 + r * 65536 + g * 256 + b + a * 7) % 1_000_000_007)
+        })
     }
 
     #[test]
-    fn palettes_have_16_colors_each() {
-        for p in Palettes::ALL.iter() { assert_eq!(p.colors.len(), 16); }
-    }
-
-    #[test]
-    fn marker_alpha_param_overrides_stroke_alpha() {
-        // The slider passes the user-chosen alpha straight through. Whatever
-        // alpha the swatch color carried is replaced by the param; only the
-        // RGB triple survives. This is what makes the slider's live preview
-        // match the eventual painted stroke.
-        let opaque = Stroke {
-            color:     Rgba::new(255, 0, 0, 0xFF),
-            thickness: 4.0,
-        };
-        let a = Annotation::marker(opaque, Point2::new(10.0, 20.0), 0x80);
-        match a.kind {
-            AnnotationKind::Marker { stroke, points } => {
-                assert_eq!(stroke.color.a, 0x80, "alpha must come from the param, not the input swatch");
-                assert_eq!(stroke.color.r, 255);
-                assert_eq!(stroke.color.g, 0);
-                assert_eq!(stroke.color.b, 0);
-                assert_eq!(stroke.thickness, 24.0, "thickness multiplier is 6×, untouched by this change");
-                assert_eq!(points, vec![Point2::new(10.0, 20.0)]);
-            }
-            _ => panic!("wrong variant"),
+    fn the_palettes_hold_the_same_sixteen_swatches_as_ever() {
+        let names: Vec<_> = Palettes::ALL.iter().map(|p| p.name).collect();
+        assert_eq!(names, ["Vivid", "Highlighter", "Pastel", "Pro"]);
+        let expected = [(10531, 274714184), (10380, 662982351), (14550, 920443298), (9118, 356128239)];
+        for (palette, want) in Palettes::ALL.iter().zip(expected) {
+            assert_eq!(palette.colors.len(), 16);
+            assert_eq!(fingerprint(palette), want, "{} changed", palette.name);
         }
+        let first = Palettes::ALL[0].colors[0];
+        assert_eq!((first.r, first.g, first.b, first.a), (220, 38, 38, 255));
+        let glow = Palettes::ALL[1].colors[0];
+        assert_eq!((glow.r, glow.g, glow.b, glow.a), (255, 235, 0, 170));
+        assert_eq!(Palettes::get(99).name, "Pro", "past the end gives the last");
     }
 
     #[test]
-    fn marker_alpha_param_min_and_max() {
-        let stroke = Stroke::default();
-        let p = Point2::new(0.0, 0.0);
-        for alpha in [0x00u8, 0x01, 0x7F, 0xC8, 0xFF] {
-            let a = Annotation::marker(stroke, p, alpha);
-            match a.kind {
-                AnnotationKind::Marker { stroke: s, .. } => assert_eq!(s.color.a, alpha),
-                _ => panic!("wrong variant"),
-            }
+    fn a_marker_takes_its_opacity_from_the_setting_not_the_swatch() {
+        // Whatever alpha the swatch had is replaced; the colour itself stays,
+        // so the slider preview matches what gets painted.
+        let solid_red = Stroke { color: Rgba::new(255, 0, 0, 0xFF), thickness: 4.0 };
+        let mark = Annotation::marker(solid_red, Point2::new(10.0, 20.0), 0x80);
+        let AnnotationKind::Marker { stroke, points } = mark.kind else { panic!("not a marker") };
+        assert_eq!((stroke.color.r, stroke.color.g, stroke.color.b, stroke.color.a), (255, 0, 0, 0x80));
+        assert_eq!(stroke.thickness, 24.0, "six times the 4 px asked for");
+        assert_eq!(points, vec![Point2::new(10.0, 20.0)]);
+    }
+
+    #[test]
+    fn every_marker_opacity_from_clear_to_solid_is_kept() {
+        for alpha in [0u8, 1, 0x40, 0x7F, 0xC8, 0xFE, 0xFF] {
+            let AnnotationKind::Marker { stroke, .. } = Annotation::marker(Stroke::default(), ORIGIN, alpha).kind
+            else { panic!("not a marker") };
+            assert_eq!(stroke.color.a, alpha);
         }
     }
 
     #[test]
-    fn constructors_default_to_whole_clip_time() {
-        // `None` = whole clip; the editor stamps a window only in video
-        // mode. Every constructor must start un-windowed so screenshot
-        // sessions are structurally unchanged.
-        let p = Point2::new(1.0, 2.0);
-        assert_eq!(Annotation::pen(Stroke::default(), p).time, None);
-        assert_eq!(Annotation::marker(Stroke::default(), p, 0x80).time, None);
-        assert_eq!(Annotation::text(Rgba::RED, p, "hi").time, None);
-        assert_eq!(Annotation::step(Rgba::RED, p, 1).time, None);
-        assert_eq!(Annotation::pixelate(p).time, None);
+    fn new_marks_show_for_the_whole_clip() {
+        // Only the editor's video mode gives a mark a time window.
+        let at = Point2::new(1.0, 2.0);
+        let fresh = [
+            Annotation::pen(Stroke::default(), at),
+            Annotation::marker(Stroke::default(), at, 0x80),
+            Annotation::text(Rgba::RED, at, "hi"),
+            Annotation::step(Rgba::RED, at, 1),
+            Annotation::pixelate(at),
+            Annotation::spotlight(at),
+            Annotation::magnify(Stroke::default(), at, 3),
+        ];
+        assert!(fresh.iter().all(|a| a.time.is_none()));
     }
 
     #[test]
-    fn extend_leaves_time_window_untouched() {
-        let mut a = Annotation::pen(Stroke::default(), Point2::new(0.0, 0.0));
-        a.time = Some((1.5, 4.5));
-        a.extend(Point2::new(3.0, 3.0));
-        assert_eq!(a.time, Some((1.5, 4.5)));
+    fn drawing_further_keeps_the_time_window() {
+        let mut pen = Annotation::pen(Stroke::default(), ORIGIN);
+        pen.time = Some((1.5, 4.5));
+        pen.extend(Point2::new(3.0, 3.0));
+        assert_eq!(pen.time, Some((1.5, 4.5)));
+    }
+
+    #[test]
+    fn a_mark_without_a_time_field_loads_as_whole_clip() {
+        let pen = Annotation::pen(Stroke::default(), Point2::new(1.0, 2.0));
+        let mut json = serde_json::to_value(&pen).unwrap();
+        json.as_object_mut().unwrap().remove("time");
+        let back: Annotation = serde_json::from_value(json).unwrap();
+        assert_eq!(back, pen);
+        let text = serde_json::to_string(&pen.kind).unwrap();
+        assert!(text.starts_with("{\"Pen\":{\"stroke\":"), "{text}");
     }
 }

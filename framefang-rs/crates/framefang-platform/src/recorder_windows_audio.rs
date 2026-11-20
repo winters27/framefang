@@ -1,347 +1,508 @@
-//! Windows system-audio + microphone capture via WASAPI.
+//! Recording system audio and the microphone on Windows, through WASAPI.
 //!
-//! DirectShow has no general "record what the speakers are playing" device —
-//! "Stereo Mix" is disabled by default on modern Windows and absent on many
-//! chipsets, and a virtual cable (VB-Audio / VoiceMeeter) means asking the user
-//! to install a kernel driver. WASAPI **loopback** solves this with zero setup:
-//! opening the default *render* endpoint in capture mode hands us exactly the
-//! mix that's going to the speakers. The default *capture* endpoint gives the
-//! microphone the same way.
+//! Windows has no dependable "what the speakers are playing" input for
+//! ffmpeg's DirectShow reader: Stereo Mix is off by default or missing, and
+//! virtual audio cables need a driver install. WASAPI loopback needs nothing:
+//! opening the default playback endpoint for capture yields the exact mix
+//! going to the speakers, and the default recording endpoint yields the mic.
 //!
-//! Transport: `Recorder` stops ffmpeg by writing `q` to its **stdin**, so the
-//! captured PCM can't share that pipe. Instead each source owns a loopback
-//! `TcpListener`; ffmpeg connects back as a client
-//! (`-f f32le -ar R -ac C -i tcp://127.0.0.1:<port>`) and does the resample +
-//! `amix` itself, mirroring the Linux `pulse` + monitor path. We never touch
-//! the samples beyond forwarding the device-native PCM and declaring its format
-//! to ffmpeg.
+//! Getting the samples to ffmpeg: its stdin is already taken (the recorder
+//! stops ffmpeg by writing `q` there), so every source gets its own TCP
+//! listener on 127.0.0.1. ffmpeg connects to it as an ordinary input
+//! (`-f f32le -ar R -ac C -i tcp://127.0.0.1:<port>`) and does the resampling
+//! and mixing itself. This side only forwards the device's own PCM and tells
+//! ffmpeg what format it is in.
 //!
-//! WASAPI loopback emits **no packets at all** while the render endpoint is
-//! idle (nothing playing), which would make the audio track shorter than the
-//! video and drift out of sync. The capture loop fills those idle gaps with
-//! silence keyed off a monotonic clock so the stream always advances in real
-//! time.
+//! One quirk shapes the capture loop: loopback produces no packets at all
+//! while nothing is playing. Left alone, the audio track would come out
+//! shorter than the video and drift. So whenever the device goes quiet, the
+//! loop writes silence matching the wall-clock time that passed.
 
+use std::{
+    collections::VecDeque,
+    fmt::Display,
+    io::{ErrorKind, Write},
+    net::{TcpListener, TcpStream},
+    sync::{atomic::{AtomicBool, Ordering::Relaxed}, mpsc, Arc},
+    time::{Duration, Instant},
+};
+
+use wasapi::{Direction, SampleType, ShareMode, WaveFormat};
+
+use super::{AudioPump, WasapiAudioSpec};
 use crate::{Error, Result};
-use std::collections::VecDeque;
-use std::io::Write;
-use std::net::TcpListener;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
-use std::thread;
-use std::time::{Duration, Instant};
 
-use wasapi::{Direction, SampleType, ShareMode};
+/// How long `start_source` waits for the capture thread to open the device.
+const STARTUP_WAIT: Duration = Duration::from_secs(5);
 
-/// Which endpoint to capture from.
+/// How long the capture thread waits for ffmpeg to connect.
+const CONNECT_WAIT: Duration = Duration::from_secs(10);
+
+/// How often the accept loop checks for ffmpeg's connection.
+const ACCEPT_POLL: Duration = Duration::from_millis(10);
+
+/// How long one wait for a device buffer lasts before it counts as quiet.
+const BUFFER_WAIT_MS: u32 = 100;
+
+/// Silence is written in blocks of this many frames.
+const SILENCE_BLOCK_FRAMES: usize = 1024;
+
+/// A recording error that reads "`what`: `cause`".
+fn failed<E: Display>(what: impl Display) -> impl FnOnce(E) -> Error {
+    move |cause| Error::Recording(format!("{what}: {cause}"))
+}
+
+/// Which device to record.
 #[derive(Clone, Copy)]
 pub(crate) enum SourceKind {
-    /// Default render endpoint in loopback mode → what the speakers play.
+    /// What the speakers are playing (the default playback device, in
+    /// loopback).
     SystemLoopback,
-    /// Default capture endpoint → the microphone.
+    /// The default recording device.
     Microphone,
 }
 
 impl SourceKind {
-    fn label(self) -> &'static str {
+    /// How the source is named in messages.
+    fn display_name(self) -> &'static str {
         match self {
-            SourceKind::SystemLoopback => "system audio",
-            SourceKind::Microphone     => "microphone",
+            Self::SystemLoopback => "system audio",
+            Self::Microphone => "microphone",
         }
+    }
+
+    /// Which default endpoint to open. Loopback opens the playback side.
+    fn endpoint(self) -> Direction {
+        match self {
+            Self::SystemLoopback => Direction::Render,
+            Self::Microphone => Direction::Capture,
+        }
+    }
+
+    fn is_microphone(self) -> bool {
+        matches!(self, Self::Microphone)
+    }
+
+    fn thread_name(self) -> String {
+        format!("framefang-wasapi-{}", self.display_name().replace(' ', "-"))
     }
 }
 
-/// A started WASAPI source: the negotiated PCM format (so the caller can build
-/// the matching ffmpeg `-i`) plus the pump owning the capture thread.
+/// A source that is running: the format and port ffmpeg needs for its input,
+/// and the pump that owns the capture thread.
 pub(crate) struct StartedSource {
-    pub spec: super::WasapiAudioSpec,
-    pub pump: super::AudioPump,
+    pub spec: WasapiAudioSpec,
+    pub pump: AudioPump,
 }
 
-/// Format handshake the capture thread sends back once the stream is live.
-struct FmtInfo {
-    sample_rate: u32,
-    channels:    u16,
-    ffmpeg_fmt:  &'static str,
+/// What the capture thread reports once the device is streaming.
+struct StreamFormat {
+    rate: u32,
+    channels: u16,
+    pcm: &'static str,
 }
 
-/// Open `kind`, negotiate its format, and start streaming PCM over a fresh
-/// loopback TCP listener. Returns once the capture thread has initialized the
-/// stream (so the format is known) — or an actionable error if the device
-/// can't be opened (the common case being Windows microphone-privacy denial).
+type Report = mpsc::Sender<Result<StreamFormat>>;
+
+/// Open `kind` and begin serving its PCM on a new local TCP port.
+///
+/// Returns once the capture thread has the device streaming, so the format
+/// is known when ffmpeg's arguments are built. If the device cannot be opened
+/// the error says what to do about it (most often: Windows privacy settings
+/// are blocking the microphone).
 pub(crate) fn start_source(kind: SourceKind) -> Result<StartedSource> {
-    // Bind on this thread so the port is known before ffmpeg is spawned and the
-    // listening socket is already queued to accept ffmpeg's connection.
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .map_err(|e| Error::Recording(format!("could not open a loopback socket for {}: {e}", kind.label())))?;
-    let port = listener.local_addr()
-        .map_err(|e| Error::Recording(format!("could not read loopback port: {e}")))?
-        .port();
-    listener.set_nonblocking(true)
-        .map_err(|e| Error::Recording(format!("could not configure loopback socket: {e}")))?;
+    let name = kind.display_name();
+    // The listener is bound here, before ffmpeg starts, so the port is known
+    // for its arguments and the connection queues up even if ffmpeg is quick.
+    let server = TcpListener::bind(("127.0.0.1", 0))
+        .map_err(failed(format_args!("no local socket could be opened for the {name}")))?;
+    let port = server.local_addr().map_err(failed("the local audio socket has no port"))?.port();
+    server.set_nonblocking(true).map_err(failed("the local audio socket could not be set up"))?;
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = mpsc::channel::<Result<FmtInfo>>();
-
-    let stop_thread = Arc::clone(&stop);
-    let handle = thread::Builder::new()
-        .name(format!("framefang-wasapi-{}", kind.label().replace(' ', "-")))
-        .spawn(move || run_capture(kind, listener, stop_thread, tx))
-        .map_err(|e| Error::Recording(format!("could not start {} capture thread: {e}", kind.label())))?;
-
-    // Wait for the thread to report the negotiated format (or a startup error).
-    match rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(Ok(fmt)) => Ok(StartedSource {
-            spec: super::WasapiAudioSpec {
-                port,
-                sample_rate: fmt.sample_rate,
-                channels:    fmt.channels,
-                ffmpeg_fmt:  fmt.ffmpeg_fmt,
-            },
-            pump: super::AudioPump { stop, handle: Some(handle) },
-        }),
-        Ok(Err(e)) => {
-            stop.store(true, Ordering::Relaxed);
-            let _ = handle.join();
-            Err(e)
-        }
-        Err(_) => {
-            stop.store(true, Ordering::Relaxed);
-            let _ = handle.join();
-            Err(Error::Recording(format!(
-                "{} capture didn't start within 5s — the audio device may be \
-                 held in exclusive mode by another app.", kind.label()
-            )))
-        }
-    }
-}
-
-/// Capture-thread entry point. All WASAPI/COM objects live here (COM is
-/// apartment-bound). On any error before the format handshake, the error is
-/// reported back to `start_source`; errors after capture has begun just stop
-/// this one source (its socket closes and ffmpeg sees EOF).
-fn run_capture(
-    kind:     SourceKind,
-    listener: TcpListener,
-    stop:     Arc<AtomicBool>,
-    tx:       mpsc::Sender<Result<FmtInfo>>,
-) {
-    if let Err(e) = init_and_pump(kind, listener, &stop, &tx) {
-        // If the handshake hasn't been sent yet this surfaces to the user;
-        // if it has, the receiver is gone and this send is a harmless no-op.
-        let _ = tx.send(Err(e));
-    }
-}
-
-fn init_and_pump(
-    kind:     SourceKind,
-    listener: TcpListener,
-    stop:     &AtomicBool,
-    tx:       &mpsc::Sender<Result<FmtInfo>>,
-) -> Result<()> {
-    let map = |ctx: &str| {
-        let ctx = ctx.to_string();
-        move |e: Box<dyn std::error::Error>| classify_wasapi_error(kind, &ctx, &e.to_string())
+    let cancel = Arc::<AtomicBool>::default();
+    let (report, started) = mpsc::channel();
+    let worker = {
+        let cancel = Arc::clone(&cancel);
+        std::thread::Builder::new()
+            .name(kind.thread_name())
+            .spawn(move || capture_thread(kind, server, &cancel, &report))
+            .map_err(failed(format_args!("the {name} capture thread did not start")))?
     };
 
-    // COM init for this thread (MTA — we own no window/message loop here).
-    // `initialize_mta` returns an HRESULT; `.ok()` turns it into a Result.
-    wasapi::initialize_mta().ok()
-        .map_err(|e| Error::Recording(format!("could not initialize Windows audio (COM): {e}")))?;
-
-    // Loopback = render endpoint opened for capture; mic = capture endpoint.
-    let device_dir = match kind {
-        SourceKind::SystemLoopback => Direction::Render,
-        SourceKind::Microphone     => Direction::Capture,
-    };
-    let device = wasapi::get_default_device(&device_dir)
-        .map_err(map("no default audio device"))?;
-    let mut audio_client = device.get_iaudioclient()
-        .map_err(map("could not open the audio client"))?;
-
-    let format = audio_client.get_mixformat()
-        .map_err(map("could not read the device audio format"))?;
-    let sample_rate = format.get_samplespersec();
-    let channels    = format.get_nchannels();
-    let bits        = format.get_bitspersample();
-    let ffmpeg_fmt  = pcm_ffmpeg_format(&format, bits)?;
-    let blockalign  = format.get_blockalign() as usize;
-
-    let (_default_period, min_period) = audio_client.get_periods()
-        .map_err(map("could not read the device timing"))?;
-
-    // Always initialize the *stream* in capture mode; the loopback flag is
-    // implied by having opened the render device above.
-    audio_client.initialize_client(
-        &format,
-        min_period,
-        &Direction::Capture,
-        &ShareMode::Shared,
-        false, // no autoconvert — we hand ffmpeg the device-native mix format
-    ).map_err(map("could not start the audio stream"))?;
-
-    let capture_client = audio_client.get_audiocaptureclient()
-        .map_err(map("could not open the capture client"))?;
-    // `initialize_client` always sets the event-callback flag, so an event
-    // handle must be registered before `start_stream` or it fails. We wait on
-    // this handle for "buffer ready" rather than busy-polling.
-    let h_event = audio_client.set_get_eventhandle()
-        .map_err(map("could not set up the audio event"))?;
-    audio_client.start_stream()
-        .map_err(map("could not start audio capture"))?;
-
-    // Stream is live: report the negotiated format so ffmpeg can be spawned.
-    let _ = tx.send(Ok(FmtInfo { sample_rate, channels, ffmpeg_fmt }));
-
-    // Accept ffmpeg's connection (non-blocking poll so a failed start can't
-    // hang the thread).
-    let mut socket = accept_with_timeout(&listener, stop, Duration::from_secs(10))?;
-
-    let bytes_per_frame = blockalign.max(1);
-    let mut queue: VecDeque<u8> = VecDeque::new();
-    let silence = vec![0u8; bytes_per_frame * 1024];
-
-    // Monotonic idle clock: WASAPI loopback emits NO buffers while the render
-    // endpoint is idle, so the event wait simply times out. On a timeout we
-    // synthesize silence for the elapsed wall-clock gap, keeping the audio
-    // track the same length as the video instead of ending up short.
-    let mut last_real = Instant::now();
-
-    while !stop.load(Ordering::Relaxed) {
-        match h_event.wait_for_event(100) {
-            Ok(()) => {
-                // Drain every packet WASAPI has ready (one GetBuffer per call).
-                queue.clear();
-                loop {
-                    let before = queue.len();
-                    if capture_client.read_from_device_to_deque(&mut queue).is_err() {
-                        break;
-                    }
-                    if queue.len() == before { break; } // no more frames waiting
-                }
-                if !queue.is_empty() {
-                    let buf: Vec<u8> = queue.drain(..).collect();
-                    if socket.write_all(&buf).is_err() {
-                        break; // ffmpeg closed the socket → recording is stopping
-                    }
-                    last_real = Instant::now();
-                }
-            }
-            Err(_) => {
-                // Timed out → endpoint idle. Pad silence for the elapsed gap.
-                let gap = last_real.elapsed();
-                let frames = (gap.as_secs_f64() * sample_rate as f64) as usize;
-                if frames > 0 {
-                    let mut bytes = frames * bytes_per_frame;
-                    while bytes > 0 {
-                        let chunk = bytes.min(silence.len());
-                        if socket.write_all(&silence[..chunk]).is_err() {
-                            return finish(&mut audio_client, &map);
-                        }
-                        bytes -= chunk;
-                    }
-                    // Advance the clock by exactly the silence we emitted.
-                    last_real += Duration::from_secs_f64(frames as f64 / sample_rate as f64);
-                }
-            }
+    let failure = match started.recv_timeout(STARTUP_WAIT) {
+        Ok(Ok(StreamFormat { rate, channels, pcm })) => {
+            let spec = WasapiAudioSpec { port, sample_rate: rate, channels, ffmpeg_fmt: pcm };
+            return Ok(StartedSource { spec, pump: AudioPump { stop: cancel, handle: Some(worker) } });
         }
-    }
-
-    finish(&mut audio_client, &map)
+        Ok(Err(e)) => e,
+        Err(_) => Error::Recording(format!(
+            "the {name} did not begin recording within 5 seconds. Another app may be \
+             using the audio device in exclusive mode."
+        )),
+    };
+    // Whatever went wrong, the thread is told to stop and joined before the
+    // error goes back to the caller.
+    cancel.store(true, Relaxed);
+    let _ = worker.join();
+    Err(failure)
 }
 
-/// Stop the WASAPI stream cleanly. Errors here are non-fatal to the recording
-/// (the file is already being finalized by ffmpeg) but we surface them for logs.
-fn finish<F, G>(audio_client: &mut wasapi::AudioClient, map: &F) -> Result<()>
-where
-    F: Fn(&str) -> G,
-    G: FnOnce(Box<dyn std::error::Error>) -> Error,
-{
-    audio_client.stop_stream().map_err(map("could not stop audio capture"))?;
+/// Body of the capture thread. Every WASAPI and COM object is created and
+/// dropped on this thread, since COM objects belong to the thread that made
+/// them.
+///
+/// A failure before the format is reported reaches `start_source` through
+/// `report`. A failure later only ends this source: its socket closes and
+/// ffmpeg sees the input end. The report is then sent to a receiver that has
+/// already gone, which is harmless.
+fn capture_thread(kind: SourceKind, server: TcpListener, cancel: &AtomicBool, report: &Report) {
+    if let Err(e) = capture(kind, server, cancel, report) {
+        let _ = report.send(Err(e));
+    }
+}
+
+/// An open, running WASAPI stream and the pieces of it the loop needs.
+///
+/// Fields drop in order, so the event handle goes first and the device last,
+/// the reverse of the order they were opened in.
+struct LiveStream {
+    buffer_ready: wasapi::Handle,
+    capture_client: wasapi::AudioCaptureClient,
+    audio_client: wasapi::AudioClient,
+    _device: wasapi::Device,
+    rate: u32,
+    /// Bytes per frame (all channels of one sample), never zero.
+    frame_bytes: usize,
+}
+
+fn capture(kind: SourceKind, server: TcpListener, cancel: &AtomicBool, report: &Report) -> Result<()> {
+    let (stream, format) = open_stream(kind)?;
+
+    // Streaming now: ffmpeg can be started with this format.
+    let _ = report.send(Ok(format));
+
+    let mut ffmpeg = accept_with_timeout(&server, cancel, CONNECT_WAIT)?;
+    forward(&stream, &mut ffmpeg, cancel);
+
+    let stopped = stream.audio_client.stop_stream();
+    stopped.map_err(device_error(kind, "stopping the capture"))
+}
+
+/// COM setup, device, format and stream start, in the order WASAPI needs.
+fn open_stream(kind: SourceKind) -> Result<(LiveStream, StreamFormat)> {
+    // Multithreaded apartment: this thread has no windows or message loop.
+    let com = wasapi::initialize_mta();
+    com.ok().map_err(failed("Windows audio (COM) could not be initialized"))?;
+
+    let device = wasapi::get_default_device(&kind.endpoint())
+        .map_err(device_error(kind, "finding the default device"))?;
+    let mut audio_client = device
+        .get_iaudioclient()
+        .map_err(device_error(kind, "opening the audio client"))?;
+
+    let mix = audio_client
+        .get_mixformat()
+        .map_err(device_error(kind, "reading the device's audio format"))?;
+    let format = StreamFormat {
+        rate: mix.get_samplespersec(),
+        channels: mix.get_nchannels(),
+        pcm: ffmpeg_format_of(&mix)?,
+    };
+    let frame_bytes = (mix.get_blockalign() as usize).max(1);
+
+    let (_default_period, min_period) = audio_client
+        .get_periods()
+        .map_err(device_error(kind, "reading the device's timing"))?;
+
+    // The stream is always set up for capture. For system audio, opening the
+    // playback device above is what makes it loopback. No automatic format
+    // conversion: ffmpeg gets the device's own mix format.
+    audio_client
+        .initialize_client(&mix, min_period, &Direction::Capture, &ShareMode::Shared, false)
+        .map_err(device_error(kind, "setting up the audio stream"))?;
+
+    let capture_client = audio_client
+        .get_audiocaptureclient()
+        .map_err(device_error(kind, "opening the capture client"))?;
+    // The client is always set up for event callbacks, so an event handle has
+    // to exist before the stream starts or starting fails. It also lets the
+    // loop sleep until a buffer is ready instead of polling.
+    let buffer_ready = audio_client
+        .set_get_eventhandle()
+        .map_err(device_error(kind, "creating the audio event"))?;
+    audio_client
+        .start_stream()
+        .map_err(device_error(kind, "starting the capture"))?;
+
+    let stream = LiveStream {
+        buffer_ready,
+        capture_client,
+        audio_client,
+        _device: device,
+        rate: format.rate,
+        frame_bytes,
+    };
+    Ok((stream, format))
+}
+
+/// Copy audio from the device to ffmpeg until told to stop or until ffmpeg
+/// closes the connection (which means the recording is ending).
+fn forward(stream: &LiveStream, ffmpeg: &mut TcpStream, cancel: &AtomicBool) {
+    let silence = vec![0u8; stream.frame_bytes * SILENCE_BLOCK_FRAMES];
+    let mut pending: VecDeque<u8> = VecDeque::new();
+    // The point in time the audio sent so far reaches. Real packets move it
+    // to now; silence moves it on by exactly the silence written.
+    let mut sent_until = Instant::now();
+    let rate = f64::from(stream.rate);
+
+    while !cancel.load(Relaxed) {
+        if stream.buffer_ready.wait_for_event(BUFFER_WAIT_MS).is_ok() {
+            // Take every packet that is ready; each read fetches one.
+            pending.clear();
+            loop {
+                let before = pending.len();
+                let read = stream.capture_client.read_from_device_to_deque(&mut pending);
+                if read.is_err() || pending.len() == before {
+                    break;
+                }
+            }
+            if pending.is_empty() {
+                continue;
+            }
+            if ffmpeg.write_all(pending.make_contiguous()).is_err() {
+                return;
+            }
+            pending.clear();
+            sent_until = Instant::now();
+        } else {
+            // No buffer in time: the device is quiet. Fill the gap.
+            let frames = (sent_until.elapsed().as_secs_f64() * rate) as usize;
+            if frames == 0 {
+                continue;
+            }
+            if write_silence(ffmpeg, &silence, frames * stream.frame_bytes).is_err() {
+                return;
+            }
+            sent_until += Duration::from_secs_f64(frames as f64 / rate);
+        }
+    }
+}
+
+/// Write `len` zero bytes, a block at a time.
+fn write_silence(out: &mut impl Write, block: &[u8], len: usize) -> std::io::Result<()> {
+    let mut left = len;
+    while left > 0 {
+        let chunk = left.min(block.len());
+        out.write_all(&block[..chunk])?;
+        left -= chunk;
+    }
     Ok(())
 }
 
-/// Poll-accept a single connection, respecting the stop flag and a deadline.
-fn accept_with_timeout(
-    listener: &TcpListener,
-    stop:     &AtomicBool,
-    timeout:  Duration,
-) -> Result<std::net::TcpStream> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if stop.load(Ordering::Relaxed) {
-            return Err(Error::Recording("audio capture cancelled before ffmpeg connected".into()));
-        }
-        match listener.accept() {
-            Ok((stream, _)) => {
-                let _ = stream.set_nodelay(true);
-                return Ok(stream);
+/// Wait for ffmpeg to connect, giving up if recording is cancelled or the
+/// timeout passes.
+fn accept_with_timeout(server: &TcpListener, cancel: &AtomicBool, timeout: Duration)
+    -> Result<TcpStream>
+{
+    let give_up_at = Instant::now() + timeout;
+    while !cancel.load(Relaxed) {
+        match server.accept() {
+            Ok((connection, _)) => {
+                let _ = connection.set_nodelay(true);
+                return Ok(connection);
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    return Err(Error::Recording(
-                        "ffmpeg never connected to the audio socket".into()));
-                }
-                thread::sleep(Duration::from_millis(10));
+            Err(e) if e.kind() != ErrorKind::WouldBlock => {
+                return Err(failed("the audio socket stopped accepting connections")(e));
             }
-            Err(e) => return Err(Error::Recording(format!("audio socket accept failed: {e}"))),
+            Err(_) if Instant::now() >= give_up_at => {
+                return Err(Error::Recording("ffmpeg did not connect to the audio socket in time".into()));
+            }
+            Err(_) => std::thread::sleep(ACCEPT_POLL),
         }
+    }
+    Err(Error::Recording("audio capture was cancelled before ffmpeg connected".into()))
+}
+
+/// The ffmpeg raw-PCM format name (`-f <name>`) for the device's mix format.
+/// Shared mode is 32-bit float in practice; 16 and 32-bit integer are
+/// accepted just in case.
+fn ffmpeg_format_of(mix: &WaveFormat) -> Result<&'static str> {
+    let bits = mix.get_bitspersample();
+    let sample_type = mix.get_subformat().map_err(failed("the device's sample type is unreadable"))?;
+    ffmpeg_pcm_name(&sample_type, bits).ok_or_else(|| Error::Recording(format!(
+        "the audio device delivers samples Framefang cannot pass on yet \
+         ({sample_type:?}, {bits}-bit). Please report this along with your \
+         audio hardware so support can be added."
+    )))
+}
+
+fn ffmpeg_pcm_name(sample_type: &SampleType, bits: u16) -> Option<&'static str> {
+    match (bits, sample_type) {
+        (32, SampleType::Float) => Some("f32le"),
+        (16, SampleType::Int) => Some("s16le"),
+        (32, SampleType::Int) => Some("s32le"),
+        _ => None,
     }
 }
 
-/// Map a WASAPI mix format to the raw-PCM format string ffmpeg expects on its
-/// `-f <fmt>` input. Shared-mode mix formats are essentially always 32-bit
-/// float; 16/32-bit integer are handled defensively.
-fn pcm_ffmpeg_format(format: &wasapi::WaveFormat, bits: u16) -> Result<&'static str> {
-    let sample_type = format.get_subformat()
-        .map_err(|e| Error::Recording(format!("could not read the device sample type: {e}")))?;
-    match (sample_type, bits) {
-        (SampleType::Float, 32) => Ok("f32le"),
-        (SampleType::Int,   16) => Ok("s16le"),
-        (SampleType::Int,   32) => Ok("s32le"),
-        (other_type, other_bits) => Err(Error::Recording(format!(
-            "unsupported audio sample format from the device \
-             ({other_type:?}, {other_bits}-bit). Please report this with your \
-             audio hardware so we can add it."
-        ))),
-    }
+/// Build the `map_err` adapter for one WASAPI step: `doing` says what was
+/// being attempted, for the fallback message.
+fn device_error(kind: SourceKind, doing: &'static str)
+    -> impl FnOnce(Box<dyn std::error::Error>) -> Error
+{
+    move |e| classify_wasapi_error(kind, doing, &e.to_string())
 }
 
-/// Turn a raw WASAPI error string into an actionable message. The dominant
-/// real-world failure is Windows microphone privacy blocking the capture
-/// endpoint (E_ACCESSDENIED / 0x80070005).
-fn classify_wasapi_error(kind: SourceKind, ctx: &str, raw: &str) -> Error {
-    let low = raw.to_lowercase();
-    if matches!(kind, SourceKind::Microphone) {
-        if low.contains("denied") || low.contains("0x80070005") {
-            return Error::Recording(
-                "Windows blocked microphone access for Framefang.\n\n\
-                 Open Settings → Privacy & Security → Microphone, turn on \
-                 \"Microphone access\" AND \"Let desktop apps access your \
-                 microphone\", then retry.".into()
-            );
-        }
-        // 0x80070490 = ELEMENT_NOT_FOUND — there's no *default* recording
-        // device. Usually no mic is plugged in / none is set as default, but
-        // it can also be the privacy gate hiding it from desktop apps.
-        if low.contains("element not found") || low.contains("0x80070490")
-            || low.contains("not found") {
-            return Error::Recording(
-                "No microphone found.\n\n\
-                 Plug in a microphone and set it as the default recording \
-                 device in Windows Sound settings, then retry. If you do have \
-                 one, also check Settings → Privacy & Security → Microphone → \
-                 \"Microphone access\" and \"Let desktop apps access your \
-                 microphone\" are ON.\n\n\
-                 To record without a mic, choose system audio only.".into()
-            );
+/// Turn a WASAPI error into a message the user can act on.
+///
+/// Far and away the most common failure is Windows privacy settings blocking
+/// the microphone (E_ACCESSDENIED, 0x80070005), so that gets its own
+/// instructions, as does a missing microphone.
+fn classify_wasapi_error(kind: SourceKind, doing: &str, raw: &str) -> Error {
+    let text = raw.to_lowercase();
+    let mentions = |needles: &[&str]| needles.iter().any(|n| text.contains(n));
+    let name = kind.display_name();
+
+    let advice = if kind.is_microphone() && mentions(&["denied", "0x80070005"]) {
+        MIC_BLOCKED.to_owned()
+    // ELEMENT_NOT_FOUND (0x80070490): there is no default recording device.
+    // Usually no mic is connected or chosen as default, though the privacy
+    // setting can also hide it from desktop apps.
+    } else if kind.is_microphone() && mentions(&["element not found", "0x80070490", "not found"]) {
+        MIC_MISSING.to_owned()
+    // AUDCLNT_E_UNSUPPORTED_FORMAT.
+    } else if mentions(&["0x88890008", "unsupported"]) {
+        format!("recording {name} failed because the device's format is not supported ({raw}).")
+    } else {
+        format!("recording {name} failed while {doing} ({raw}).")
+    };
+    Error::Recording(advice)
+}
+
+const MIC_BLOCKED: &str = "Windows is not letting Framefang use the microphone.\n\n\
+    In Settings, go to Privacy & Security, then Microphone, and switch on both \
+    \"Microphone access\" and \"Let desktop apps access your microphone\". \
+    Then try again.";
+
+const MIC_MISSING: &str = "No microphone was found.\n\n\
+    Connect a microphone and make it the default recording device in the \
+    Windows Sound settings, then try again. If one is already connected, \
+    check that \"Microphone access\" and \"Let desktop apps access your \
+    microphone\" are both on, under Settings, Privacy & Security, Microphone.\n\n\
+    To record without a microphone, choose system audio only.";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(e: Error) -> String {
+        match e {
+            Error::Recording(m) => m,
+            other => panic!("expected a recording error, got {other:?}"),
         }
     }
-    if low.contains("0x88890008") || low.contains("unsupported") {
-        return Error::Recording(format!(
-            "{} capture failed: the device format isn't supported ({raw}).",
-            kind.label()
-        ));
+
+    #[test]
+    fn a_blocked_microphone_points_at_privacy_settings() {
+        for raw in ["Access is denied.", "HRESULT 0x80070005"] {
+            let m = message(classify_wasapi_error(SourceKind::Microphone, "x", raw));
+            assert_eq!(m, MIC_BLOCKED, "{raw}");
+            assert!(m.contains("Privacy & Security"), "{m}");
+        }
     }
-    Error::Recording(format!("{ctx} for {} ({raw}).", kind.label()))
+
+    #[test]
+    fn a_missing_microphone_says_so() {
+        for raw in ["Element not found.", "0x80070490", "device not found"] {
+            let m = message(classify_wasapi_error(SourceKind::Microphone, "x", raw));
+            assert_eq!(m, MIC_MISSING, "{raw}");
+            assert!(m.ends_with("choose system audio only."), "{m}");
+        }
+    }
+
+    #[test]
+    fn microphone_advice_is_only_for_the_microphone() {
+        let m = message(classify_wasapi_error(
+            SourceKind::SystemLoopback, "finding the default device", "Access is denied."));
+        assert_eq!(m, "recording system audio failed while finding the default device (Access is denied.).");
+    }
+
+    #[test]
+    fn an_unsupported_format_is_named() {
+        for kind in [SourceKind::SystemLoopback, SourceKind::Microphone] {
+            let m = message(classify_wasapi_error(kind, "x", "AUDCLNT 0x88890008"));
+            assert_eq!(m, format!(
+                "recording {} failed because the device's format is not supported (AUDCLNT 0x88890008).",
+                kind.display_name()));
+        }
+    }
+
+    #[test]
+    fn other_errors_say_what_was_being_done() {
+        let m = message(classify_wasapi_error(
+            SourceKind::Microphone, "setting up the audio stream", "E_FAIL"));
+        assert_eq!(m, "recording microphone failed while setting up the audio stream (E_FAIL).");
+    }
+
+    #[test]
+    fn the_failed_helper_joins_context_and_cause() {
+        let e = failed::<&str>("the thing broke")("because");
+        assert_eq!(message(e), "the thing broke: because");
+    }
+
+    #[test]
+    fn pcm_names_match_ffmpeg() {
+        assert_eq!(ffmpeg_pcm_name(&SampleType::Float, 32), Some("f32le"));
+        assert_eq!(ffmpeg_pcm_name(&SampleType::Int, 16), Some("s16le"));
+        assert_eq!(ffmpeg_pcm_name(&SampleType::Int, 32), Some("s32le"));
+        assert_eq!(ffmpeg_pcm_name(&SampleType::Float, 64), None);
+        assert_eq!(ffmpeg_pcm_name(&SampleType::Int, 24), None);
+    }
+
+    #[test]
+    fn sources_open_the_right_endpoint_and_name_their_threads() {
+        assert!(matches!(SourceKind::SystemLoopback.endpoint(), Direction::Render));
+        assert!(matches!(SourceKind::Microphone.endpoint(), Direction::Capture));
+        assert_eq!(SourceKind::SystemLoopback.thread_name(), "framefang-wasapi-system-audio");
+        assert_eq!(SourceKind::Microphone.thread_name(), "framefang-wasapi-microphone");
+    }
+
+    #[test]
+    fn silence_is_written_in_blocks_to_the_exact_length() {
+        let block = [0u8; 8];
+        let mut out = Vec::new();
+        write_silence(&mut out, &block, 21).unwrap();
+        assert_eq!(out.len(), 21);
+        assert!(out.iter().all(|&b| b == 0));
+
+        let mut none = Vec::new();
+        write_silence(&mut none, &block, 0).unwrap();
+        assert!(none.is_empty());
+    }
+
+    fn quiet_listener() -> TcpListener {
+        let server = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        server.set_nonblocking(true).unwrap();
+        server
+    }
+
+    #[test]
+    fn accept_gives_up_when_stopped() {
+        let err = accept_with_timeout(&quiet_listener(), &AtomicBool::new(true), Duration::from_secs(10));
+        assert_eq!(message(err.err().unwrap()), "audio capture was cancelled before ffmpeg connected");
+    }
+
+    #[test]
+    fn accept_gives_up_at_the_deadline() {
+        let err = accept_with_timeout(&quiet_listener(), &AtomicBool::new(false), Duration::ZERO);
+        assert_eq!(message(err.err().unwrap()), "ffmpeg did not connect to the audio socket in time");
+    }
+
+    #[test]
+    fn accept_returns_the_connection() {
+        let server = quiet_listener();
+        let port = server.local_addr().unwrap().port();
+        let _client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        assert!(accept_with_timeout(&server, &AtomicBool::new(false), Duration::from_secs(5)).is_ok());
+    }
 }

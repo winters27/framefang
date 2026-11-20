@@ -1,235 +1,212 @@
-//! Themed "Convert video" dialog. Same skin as Settings / About / Updates /
-//! Convert image.
+//! The Convert video dialog: re-encode a clip with FFmpeg.
 //!
-//! Flow:
-//!   1. Pick a source video file.
-//!   2. Pick a target format (MP4 · MOV · WEBM · MKV · GIF).
-//!   3. Click Convert → spawns ffmpeg in the background and writes the
-//!      result next to the source as `<stem>.framefang.<ext>`.
+//! The user picks a video, a container (MP4, MOV, WEBM, MKV or GIF), and
+//! for the ones that re-encode a quality preset and a size cap; GIF adds a
+//! frame rate. Convert runs FFmpeg on a worker thread and writes
+//! `<name>.framefang.<ext>` beside the original. The status line counts
+//! the seconds while it runs and says where the result went, or why there
+//! is none.
 //!
-//! ffmpeg lookup, in order:
-//!   1. `<dir-of-framefang-binary>/ffmpeg[.exe]`  (the bundled binary the
-//!      installer drops next to ours — Linux .tar.gz, Windows MSI, macOS
-//!      .app all carry one)
-//!   2. `<dir-of-framefang-binary>/../Resources/ffmpeg` (macOS .app layout
-//!      with the binary in `Contents/MacOS/` and the helper in
-//!      `Contents/Resources/`)
-//!   3. system `PATH` (last resort — user's own install)
+//! MKV is a plain container swap (streams copied as they are), so quality
+//! and size are hidden for it. GIF goes through `crate::gif`, which makes
+//! a palette first and then the GIF, in two FFmpeg runs.
 //!
-//! While ffmpeg runs the dialog shows "encoding…" with a moving dot; the
-//! result text updates on completion.
+//! The layout pieces are shared with Convert image (`convert_image_form`).
 
-use std::num::NonZeroU32;
 use std::path::PathBuf;
-use std::process::Command;
-use std::rc::Rc;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 use std::time::Instant;
 
-use anyhow::{anyhow, Result};
-use softbuffer::{Context, Surface};
-use winit::dpi::{PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use anyhow::Result;
+use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
-use winit::keyboard::{Key, NamedKey};
-use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
+use winit::keyboard::NamedKey;
+use winit::window::WindowId;
 
-use framefang_core::color::Rgba as FramefangRgba;
+use crate::dialog::{inside, Input, Shell};
+use crate::convert_image_form::{choose_file, convert_button, draw_pill, draw_source, output_beside, Form, Status};
+use crate::gif::GifOpts;
 
-use crate::bitmap_font;
-use crate::painter;
+const CARD_W: u32 = 760;
+const CARD_H: u32 = 671;
+const CARD: (u32, u32) = (CARD_W, CARD_H);
 
-// Colors: the app's one palette (cyan and magenta on blue-black).
-#[allow(unused_imports)]
-use crate::palette::*;
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum VidFormat { Mp4, Mov, Webm, Mkv, Gif }
 
-const WIN_W: u32 = 760;
-const WIN_H: u32 = 671;
-const PAD:   i32 = 24;
-const ROW_H: i32 = 36;
-const LABEL_W: i32 = 150;
-const BTN_H: i32 = 34;
-/// The first row's top, right under the title bar (which holds the
-/// heading); its section header sits above it.
-const BODY_Y: i32 = 44;
-/// Convert now, in the bar along the bottom with the status beside it.
-const CONVERT_W: i32 = 140;
-// Tall, label-only pill for the format picker. Sized to fit one row inside
-// the content area (no LABEL_W column reservation — the FORMAT section
-// header already names it) so we can give each pill plenty of real estate.
-const FMT_PILL_H: i32 = 46;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum VidFormat { Mp4, Mov, Webm, Mkv, Gif }
-
-/// Three-stop encode preset. Maps to libx264 / libvpx-vp9 knobs that real
-/// users actually care about: file size vs visual quality.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum VidQuality { Low, Med, High }
-
-impl VidQuality {
-    /// libx264 CRF (lower = better). 28 / 23 / 20 lines up with what the
-    /// FFmpeg docs recommend as "visually-lossy / sane default / nearly
-    /// indistinguishable".
-    fn x264_crf(&self) -> &'static str { match self { Self::Low=>"28", Self::Med=>"23", Self::High=>"20" } }
-    /// libx264 preset — speed/compression tradeoff.
-    fn x264_preset(&self) -> &'static str { match self { Self::Low=>"fast", Self::Med=>"medium", Self::High=>"slow" } }
-    /// libvpx-vp9 CRF. Range is 0..63; 38 / 32 / 28 mirrors the x264 stops.
-    fn vp9_crf(&self) -> &'static str { match self { Self::Low=>"38", Self::Med=>"32", Self::High=>"28" } }
-}
-
-/// Output cap. Downscale-only — never upscale a smaller source. The
-/// `min(iw, target)` trick in the ffmpeg expression handles that for us so
-/// a 720p source picking "1080p" still comes out at 720p, no blurring.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum VidResize { Source, P1080, P720, P480 }
-
-impl VidResize {
-    /// ffmpeg `-vf` scale expression that downscales to the cap on the
-    /// long edge (width-clamped here since most desktop captures are
-    /// landscape). `-2` for the other axis preserves aspect ratio AND
-    /// keeps the dimension even, which several encoders require.
-    fn scale_expr(&self) -> Option<&'static str> {
-        match self {
-            Self::Source => None,
-            Self::P1080  => Some("scale='min(1920,iw)':'-2'"),
-            Self::P720   => Some("scale='min(1280,iw)':'-2'"),
-            Self::P480   => Some("scale='min(854,iw)':'-2'"),
-        }
-    }
-}
-
-/// GIF only — file size scales linearly with framerate so this knob has
-/// real teeth there. We hide the row for other formats (their fps stays
-/// at source).
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum GifFps { Eight, Twelve, TwentyFour }
-
-impl GifFps {
-    fn fps(&self) -> u32 { match self { Self::Eight=>8, Self::Twelve=>12, Self::TwentyFour=>24 } }
-}
+const FORMATS: [VidFormat; 5] = [VidFormat::Mp4, VidFormat::Mov, VidFormat::Webm, VidFormat::Mkv, VidFormat::Gif];
 
 impl VidFormat {
-    fn label(&self) -> &'static str {
+    fn ext(self) -> &'static str {
         match self {
-            VidFormat::Mp4  => "MP4",
-            VidFormat::Mov  => "MOV",
-            VidFormat::Webm => "WEBM",
-            VidFormat::Mkv  => "MKV",
-            VidFormat::Gif  => "GIF",
-        }
-    }
-    fn ext(&self) -> &'static str {
-        match self {
-            VidFormat::Mp4  => "mp4",
-            VidFormat::Mov  => "mov",
+            VidFormat::Mp4 => "mp4",
+            VidFormat::Mov => "mov",
             VidFormat::Webm => "webm",
-            VidFormat::Mkv  => "mkv",
-            VidFormat::Gif  => "gif",
+            VidFormat::Mkv => "mkv",
+            VidFormat::Gif => "gif",
         }
     }
 
-    /// Build the ffmpeg argv (minus the binary name itself) for converting
-    /// `src` → `dst`. Quality preset + downscale cap are applied per
-    /// container; the MKV path stream-copies (no re-encode), so quality
-    /// and resize are silently ignored there — the user got a container
-    /// swap and a fast path, no quality cost.
-    fn ffmpeg_args(&self,
-                   src: &str, dst: &str,
-                   quality: VidQuality,
-                   resize:  VidResize,
-                   gif_fps: GifFps) -> Vec<String> {
+    fn caption(self) -> &'static str {
         match self {
-            VidFormat::Mp4 | VidFormat::Mov => {
-                let mut args: Vec<String> = vec!["-y".into(), "-i".into(), src.into()];
-                if let Some(scale) = resize.scale_expr() {
-                    args.push("-vf".into());
-                    args.push(scale.into());
-                }
-                args.extend([
-                    "-c:v".into(), "libx264".into(),
-                    "-preset".into(), quality.x264_preset().into(),
-                    "-crf".into(),    quality.x264_crf().into(),
-                    "-c:a".into(), "aac".into(), "-b:a".into(), "160k".into(),
-                    "-movflags".into(), "+faststart".into(),
-                    dst.into(),
-                ]);
-                args
-            }
-            VidFormat::Webm => {
-                let mut args: Vec<String> = vec!["-y".into(), "-i".into(), src.into()];
-                if let Some(scale) = resize.scale_expr() {
-                    args.push("-vf".into());
-                    args.push(scale.into());
-                }
-                args.extend([
-                    "-c:v".into(), "libvpx-vp9".into(),
-                    "-crf".into(), quality.vp9_crf().into(), "-b:v".into(), "0".into(),
-                    "-c:a".into(), "libopus".into(), "-b:a".into(), "128k".into(),
-                    dst.into(),
-                ]);
-                args
-            }
-            VidFormat::Mkv => vec![
-                // Container swap. Stream-copy keeps quality + speed; the
-                // quality/resize knobs are intentionally ignored — picking
-                // MKV means "wrap as-is".
-                "-y".into(), "-i".into(), src.into(),
-                "-c".into(), "copy".into(),
-                dst.into(),
-            ],
-            // Two FFmpeg runs (palette, then GIF) through `crate::gif`: one
-            // run with `split` holds every frame in memory.
-            VidFormat::Gif => crate::gif::gif_args(
-                std::path::Path::new(src), &gif_palette(std::path::Path::new(dst)),
-                std::path::Path::new(dst), self.gif_opts(resize, gif_fps)),
+            VidFormat::Mp4 => "MP4",
+            VidFormat::Mov => "MOV",
+            VidFormat::Webm => "WEBM",
+            VidFormat::Mkv => "MKV",
+            VidFormat::Gif => "GIF",
         }
-    }
-
-    fn gif_opts(&self, resize: VidResize, gif_fps: GifFps) -> crate::gif::GifOpts {
-        crate::gif::GifOpts { fps: gif_fps.fps(), scale: resize.scale_expr() }
     }
 }
 
-/// Where `crate::gif::convert` keeps the palette for `dst`.
-fn gif_palette(dst: &std::path::Path) -> PathBuf {
-    let mut p = dst.as_os_str().to_owned();
-    p.push(".palette.png");
-    p.into()
+/// Size against looks, in three steps.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum VidQuality { Low, Med, High }
+
+const QUALITIES: [VidQuality; 3] = [VidQuality::Low, VidQuality::Med, VidQuality::High];
+
+/// What each quality step sets.
+struct Knobs {
+    /// libx264's speed against compression.
+    x264_preset: &'static str,
+    /// libx264's constant rate factor; lower looks better. 28, 23 and 20
+    /// are roughly FFmpeg's "a bit lossy", "the default" and "very close
+    /// to the original".
+    x264_crf: &'static str,
+    /// libvpx-vp9's (0 to 63), chosen to match the x264 steps.
+    vp9_crf: &'static str,
+}
+
+impl VidQuality {
+    fn knobs(self) -> Knobs {
+        let (x264_preset, x264_crf, vp9_crf) = match self {
+            VidQuality::Low => ("fast", "28", "38"),
+            VidQuality::Med => ("medium", "23", "32"),
+            VidQuality::High => ("slow", "20", "28"),
+        };
+        Knobs { x264_preset, x264_crf, vp9_crf }
+    }
+
+    fn caption(self) -> &'static str {
+        match self {
+            VidQuality::Low => "Low",
+            VidQuality::Med => "Medium",
+            VidQuality::High => "High",
+        }
+    }
+}
+
+/// A cap on the width. It only ever shrinks: `min(cap, iw)` leaves a
+/// smaller clip at its own size instead of blowing it up.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum VidResize { Source, P1080, P720, P480 }
+
+const SIZES: [VidResize; 4] = [VidResize::Source, VidResize::P1080, VidResize::P720, VidResize::P480];
+
+impl VidResize {
+    /// The `scale` filter for the cap. Width is the edge capped, desktop
+    /// captures being mostly landscape; `-2` keeps the aspect ratio and an
+    /// even height, which several encoders insist on.
+    fn scale_expr(self) -> Option<&'static str> {
+        match self {
+            VidResize::Source => None,
+            VidResize::P1080 => Some("scale='min(1920,iw)':'-2'"),
+            VidResize::P720 => Some("scale='min(1280,iw)':'-2'"),
+            VidResize::P480 => Some("scale='min(854,iw)':'-2'"),
+        }
+    }
+
+    fn caption(self) -> &'static str {
+        match self {
+            VidResize::Source => "Full size",
+            VidResize::P1080 => "1080p",
+            VidResize::P720 => "720p",
+            VidResize::P480 => "480p",
+        }
+    }
+}
+
+/// GIF frame rate. A GIF's size grows in step with it, so it is worth a
+/// choice there; the other formats keep the clip's own rate.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GifFps { Eight, Twelve, TwentyFour }
+
+const FRAME_RATES: [GifFps; 3] = [GifFps::Eight, GifFps::Twelve, GifFps::TwentyFour];
+
+impl GifFps {
+    fn per_second(self) -> u32 {
+        match self {
+            GifFps::Eight => 8,
+            GifFps::Twelve => 12,
+            GifFps::TwentyFour => 24,
+        }
+    }
+
+    fn caption(self) -> &'static str {
+        match self {
+            GifFps::Eight => "8 fps",
+            GifFps::Twelve => "12 fps",
+            GifFps::TwentyFour => "24 fps",
+        }
+    }
+}
+
+/// How a conversion runs.
+enum Job {
+    /// One FFmpeg run with these arguments.
+    Single(Vec<String>),
+    /// Two runs through `crate::gif`.
+    Gif(GifOpts),
+}
+
+/// The work for turning `src` into `dst` as `format`. MKV copies the
+/// streams, so it ignores quality and size.
+fn plan(format: VidFormat, src: &str, dst: &str, quality: VidQuality, size: VidResize, fps: GifFps) -> Job {
+    let knobs = quality.knobs();
+    let encode = match format {
+        VidFormat::Gif => return Job::Gif(GifOpts { fps: fps.per_second(), scale: size.scale_expr() }),
+        VidFormat::Mkv => vec!["-c", "copy"],
+        VidFormat::Webm => vec![
+            "-c:v", "libvpx-vp9", "-crf", knobs.vp9_crf, "-b:v", "0",
+            "-c:a", "libopus", "-b:a", "128k",
+        ],
+        VidFormat::Mp4 | VidFormat::Mov => vec![
+            "-c:v", "libx264", "-preset", knobs.x264_preset, "-crf", knobs.x264_crf,
+            "-c:a", "aac", "-b:a", "160k",
+            "-movflags", "+faststart",
+        ],
+    };
+    let scale = match format {
+        VidFormat::Mkv => None,
+        _ => size.scale_expr(),
+    };
+    let mut args = vec!["-y", "-i", src];
+    if let Some(filter) = scale {
+        args.extend(["-vf", filter]);
+    }
+    args.extend(encode);
+    args.push(dst);
+    Job::Single(args.into_iter().map(str::to_owned).collect())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum WidgetKind {
-    Source,
-    FormatMp4,
-    FormatMov,
-    FormatWebm,
-    FormatMkv,
-    FormatGif,
-    QualityLow,
-    QualityMed,
-    QualityHigh,
-    ResizeSource,
-    Resize1080,
-    Resize720,
-    Resize480,
-    GifFps8,
-    GifFps12,
-    GifFps24,
+enum Control {
     Convert,
+    Source,
+    Format(VidFormat),
+    Quality(VidQuality),
+    Resize(VidResize),
+    Fps(GifFps),
 }
 
-struct Row {
-    kind:  WidgetKind,
-    label: &'static str,
-    rect:  (i32, i32, i32, i32),
-}
-
-enum Status {
-    Idle,
-    Running { since: Instant },
-    Ok(PathBuf),
-    Err(String),
+/// Whether `control` means anything for `format`: no quality or size for a
+/// stream copy, and a frame rate only for GIF.
+fn shown_for(format: VidFormat, control: Control) -> bool {
+    match control {
+        Control::Quality(_) | Control::Resize(_) => format != VidFormat::Mkv,
+        Control::Fps(_) => format == VidFormat::Gif,
+        _ => true,
+    }
 }
 
 pub enum ConvertVideoOutcome {
@@ -237,623 +214,269 @@ pub enum ConvertVideoOutcome {
 }
 
 pub struct ConvertVideoView {
-    window:  Rc<Window>,
-    _ctx:    Context<Rc<Window>>,
-    surface: Surface<Rc<Window>, Rc<Window>>,
-    source:  Option<PathBuf>,
-    format:  VidFormat,
-    quality: VidQuality,
-    resize:  VidResize,
-    gif_fps: GifFps,
-    rows:    Vec<Row>,
-    cursor:  (i32, i32),
-    hover:   Option<usize>,
-    status:  Status,
-    rx:      Option<mpsc::Receiver<Result<PathBuf, String>>>,
-    /// The title strip drawn above the dialog (minimize, close, drag).
-    title_bar: crate::chrome::TitleBar,
+    shell: Shell,
+    form: Form<Control>,
+    source: Option<PathBuf>,
+    format: VidFormat,
+    quality: VidQuality, resize: VidResize, fps: GifFps,
+    hover: Option<Control>,
+    status: Status,
+    /// The worker's answer, while a conversion runs.
+    result: Option<mpsc::Receiver<Result<PathBuf, String>>>,
     pub outcome: Option<ConvertVideoOutcome>,
 }
 
 impl ConvertVideoView {
     pub fn new(loop_target: &ActiveEventLoop) -> Result<Self> {
-        let win_h = WIN_H + crate::chrome::TITLE_H as u32;
-        let (cx, cy) = centered_origin(loop_target, WIN_W, win_h);
-        let attrs = crate::chrome::frameless(WindowAttributes::default())
-            .with_title("Frame Fang: Convert video")
-            .with_resizable(false)
-            .with_inner_size(PhysicalSize::new(WIN_W, win_h))
-            .with_position(PhysicalPosition::new(cx, cy))
-            .with_window_icon(crate::brand_icon::shared());
-
-        let window = loop_target
-            .create_window(attrs)
-            .map(Rc::new)
-            .map_err(|e| anyhow!("create_window (convert-video): {e}"))?;
-        crate::chrome::finish(&window);
-        // Framefang runs as a menu-bar/tray agent, so on macOS there is no Dock
-        // icon to click if this opens behind the frontmost app. Ask for focus
-        // explicitly; on Windows/Linux it is a harmless raise.
-        window.focus_window();
-        window.set_cursor(CursorIcon::Default);
-
-        let ctx = Context::new(window.clone())
-            .map_err(|e| anyhow!("softbuffer Context::new (convert-video): {e}"))?;
-        let surface = Surface::new(&ctx, window.clone())
-            .map_err(|e| anyhow!("softbuffer Surface::new (convert-video): {e}"))?;
-
-        let mut me = ConvertVideoView {
-            window, _ctx: ctx, surface,
-            source: None,
-            format:  VidFormat::Mp4,
-            quality: VidQuality::Med,
-            resize:  VidResize::Source,
-            gif_fps: GifFps::Twelve,
-            rows: Vec::new(),
-            cursor: (0, 0),
-            hover: None,
-            status: Status::Idle,
-            rx: None,
-            title_bar: Default::default(),
-            outcome: None,
+        let shell = Shell::open(loop_target, "Frame Fang: Convert video", "// CONVERT VIDEO", "convert-video", CARD)?;
+        // Every group keeps its place when it is hidden, so changing the
+        // format never moves the rest of the form.
+        let form = Form::new(CARD_W)
+            .field("INPUT", Control::Source)
+            .pills("OUTPUT FORMAT", &FORMATS.map(Control::Format))
+            .pills("QUALITY", &QUALITIES.map(Control::Quality))
+            .pills("SIZE  (can only shrink)", &SIZES.map(Control::Resize))
+            .pills("GIF FRAMES PER SECOND", &FRAME_RATES.map(Control::Fps));
+        // Starts on an MP4 at medium quality and full size (12 fps for GIF).
+        let mut view = ConvertVideoView {
+            shell, form,
+            format: VidFormat::Mp4, quality: VidQuality::Med, resize: VidResize::Source, fps: GifFps::Twelve,
+            source: None, hover: None, status: Status::Idle, result: None, outcome: None,
         };
-        me.rows = me.build_rows();
-        me.redraw();
-        Ok(me)
+        view.paint();
+        Ok(view)
     }
 
-    pub fn window_id(&self) -> WindowId { self.window.id() }
+    pub fn window_id(&self) -> WindowId { self.shell.id() }
 
-    /// Called every poll tick from the tray loop so the running-animation
-    /// keeps moving and the conversion result lands when it arrives.
+    /// Called on every poll tick of the tray loop: picks up the worker's
+    /// result when it lands, and keeps the running line's clock moving.
     pub fn tick(&mut self) {
-        if let Some(rx) = &self.rx {
-            if let Ok(res) = rx.try_recv() {
-                self.status = match res {
-                    Ok(p)  => Status::Ok(p),
-                    Err(e) => Status::Err(e),
-                };
-                self.rx = None;
-                self.window.request_redraw();
-            }
+        if let Some(Ok(done)) = self.result.as_ref().map(mpsc::Receiver::try_recv) {
+            self.status = match done {
+                Ok(path) => Status::Saved(path),
+                Err(why) => Status::Failed(why),
+            };
+            self.result = None;
+            self.shell.repaint();
         }
-        if matches!(self.status, Status::Running { .. }) {
-            self.window.request_redraw();
+        if matches!(self.status, Status::Working(_)) {
+            self.shell.repaint();
         }
     }
 
     pub fn handle_event(&mut self, event: WindowEvent) {
-        match event {
-            WindowEvent::CloseRequested => self.outcome = Some(ConvertVideoOutcome::Closed),
-            WindowEvent::KeyboardInput {
-                event: winit::event::KeyEvent {
-                    logical_key: Key::Named(NamedKey::Escape),
-                    state: ElementState::Pressed, ..
-                }, ..
-            } => self.outcome = Some(ConvertVideoOutcome::Closed),
-            WindowEvent::CursorLeft { .. } => {
-                if self.title_bar.leave() { self.window.request_redraw(); }
+        match self.shell.input(event) {
+            Input::Close | Input::Key(NamedKey::Escape) => self.outcome = Some(ConvertVideoOutcome::Closed),
+            Input::Moved => {
+                let now = self.control_at(self.shell.cursor);
+                self.shell.track_hover(&mut self.hover, now, now.is_some());
             }
-            WindowEvent::CursorMoved { position, .. } => {
-                let raw = (position.x as i32, position.y as i32);
-                if self.title_bar.hover_at(&self.window, raw) { self.window.request_redraw(); }
-                // The dialog's own coordinates start below the title strip.
-                self.cursor = (raw.0, raw.1 - crate::chrome::TITLE_H);
-                let new_hover = self.hit_test(self.cursor.0, self.cursor.1);
-                self.window.set_cursor(if new_hover.is_some() { CursorIcon::Pointer } else { CursorIcon::Default });
-                if new_hover != self.hover {
-                    self.hover = new_hover;
-                    self.window.request_redraw();
+            Input::Press => {
+                if let Some(control) = self.control_at(self.shell.cursor) {
+                    self.press(control);
+                    self.shell.repaint();
                 }
             }
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Left, ..
-            } => {
-                match self.title_bar.press(&self.window, self.cursor) {
-                    Some(crate::chrome::TitlePart::Close) => return self.handle_event(WindowEvent::CloseRequested),
-                    Some(_) => return,
-                    None => {}
-                }
-                if let Some(i) = self.hit_test(self.cursor.0, self.cursor.1) {
-                    self.activate(i);
-                }
-            }
-            WindowEvent::Resized(_) | WindowEvent::RedrawRequested => self.redraw(),
+            Input::Paint => self.paint(),
             _ => {}
         }
     }
 
-    fn hit_test(&self, x: i32, y: i32) -> Option<usize> {
-        let fmt = self.format;
-        self.rows.iter().position(|r| {
-            if !row_visible_for(fmt, r.kind) { return false; }
-            let (rx, ry, rw, rh) = r.rect;
-            x >= rx && x < rx + rw && y >= ry && y < ry + rh
-        })
+    fn control_at(&self, p: (i32, i32)) -> Option<Control> {
+        if inside(convert_button(CARD), p) { return Some(Control::Convert); }
+        self.form.hit(p, |c| shown_for(self.format, c))
     }
 
-    fn activate(&mut self, idx: usize) {
-        let kind = self.rows[idx].kind;
-        match kind {
-            WidgetKind::Source => {
-                let starting = self.source.clone()
-                    .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-                    .unwrap_or_else(|| {
-                        directories::UserDirs::new()
-                            .and_then(|u| u.video_dir().map(|p| p.to_path_buf()))
-                            .unwrap_or_else(std::env::temp_dir)
-                    });
-                if let Some(p) = rfd::FileDialog::new()
-                    .set_title("Pick a video")
-                    .set_directory(&starting)
-                    .add_filter("Videos", &["mp4", "mov", "webm", "mkv", "avi", "m4v", "gif"])
-                    .pick_file()
-                {
-                    self.source = Some(p);
-                    self.status = Status::Idle;
-                }
+    fn press(&mut self, control: Control) {
+        match control {
+            Control::Source => {
+                let picked = choose_file("Choose a video", self.source.as_deref(), directories::UserDirs::video_dir,
+                    "Videos", &["mp4", "mov", "webm", "mkv", "avi", "m4v", "gif"]);
+                // A new choice clears the last result line.
+                if picked.is_some() { (self.source, self.status) = (picked, Status::Idle); }
             }
-            WidgetKind::FormatMp4  => { self.format = VidFormat::Mp4;  self.status = Status::Idle; }
-            WidgetKind::FormatMov  => { self.format = VidFormat::Mov;  self.status = Status::Idle; }
-            WidgetKind::FormatWebm => { self.format = VidFormat::Webm; self.status = Status::Idle; }
-            WidgetKind::FormatMkv  => { self.format = VidFormat::Mkv;  self.status = Status::Idle; }
-            WidgetKind::FormatGif  => { self.format = VidFormat::Gif;  self.status = Status::Idle; }
-            WidgetKind::QualityLow  => { self.quality = VidQuality::Low;  }
-            WidgetKind::QualityMed  => { self.quality = VidQuality::Med;  }
-            WidgetKind::QualityHigh => { self.quality = VidQuality::High; }
-            WidgetKind::ResizeSource => { self.resize = VidResize::Source; }
-            WidgetKind::Resize1080   => { self.resize = VidResize::P1080;  }
-            WidgetKind::Resize720    => { self.resize = VidResize::P720;   }
-            WidgetKind::Resize480    => { self.resize = VidResize::P480;   }
-            WidgetKind::GifFps8      => { self.gif_fps = GifFps::Eight;      }
-            WidgetKind::GifFps12     => { self.gif_fps = GifFps::Twelve;     }
-            WidgetKind::GifFps24     => { self.gif_fps = GifFps::TwentyFour; }
-            WidgetKind::Convert => {
-                self.start_conversion();
-            }
+            Control::Format(f) => (self.format, self.status) = (f, Status::Idle),
+            Control::Quality(q) => self.quality = q,
+            Control::Resize(r) => self.resize = r,
+            Control::Fps(f) => self.fps = f,
+            Control::Convert => self.start(),
         }
-        self.window.request_redraw();
     }
 
-    fn start_conversion(&mut self) {
-        if matches!(self.status, Status::Running { .. }) {
-            return;
-        }
-        let Some(src) = self.source.clone() else {
-            self.status = Status::Err("Pick a source video first.".to_owned());
-            return;
+    /// Start FFmpeg on a worker thread, unless one is already running.
+    fn start(&mut self) {
+        if matches!(self.status, Status::Working(_)) { return; }
+        let ready = match &self.source {
+            None => Err("Choose a video to convert first."),
+            Some(src) => locate_ffmpeg().map(|ffmpeg| (src.clone(), ffmpeg)).ok_or(crate::ffmpeg_fetch::missing_message()),
         };
-        let ffmpeg = match locate_ffmpeg() {
-            Some(p) => p,
-            None => {
-                self.status = Status::Err(crate::ffmpeg_fetch::missing_message().to_owned());
+        let (src, ffmpeg) = match ready {
+            Ok(both) => both,
+            Err(why) => {
+                self.status = Status::Failed(why.to_owned());
                 return;
             }
         };
-        let dst = {
-            let stem = src.file_stem().map(|s| s.to_string_lossy().to_string())
-                                       .unwrap_or_else(|| "framefang".to_owned());
-            let parent = src.parent().map(|p| p.to_path_buf())
-                                     .unwrap_or_else(std::env::temp_dir);
-            parent.join(format!("{stem}.framefang.{}", self.format.ext()))
-        };
-        let src_s = src.to_string_lossy().to_string();
-        let dst_s = dst.to_string_lossy().to_string();
-        let args = self.format.ffmpeg_args(&src_s, &dst_s, self.quality, self.resize, self.gif_fps);
+        let dst = output_beside(&src, self.format.ext());
+        let job = plan(self.format, &src.to_string_lossy(), &dst.to_string_lossy(), self.quality, self.resize, self.fps);
 
-        let (tx, rx) = mpsc::channel();
-        self.rx = Some(rx);
-        self.status = Status::Running { since: Instant::now() };
+        let (send, receive) = mpsc::channel();
+        (self.result, self.status) = (Some(receive), Status::Working(Instant::now()));
+        std::thread::spawn(move || { let _ = send.send(run_job(&ffmpeg, &src, dst, job)); });
+    }
 
-        let dst_thread = dst.clone();
-        let gif = (self.format == VidFormat::Gif).then(|| self.format.gif_opts(self.resize, self.gif_fps));
-        std::thread::spawn(move || {
-            if let Some(o) = gif {
-                let cancel = std::sync::atomic::AtomicBool::new(false);
-                let outcome = crate::gif::convert(&ffmpeg, &src, &dst_thread, o, &cancel).map(|_| dst_thread);
-                let _ = tx.send(outcome);
-                return;
+    fn paint(&mut self) {
+        let Some(mut page) = self.shell.page() else { return };
+        let format = self.format;
+        self.form.paint(&mut page, |c| shown_for(format, c), |page, control, r| {
+            let hovered = self.hover == Some(control);
+            match control {
+                Control::Source => draw_source(page, r, "Video file", self.source.as_deref(), "(choose a video)", hovered),
+                Control::Format(f) => draw_pill(page, r, f.caption(), true, f == self.format, hovered),
+                Control::Quality(q) => draw_pill(page, r, q.caption(), false, q == self.quality, hovered),
+                Control::Resize(s) => draw_pill(page, r, s.caption(), false, s == self.resize, hovered),
+                Control::Fps(f) => draw_pill(page, r, f.caption(), false, f == self.fps, hovered),
+                Control::Convert => {}
             }
-            let mut cmd = Command::new(&ffmpeg);
-            cmd.args(&args)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::piped());
-            // CREATE_NO_WINDOW: don't flash a console while converting on Windows.
-            #[cfg(target_os = "windows")]
-            { use std::os::windows::process::CommandExt; cmd.creation_flags(0x0800_0000); }
-            let res = cmd.output();
-            let outcome = match res {
-                Ok(out) if out.status.success() => Ok(dst_thread),
-                Ok(out) => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    let last_line = stderr.lines().last().unwrap_or("ffmpeg failed").to_owned();
-                    Err(format!("ffmpeg: {last_line}"))
-                }
-                Err(e) => Err(format!("ffmpeg spawn failed: {e}")),
-            };
-            let _ = tx.send(outcome);
         });
-    }
-
-    fn build_rows(&self) -> Vec<Row> {
-        let mut rows = Vec::new();
-        let row_w = WIN_W as i32 - PAD * 2;
-
-        // Convert now at the bottom right, where a dialog's commit goes; the
-        // title bar's own button closes the window.
-        rows.push(Row { kind: WidgetKind::Convert, label: "Convert now",
-                        rect: (WIN_W as i32 - PAD - CONVERT_W, WIN_H as i32 - PAD - BTN_H, CONVERT_W, BTN_H) });
-
-        let mut y = BODY_Y;
-        rows.push(Row { kind: WidgetKind::Source, label: "Source video", rect: (PAD, y, row_w, ROW_H) });
-        y += ROW_H + 22;
-
-        y += 18;
-        // FORMAT pills span the full content width — no left-column
-        // reservation — so each pill is generous and the row reads as a
-        // single visual unit. Five pills, evenly spaced with a 14 px gap.
-        let fmt_y = y;
-        let fmt_gap = 14;
-        let count = 5;
-        let content_w = WIN_W as i32 - PAD * 2;
-        let fmt_w = (content_w - fmt_gap * (count - 1)) / count;
-        let fmt_x0 = PAD;
-        rows.push(Row { kind: WidgetKind::FormatMp4,  label: "MP4",  rect: (fmt_x0 + 0 * (fmt_w + fmt_gap), fmt_y, fmt_w, FMT_PILL_H) });
-        rows.push(Row { kind: WidgetKind::FormatMov,  label: "MOV",  rect: (fmt_x0 + 1 * (fmt_w + fmt_gap), fmt_y, fmt_w, FMT_PILL_H) });
-        rows.push(Row { kind: WidgetKind::FormatWebm, label: "WEBM", rect: (fmt_x0 + 2 * (fmt_w + fmt_gap), fmt_y, fmt_w, FMT_PILL_H) });
-        rows.push(Row { kind: WidgetKind::FormatMkv,  label: "MKV",  rect: (fmt_x0 + 3 * (fmt_w + fmt_gap), fmt_y, fmt_w, FMT_PILL_H) });
-        rows.push(Row { kind: WidgetKind::FormatGif,  label: "GIF",  rect: (fmt_x0 + 4 * (fmt_w + fmt_gap), fmt_y, fmt_w, FMT_PILL_H) });
-        y += FMT_PILL_H + 22;
-
-        // QUALITY (3 pills) — applies to MP4/MOV/WEBM/GIF. Hidden for MKV
-        // (gated in render + hit_test) since MKV is a stream-copy path.
-        y += 18;
-        let q_y = y;
-        let q_count = 3;
-        let q_w = (content_w - fmt_gap * (q_count - 1)) / q_count;
-        let q_x0 = PAD;
-        rows.push(Row { kind: WidgetKind::QualityLow,  label: "Low",    rect: (q_x0 + 0 * (q_w + fmt_gap), q_y, q_w, FMT_PILL_H) });
-        rows.push(Row { kind: WidgetKind::QualityMed,  label: "Medium", rect: (q_x0 + 1 * (q_w + fmt_gap), q_y, q_w, FMT_PILL_H) });
-        rows.push(Row { kind: WidgetKind::QualityHigh, label: "High",   rect: (q_x0 + 2 * (q_w + fmt_gap), q_y, q_w, FMT_PILL_H) });
-        y += FMT_PILL_H + 22;
-
-        // RESIZE (4 pills) — downscale-only output cap. Always available.
-        y += 18;
-        let r_y = y;
-        let r_count = 4;
-        let r_w = (content_w - fmt_gap * (r_count - 1)) / r_count;
-        let r_x0 = PAD;
-        rows.push(Row { kind: WidgetKind::ResizeSource, label: "Source", rect: (r_x0 + 0 * (r_w + fmt_gap), r_y, r_w, FMT_PILL_H) });
-        rows.push(Row { kind: WidgetKind::Resize1080,   label: "1080p",  rect: (r_x0 + 1 * (r_w + fmt_gap), r_y, r_w, FMT_PILL_H) });
-        rows.push(Row { kind: WidgetKind::Resize720,    label: "720p",   rect: (r_x0 + 2 * (r_w + fmt_gap), r_y, r_w, FMT_PILL_H) });
-        rows.push(Row { kind: WidgetKind::Resize480,    label: "480p",   rect: (r_x0 + 3 * (r_w + fmt_gap), r_y, r_w, FMT_PILL_H) });
-        y += FMT_PILL_H + 22;
-
-        // GIF FPS (3 pills) — only meaningful for GIF (gated in render +
-        // hit_test). Layout reserved so the dialog doesn't grow/shrink on
-        // format change.
-        y += 18;
-        let g_y = y;
-        let g_count = 3;
-        let g_w = (content_w - fmt_gap * (g_count - 1)) / g_count;
-        let g_x0 = PAD;
-        rows.push(Row { kind: WidgetKind::GifFps8,  label: "8 fps",  rect: (g_x0 + 0 * (g_w + fmt_gap), g_y, g_w, FMT_PILL_H) });
-        rows.push(Row { kind: WidgetKind::GifFps12, label: "12 fps", rect: (g_x0 + 1 * (g_w + fmt_gap), g_y, g_w, FMT_PILL_H) });
-        rows.push(Row { kind: WidgetKind::GifFps24, label: "24 fps", rect: (g_x0 + 2 * (g_w + fmt_gap), g_y, g_w, FMT_PILL_H) });
-        rows
-    }
-
-    fn redraw(&mut self) {
-        let phys = self.window.inner_size();
-        let (Some(w), Some(h)) = (NonZeroU32::new(phys.width), NonZeroU32::new(phys.height))
-            else { return; };
-        if let Err(e) = self.surface.resize(w, h) { eprintln!("convert-video: surface.resize: {e}"); return; }
-        let mut frame = match self.surface.buffer_mut() {
-            Ok(b) => b,
-            Err(e) => { eprintln!("convert-video: buffer_mut: {e}"); return; }
-        };
-        let win_w = w.get() as usize;
-        // The dialog draws into its own buffer, placed below the title strip.
-        let win_h = (h.get() as usize).saturating_sub(crate::chrome::TITLE_H as usize);
-        let mut buf = vec![0u32; win_w * win_h];
-        // The title bar holds the heading; the glowing rule runs along the
-        // body's top.
-        crate::hud::backdrop(&mut buf, win_w, win_h, 0);
-
-        let mut surf = BufferSurface { buf: &mut buf, w: win_w as i32, h: win_h as i32 };
-
-        // Section headers, numbered in the order shown.
-        let mut sec = 0;
-        if let Some(r) = self.rows.iter().find(|r| r.kind == WidgetKind::Source) {
-            section_header(&mut surf, &mut sec, "SOURCE", r.rect.1 - 22);
-        }
-        if let Some(r) = self.rows.iter().find(|r| r.kind == WidgetKind::FormatMp4) {
-            section_header(&mut surf, &mut sec, "FORMAT", r.rect.1 - 22);
-        }
-        // QUALITY is meaningful for everything except MKV (stream-copy).
-        if self.format != VidFormat::Mkv {
-            if let Some(r) = self.rows.iter().find(|r| r.kind == WidgetKind::QualityLow) {
-                section_header(&mut surf, &mut sec, "QUALITY", r.rect.1 - 22);
-            }
-        }
-        // RESIZE applies to MP4 / MOV / WEBM / GIF (but not MKV, which
-        // stream-copies). Keep the header visible there too — the slot is
-        // reserved so layout doesn't jump on format change.
-        if self.format != VidFormat::Mkv {
-            if let Some(r) = self.rows.iter().find(|r| r.kind == WidgetKind::ResizeSource) {
-                section_header(&mut surf, &mut sec, "RESIZE  (downscale only)", r.rect.1 - 22);
-            }
-        }
-        // GIF FPS section header is only meaningful when the user actually
-        // picked GIF — the other formats keep source framerate.
-        if self.format == VidFormat::Gif {
-            if let Some(r) = self.rows.iter().find(|r| r.kind == WidgetKind::GifFps8) {
-                section_header(&mut surf, &mut sec, "GIF FRAME RATE", r.rect.1 - 22);
-            }
-        }
-
-        // Cache format ahead of the borrow loop — `row_visible` takes &self
-        // and we'd otherwise alias the in-flight `&mut buf` mutable borrow.
-        let format  = self.format;
-        let quality = self.quality;
-        let resize  = self.resize;
-        let gif_fps = self.gif_fps;
-        for (i, row) in self.rows.iter().enumerate() {
-            if !row_visible_for(format, row.kind) { continue; }
-            let hovered = self.hover == Some(i);
-            render_row(&mut surf, row, hovered, &self.source, format, quality, resize, gif_fps);
-        }
-
-        // Status in the bottom bar, level with Convert now and clear of it.
-        let footer_y = WIN_H as i32 - PAD - (BTN_H + bitmap_font::GLYPH_H) / 2;
-        let footer_w = WIN_W as i32 - PAD - CONVERT_W - 16 - PAD;
-        match &self.status {
-            Status::Idle => {}
-            Status::Running { since } => {
-                let dots = (since.elapsed().as_millis() / 400) % 4;
-                let dots_s: String = std::iter::repeat('.').take(dots as usize).collect();
-                let secs = since.elapsed().as_secs();
-                let msg = format!("encoding{dots_s}  {secs}s  (runs in the background)");
-                draw_text(&mut surf, PAD, footer_y, 1, &truncate_for(&msg, footer_w), argb_to_framefang(TEXT_MUTED()));
-            }
-            Status::Ok(path) => {
-                let msg = format!("Saved: {}", path.display());
-                draw_text(&mut surf, PAD, footer_y, 1, &truncate_for(&msg, footer_w), argb_to_framefang(OK_TINT));
-            }
-            Status::Err(e) => {
-                draw_text(&mut surf, PAD, footer_y, 1, &truncate_for(e, footer_w), argb_to_framefang(DANGER()));
-            }
-        }
-
-        self.title_bar.draw(&mut frame, win_w, &buf, "// CONVERT VIDEO", BG_TOP());
-        if let Err(e) = frame.present() { eprintln!("convert-video: buf.present: {e}"); }
+        page.button(convert_button(CARD), "Convert", true, self.hover == Some(Control::Convert));
+        self.status.paint(&mut page, CARD);
+        self.shell.show(page);
     }
 }
 
-/// Find a usable ffmpeg: the shared lookup the recorder uses too (next to
-/// us, a Mac bundle, `PATH`, then the copy Framefang downloaded).
-/// `pub(crate)` because the tray loop's annotate-recording burn step reuses it.
+/// Carry out `job` (on the worker thread), answering with where the result
+/// went. Nothing cancels a conversion: closing the dialog lets it finish.
+fn run_job(ffmpeg: &std::path::Path, src: &std::path::Path, dst: PathBuf, job: Job) -> Result<PathBuf, String> {
+    let never = AtomicBool::new(false);
+    let ran = match job {
+        Job::Gif(opts) => crate::gif::convert(ffmpeg, src, &dst, opts, &never),
+        Job::Single(args) => crate::gif::run(ffmpeg, &args, &never),
+    };
+    ran.map(|()| dst)
+}
+
+/// A usable FFmpeg, found the way the recorder finds it (beside the app,
+/// in a Mac bundle, on `PATH`, then the copy Frame Fang downloaded). The
+/// tray loop uses it as well, for recordings and the annotate burn-in.
 pub(crate) fn locate_ffmpeg() -> Option<PathBuf> {
     framefang_platform::recorder::locate_ffmpeg()
 }
 
-/// Whether a given widget is currently relevant for the chosen format.
-/// Hidden rows neither paint nor catch clicks — keeps the dialog from
-/// showing controls that wouldn't do anything (MKV doesn't re-encode, only
-/// GIF cares about frame rate). Free function so we can use it from
-/// `redraw` while a mutable borrow on the framebuffer is alive.
-fn row_visible_for(format: VidFormat, kind: WidgetKind) -> bool {
-    match kind {
-        WidgetKind::QualityLow | WidgetKind::QualityMed | WidgetKind::QualityHigh
-            => format != VidFormat::Mkv,
-        WidgetKind::ResizeSource | WidgetKind::Resize1080
-        | WidgetKind::Resize720  | WidgetKind::Resize480
-            => format != VidFormat::Mkv,
-        WidgetKind::GifFps8 | WidgetKind::GifFps12 | WidgetKind::GifFps24
-            => format == VidFormat::Gif,
-        _   => true,
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
 
-/// The next section label (`hud::section`), numbered in the order they
-/// appear: `n` counts the ones already drawn this frame.
-fn section_header(surf: &mut BufferSurface, n: &mut usize, text: &str, y: i32) {
-    *n += 1;
-    crate::hud::section(surf.buf, surf.w as usize, surf.h as usize, PAD, WIN_W as i32 - PAD, y, *n, text);
-}
-
-fn render_row<S: painter::Surface>(
-    surf: &mut S, row: &Row,
-    hovered: bool,
-    source: &Option<PathBuf>,
-    format: VidFormat,
-    quality: VidQuality,
-    resize:  VidResize,
-    gif_fps: GifFps,
-) {
-    let (rx, ry, rw, rh) = row.rect;
-
-    if row.kind == WidgetKind::Convert {
-        let is_primary = true;
-        let border = if is_primary { LASER() } else if hovered { LASER_DIM() } else { PANEL_BORDER() };
-        let fill   = if is_primary && hovered { PRIMARY_FILL() } else if hovered { HOVER_FILL() } else { 0x0000_0000 };
-        if fill != 0 { fill_rect(surf, rx, ry, rw, rh, argb_to_framefang(fill)); }
-        stroke_rect_argb(surf, rx, ry, rw, rh, argb_to_framefang(border));
-        let tw = bitmap_font::measure(row.label, 1);
-        let tx = rx + (rw - tw) / 2;
-        let ty = ry + (rh - bitmap_font::GLYPH_H) / 2;
-        let color = if is_primary { LASER() } else { TEXT_BRIGHT };
-        draw_text(surf, tx, ty, 1, row.label, argb_to_framefang(color));
-        return;
-    }
-
-    // Generic "is this the currently-selected pill" check for every pill
-    // group. Keeps the render branch below simple.
-    let selected = match row.kind {
-        WidgetKind::FormatMp4  => format == VidFormat::Mp4,
-        WidgetKind::FormatMov  => format == VidFormat::Mov,
-        WidgetKind::FormatWebm => format == VidFormat::Webm,
-        WidgetKind::FormatMkv  => format == VidFormat::Mkv,
-        WidgetKind::FormatGif  => format == VidFormat::Gif,
-        WidgetKind::QualityLow  => quality == VidQuality::Low,
-        WidgetKind::QualityMed  => quality == VidQuality::Med,
-        WidgetKind::QualityHigh => quality == VidQuality::High,
-        WidgetKind::ResizeSource => resize == VidResize::Source,
-        WidgetKind::Resize1080   => resize == VidResize::P1080,
-        WidgetKind::Resize720    => resize == VidResize::P720,
-        WidgetKind::Resize480    => resize == VidResize::P480,
-        WidgetKind::GifFps8      => gif_fps == GifFps::Eight,
-        WidgetKind::GifFps12     => gif_fps == GifFps::Twelve,
-        WidgetKind::GifFps24     => gif_fps == GifFps::TwentyFour,
-        _                         => false,
-    };
-    let is_pill = !matches!(row.kind, WidgetKind::Source);
-    if is_pill {
-        let border = if selected { LASER() } else if hovered { LASER_DIM() } else { FIELD_BORDER() };
-        let fill   = if selected { 0x000c_2820 } else if hovered { HOVER_FILL() } else { FIELD_BG() };
-        fill_rect(surf, rx, ry, rw, rh, argb_to_framefang(fill));
-        stroke_rect_argb(surf, rx, ry, rw, rh, argb_to_framefang(border));
-        // Big labels for format; slightly smaller for the secondary
-        // quality/resize/fps rows so they don't compete visually with the
-        // primary format choice.
-        let label_scale = if matches!(row.kind,
-            WidgetKind::FormatMp4 | WidgetKind::FormatMov
-            | WidgetKind::FormatWebm | WidgetKind::FormatMkv | WidgetKind::FormatGif)
-        { 2 } else { 1 };
-        let tw = bitmap_font::measure(row.label, label_scale);
-        let tx = rx + (rw - tw) / 2;
-        let ty = ry + (rh - bitmap_font::GLYPH_H * label_scale) / 2;
-        let color = if selected { LASER() } else { TEXT_BRIGHT };
-        draw_text(surf, tx, ty, label_scale, row.label, argb_to_framefang(color));
-        return;
-    }
-
-    if hovered && row.kind == WidgetKind::Source {
-        fill_rect(surf, rx, ry, rw, rh, argb_to_framefang(HOVER_FILL()));
-    }
-    let label_y = ry + (rh - bitmap_font::GLYPH_H) / 2;
-    draw_text(surf, rx + 6, label_y, 1, row.label, argb_to_framefang(TEXT_BRIGHT));
-
-    let val_x = rx + LABEL_W;
-    let val_w = rw - LABEL_W - 4;
-    let val_y = ry + 4;
-    let val_h = rh - 8;
-
-    if row.kind == WidgetKind::Source {
-        let browse_w = 90;
-        let path_w   = val_w - browse_w - 8;
-        fill_rect(surf, val_x, val_y, path_w, val_h, argb_to_framefang(FIELD_BG()));
-        stroke_rect_argb(surf, val_x, val_y, path_w, val_h, argb_to_framefang(FIELD_BORDER()));
-        let val = source.as_ref()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| "(pick a video)".to_owned());
-        let truncated = truncate_for(&val, path_w - 14);
-        let ty = val_y + (val_h - bitmap_font::GLYPH_H) / 2;
-        let color = if source.is_some() { TEXT_BRIGHT } else { TEXT_DIM() };
-        draw_text(surf, val_x + 7, ty, 1, &truncated, argb_to_framefang(color));
-        let bx = val_x + path_w + 8;
-        let by = val_y;
-        let bw = browse_w;
-        let bh = val_h;
-        stroke_rect_argb(surf, bx, by, bw, bh, argb_to_framefang(if hovered { LASER_DIM() } else { FIELD_BORDER() }));
-        let label = "Browse...";
-        let tw = bitmap_font::measure(label, 1);
-        let tx = bx + (bw - tw) / 2;
-        let ty = by + (bh - bitmap_font::GLYPH_H) / 2;
-        draw_text(surf, tx, ty, 1, label, argb_to_framefang(TEXT_BRIGHT));
-    }
-}
-
-// ── tiny rendering helpers ──────────────────────────────────────────────────
-
-struct BufferSurface<'a> {
-    buf: &'a mut [u32],
-    w:   i32,
-    h:   i32,
-}
-
-impl painter::Surface for BufferSurface<'_> {
-    fn width(&self)  -> i32 { self.w }
-    fn height(&self) -> i32 { self.h }
-    fn read(&self, x: i32, y: i32) -> [u8; 4] {
-        if x < 0 || y < 0 || x >= self.w || y >= self.h { return [0, 0, 0, 0xFF]; }
-        let p = self.buf[(y as usize) * (self.w as usize) + (x as usize)];
-        [((p >> 16) & 0xFF) as u8, ((p >> 8) & 0xFF) as u8, (p & 0xFF) as u8, 0xFF]
-    }
-    fn write(&mut self, x: i32, y: i32, rgba: [u8; 4]) {
-        if x < 0 || y < 0 || x >= self.w || y >= self.h { return; }
-        let dst = (y as usize) * (self.w as usize) + (x as usize);
-        self.buf[dst] = ((rgba[0] as u32) << 16) | ((rgba[1] as u32) << 8) | rgba[2] as u32;
-    }
-}
-
-fn argb_to_framefang(argb: u32) -> FramefangRgba {
-    FramefangRgba {
-        r: ((argb >> 16) & 0xFF) as u8,
-        g: ((argb >>  8) & 0xFF) as u8,
-        b: ( argb        & 0xFF) as u8,
-        a: 255,
-    }
-}
-
-
-fn fill_rect<S: painter::Surface>(s: &mut S, x: i32, y: i32, w: i32, h: i32, color: FramefangRgba) {
-    let rgba = [color.r, color.g, color.b, color.a];
-    for yy in y..y + h { for xx in x..x + w { s.write(xx, yy, rgba); } }
-}
-
-fn stroke_rect_argb<S: painter::Surface>(s: &mut S, x: i32, y: i32, w: i32, h: i32, color: FramefangRgba) {
-    let rgba = [color.r, color.g, color.b, color.a];
-    for xx in x..x + w { s.write(xx, y, rgba); s.write(xx, y + h - 1, rgba); }
-    for yy in y..y + h { s.write(x, yy, rgba); s.write(x + w - 1, yy, rgba); }
-}
-
-fn draw_text<S: painter::Surface>(s: &mut S, x: i32, y: i32, scale: i32, text: &str, color: FramefangRgba) {
-    painter::draw_text(s, x, y, scale, text, color);
-}
-
-fn centered_origin(loop_target: &ActiveEventLoop, w: u32, h: u32) -> (i32, i32) {
-    let primary = loop_target.primary_monitor()
-        .or_else(|| loop_target.available_monitors().next());
-    let (mon_x, mon_y, mon_w, mon_h) = match primary {
-        Some(m) => {
-            let pos  = m.position();
-            let size = m.size();
-            (pos.x as i32, pos.y as i32, size.width as i32, size.height as i32)
+    fn args(format: VidFormat, quality: VidQuality, size: VidResize) -> Vec<String> {
+        match plan(format, "in.mov", "out.mp4", quality, size, GifFps::Twelve) {
+            Job::Single(a) => a,
+            Job::Gif(_) => panic!("{format:?} should be a single run"),
         }
-        None => (0, 0, 1920, 1080),
-    };
-    let x = mon_x + (mon_w - w as i32) / 2;
-    let y = mon_y + (mon_h - h as i32) / 2;
-    (x.max(mon_x), y.max(mon_y))
-}
-
-/// Shrink `s` until it fits in `max_px` at scale 1, eliding the middle instead
-/// of the tail: these fields mostly hold filesystem paths, and the leaf name at
-/// the end is the part worth reading.
-fn truncate_for(s: &str, max_px: i32) -> String {
-    if bitmap_font::measure(s, 1) <= max_px { return s.to_owned(); }
-    let ellipsis = "..";
-    // A glyph advances GLYPH_W plus the one-pixel gap that follows it; `measure`
-    // drops that gap only after the very last glyph, so a run of `n` chars is
-    // `n * advance - 1` wide and `n` chars fit while `n * advance - 1 <= max_px`.
-    let advance = bitmap_font::GLYPH_W + 1;
-    let fits = (max_px + 1) / advance;
-    let ell_n = ellipsis.chars().count() as i32;
-    if fits <= ell_n {
-        return ellipsis.chars().take(fits.max(0) as usize).collect();
     }
-    // Split the remaining budget two-thirds in favour of the tail.
-    let keep = fits - ell_n;
-    let tail = (keep * 2 / 3).max(1) as usize;
-    let head = keep as usize - tail;
-    // `fits < s.chars().count()` here (the early return covers the rest), so the
-    // head and tail slices can never overlap.
-    let chars: Vec<char> = s.chars().collect();
-    let mut out: String = chars[..head].iter().collect();
-    out.push_str(ellipsis);
-    out.extend(&chars[chars.len() - tail..]);
-    out
+
+    #[test]
+    fn mp4_and_mov_encode_with_x264_and_aac() {
+        let want = [
+            "-y", "-i", "in.mov",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "23",
+            "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart",
+            "out.mp4",
+        ];
+        assert_eq!(args(VidFormat::Mp4, VidQuality::Med, VidResize::Source), want);
+        assert_eq!(args(VidFormat::Mov, VidQuality::Med, VidResize::Source), want);
+        let small = [
+            "-y", "-i", "in.mov", "-vf", "scale='min(1280,iw)':'-2'",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "28",
+            "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart",
+            "out.mp4",
+        ];
+        assert_eq!(args(VidFormat::Mp4, VidQuality::Low, VidResize::P720), small);
+        let sharp = args(VidFormat::Mov, VidQuality::High, VidResize::P1080);
+        assert_eq!(&sharp[3..11], ["-vf", "scale='min(1920,iw)':'-2'", "-c:v", "libx264", "-preset", "slow", "-crf", "20"]);
+    }
+
+    #[test]
+    fn webm_encodes_with_vp9_and_opus() {
+        assert_eq!(args(VidFormat::Webm, VidQuality::Med, VidResize::Source), [
+            "-y", "-i", "in.mov",
+            "-c:v", "libvpx-vp9", "-crf", "32", "-b:v", "0",
+            "-c:a", "libopus", "-b:a", "128k",
+            "out.mp4",
+        ]);
+        assert_eq!(args(VidFormat::Webm, VidQuality::Low, VidResize::P480), [
+            "-y", "-i", "in.mov", "-vf", "scale='min(854,iw)':'-2'",
+            "-c:v", "libvpx-vp9", "-crf", "38", "-b:v", "0",
+            "-c:a", "libopus", "-b:a", "128k",
+            "out.mp4",
+        ]);
+        assert_eq!(args(VidFormat::Webm, VidQuality::High, VidResize::Source)[6], "28");
+    }
+
+    #[test]
+    fn mkv_copies_the_streams_whatever_the_knobs_say() {
+        let copy = ["-y", "-i", "in.mov", "-c", "copy", "out.mp4"];
+        for q in QUALITIES {
+            for s in SIZES {
+                assert_eq!(args(VidFormat::Mkv, q, s), copy);
+            }
+        }
+    }
+
+    #[test]
+    fn gif_takes_the_two_run_path_with_the_chosen_rate_and_cap() {
+        let Job::Gif(opts) = plan(VidFormat::Gif, "in.mp4", "out.gif", VidQuality::Med, VidResize::P720, GifFps::Twelve)
+        else { panic!("GIF must go through crate::gif") };
+        assert_eq!(opts.fps, 12);
+        assert_eq!(opts.scale, Some("scale='min(1280,iw)':'-2'"));
+        let Job::Gif(plain) = plan(VidFormat::Gif, "a", "b", VidQuality::Low, VidResize::Source, GifFps::TwentyFour)
+        else { unreachable!() };
+        assert_eq!((plain.fps, plain.scale), (24, None));
+
+        // The two command lines `gif::convert` runs for the first one.
+        let (src, out, palette) = (Path::new("in.mp4"), Path::new("out.gif"), Path::new("out.gif.palette.png"));
+        assert_eq!(crate::gif::palette_args(src, palette, opts), [
+            "-y", "-i", "in.mp4",
+            "-vf", "fps=12,scale='min(1280,iw)':'-2',palettegen=stats_mode=diff",
+            "out.gif.palette.png",
+        ]);
+        assert_eq!(crate::gif::gif_args(src, palette, out, opts), [
+            "-y", "-i", "in.mp4", "-i", "out.gif.palette.png",
+            "-lavfi", "fps=12,scale='min(1280,iw)':'-2'[x];[x][1:v]paletteuse=dither=sierra2_4a",
+            "-f", "gif", "out.gif",
+        ]);
+    }
+
+    #[test]
+    fn controls_hide_when_the_format_ignores_them() {
+        let q = Control::Quality(VidQuality::Low);
+        let s = Control::Resize(VidResize::P720);
+        let f = Control::Fps(GifFps::Eight);
+        assert!(shown_for(VidFormat::Mp4, q) && shown_for(VidFormat::Mp4, s) && !shown_for(VidFormat::Mp4, f));
+        assert!(!shown_for(VidFormat::Mkv, q) && !shown_for(VidFormat::Mkv, s) && !shown_for(VidFormat::Mkv, f));
+        assert!(shown_for(VidFormat::Gif, q) && shown_for(VidFormat::Gif, s) && shown_for(VidFormat::Gif, f));
+        for format in FORMATS {
+            assert!(shown_for(format, Control::Source) && shown_for(format, Control::Format(VidFormat::Gif)));
+        }
+    }
+
+    #[test]
+    fn the_form_keeps_every_group_in_place() {
+        let form = Form::new(CARD_W)
+            .field("INPUT", Control::Source)
+            .pills("OUTPUT FORMAT", &FORMATS.map(Control::Format))
+            .pills("QUALITY", &QUALITIES.map(Control::Quality))
+            .pills("SIZE", &SIZES.map(Control::Resize))
+            .pills("FPS", &FRAME_RATES.map(Control::Fps));
+        assert_eq!(form.rect_of(Control::Source), Some((24, 44, 712, 36)));
+        assert_eq!(form.rect_of(Control::Format(VidFormat::Gif)), Some((24 + 4 * 145, 120, 131, 46)));
+        assert_eq!(form.rect_of(Control::Quality(VidQuality::High)), Some((24 + 2 * 242, 206, 228, 46)));
+        assert_eq!(form.rect_of(Control::Resize(VidResize::P480)), Some((24 + 3 * 181, 292, 167, 46)));
+        assert_eq!(form.rect_of(Control::Fps(GifFps::Eight)), Some((24, 378, 228, 46)));
+        // The hidden frame-rate pills take no clicks outside GIF.
+        assert!(form.hit((30, 390), |c| shown_for(VidFormat::Mp4, c)).is_none());
+        assert!(form.hit((30, 390), |c| shown_for(VidFormat::Gif, c)) == Some(Control::Fps(GifFps::Eight)));
+        assert_eq!(convert_button(CARD), (596, 613, 140, 34));
+    }
 }

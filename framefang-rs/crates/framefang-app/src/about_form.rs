@@ -1,345 +1,200 @@
-//! Themed About dialog. Same laser-green / void-black skin as the Settings
-//! window — replaces the prior `rfd::MessageDialog` info popup.
+//! The About window.
 //!
-//! Lifecycle pattern mirrors `SettingsView` / `PinView`: the tray app owns
-//! an `Option<AboutView>`, routes `WindowEvent`s by `WindowId`, and polls
-//! `outcome` after each event to know when the user dismissed the dialog.
+//! A small fixed card: the version, a byline whose name links to the
+//! author's page, three label and value facts, and two buttons along the
+//! bottom. The tray loop keeps it in an `Option<AboutView>`, hands it the
+//! window's events, and reads `outcome` afterwards to learn what the user
+//! asked for. The window itself is a [`crate::dialog::Shell`].
 
-use std::num::NonZeroU32;
-use std::rc::Rc;
-
-use anyhow::{anyhow, Result};
-use softbuffer::{Context, Surface};
-use winit::dpi::{PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use anyhow::Result;
+use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
-use winit::keyboard::{Key, NamedKey};
-use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
+use winit::keyboard::NamedKey;
+use winit::window::WindowId;
 
-use framefang_core::color::Rgba as FramefangRgba;
-
-use crate::bitmap_font;
-use crate::painter;
-use crate::painter::Surface as _;
-
-// Colors: the app's one palette (cyan and magenta on blue-black).
-#[allow(unused_imports)]
+use crate::bitmap_font::{self, GLYPH_H};
+use crate::dialog::{inside, Input, Rect, Shell};
 use crate::palette::*;
 
-const WIN_W: u32 = 480;
-const WIN_H: u32 = 280;
-const PAD:   i32 = 22;
-/// The version line's top: the window's first line, right under the title
-/// bar (which holds the heading).
-const BODY_Y: i32 = 22;
-/// The byline, a line gap under the version.
-const AUTHOR_Y: i32 = BODY_Y + 26;
+const CARD_W: u32 = 480;
+const CARD_H: u32 = 280;
+const MARGIN: i32 = 22;
+/// The version line: the body's first line, straight under the title strip
+/// (the strip carries the heading).
+const VERSION_Y: i32 = 22;
+/// The byline, one line gap lower.
+const BYLINE_Y: i32 = VERSION_Y + 26;
+const BYLINE_LEAD: &str = "Made by ";
+/// Drawn as a link to the author's page.
+const AUTHOR: &str = "winters27.";
 
+/// Label and value lines under the byline, one every `FACT_STEP` pixels.
+const FACTS: [(&str, &str); 3] = [
+    ("SOURCE", "github.com/winters27/framefang"),
+    ("LICENSE", "Apache-2.0"),
+    // FFmpeg is shipped beside the app and run as a separate program for
+    // recording and conversion, so it keeps its own licence.
+    ("CREDITS", "Uses FFmpeg (ffmpeg.org)"),
+];
+const FACTS_Y: i32 = BYLINE_Y + 30;
+const FACT_STEP: i32 = 18;
+const FACT_VALUE_X: i32 = MARGIN + 60;
+
+const LINK_W: i32 = 200;
+const LINK_H: i32 = 36;
+const LINK_GAP: i32 = 12;
+
+/// The things on the card that react to the pointer.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum BtnKind { Project, Updates, Author }
+enum Spot { Author, Project, Updates }
 
-struct Btn {
-    kind:  BtnKind,
-    label: &'static str,
-    rect:  (i32, i32, i32, i32),
+/// Every clickable spot and where it is. The author spot covers only the
+/// underlined name (not the lead-in), with a few pixels above and below so
+/// it is easy to hit; the two buttons share the bottom edge, centered.
+fn spots() -> [(Spot, Rect); 3] {
+    let name_x = MARGIN + bitmap_font::measure(BYLINE_LEAD, 1);
+    let name_w = bitmap_font::measure(AUTHOR, 1);
+    let row_y = CARD_H as i32 - MARGIN - LINK_H;
+    let first_x = (CARD_W as i32 - (LINK_W * 2 + LINK_GAP)) / 2;
+    [
+        (Spot::Author, (name_x, BYLINE_Y - 3, name_w, GLYPH_H + 8)),
+        (Spot::Project, (first_x, row_y, LINK_W, LINK_H)),
+        (Spot::Updates, (first_x + LINK_W + LINK_GAP, row_y, LINK_W, LINK_H)),
+    ]
 }
 
-/// The byline: a lead-in, then the author's name as a link.
-const BYLINE_LEAD: &str = "Made by ";
-const BYLINE_NAME: &str = "winters27.";
-// The Kashot credit Apache-2.0 asks for lives in NOTICE (shipped beside
-// LICENSE), not on this window (Brandon 2026-11-13: remove it here).
+impl Spot {
+    /// The button caption, or `None` for the byline link (drawn as text).
+    fn caption(self) -> Option<&'static str> {
+        match self {
+            Spot::Author => None,
+            Spot::Project => Some("Source on GitHub"),
+            Spot::Updates => Some("Look for updates"),
+        }
+    }
+
+    fn outcome(self) -> AboutOutcome {
+        match self {
+            Spot::Author => AboutOutcome::OpenAuthor,
+            Spot::Project => AboutOutcome::OpenProject,
+            Spot::Updates => AboutOutcome::OpenUpdates,
+        }
+    }
+}
 
 pub enum AboutOutcome {
-    /// User clicked Close / hit Esc / closed the window.
+    /// Dismissed: the strip's close button, Esc, Enter or the OS close.
     Closed,
-    /// User clicked "Project" — tray loop should shell-open the project's
-    /// source page and keep the view open until Close is hit explicitly.
+    /// Open the project's source page. The card stays up.
     OpenProject,
-    /// User clicked "Check for updates" — tray loop should open the
-    /// themed updates dialog (or the releases URL as a fallback).
+    /// Show the Updates dialog in place of this one.
     OpenUpdates,
-    /// User clicked the author byline → open the author's page.
+    /// Open the author's page. The card stays up.
     OpenAuthor,
 }
 
 pub struct AboutView {
-    window:  Rc<Window>,
-    _ctx:    Context<Rc<Window>>,
-    surface: Surface<Rc<Window>, Rc<Window>>,
-    btns:    Vec<Btn>,
-    cursor:  (i32, i32),
-    hover:   Option<usize>,
-    /// The title strip drawn above the dialog (minimize, close, drag).
-    title_bar: crate::chrome::TitleBar,
+    shell: Shell,
+    /// Index into [`spots`] under the pointer.
+    hover: Option<usize>,
     pub outcome: Option<AboutOutcome>,
 }
 
 impl AboutView {
     pub fn new(loop_target: &ActiveEventLoop) -> Result<Self> {
-        let win_h = WIN_H + crate::chrome::TITLE_H as u32;
-        let (cx, cy) = centered_origin(loop_target, WIN_W, win_h);
-        let attrs = crate::chrome::frameless(WindowAttributes::default())
-            .with_title("About Frame Fang")
-            .with_resizable(false)
-            .with_inner_size(PhysicalSize::new(WIN_W, win_h))
-            .with_position(PhysicalPosition::new(cx, cy))
-            .with_window_icon(crate::brand_icon::shared());
-
-        let window = loop_target
-            .create_window(attrs)
-            .map(Rc::new)
-            .map_err(|e| anyhow!("create_window (about): {e}"))?;
-        crate::chrome::finish(&window);
-
-        // Framefang runs as a menu-bar/tray agent, so on macOS there is no Dock
-        // icon to click if this opens behind the frontmost app. Ask for focus
-        // explicitly; on Windows/Linux it is a harmless raise.
-        window.focus_window();
-        window.set_cursor(CursorIcon::Default);
-        let ctx = Context::new(window.clone())
-            .map_err(|e| anyhow!("softbuffer Context::new (about): {e}"))?;
-        let surface = Surface::new(&ctx, window.clone())
-            .map_err(|e| anyhow!("softbuffer Surface::new (about): {e}"))?;
-
-        let mut me = AboutView {
-            window, _ctx: ctx, surface,
-            btns: Vec::new(),
-            cursor: (0, 0),
-            hover: None,
-            title_bar: Default::default(),
-            outcome: None,
-        };
-        me.btns = me.build_btns();
-        me.redraw();
-        Ok(me)
+        let shell = Shell::open(loop_target, "About Frame Fang", "// ABOUT", "about", (CARD_W, CARD_H))?;
+        let mut view = AboutView { shell, hover: None, outcome: None };
+        view.paint();
+        Ok(view)
     }
 
-    pub fn window_id(&self) -> WindowId { self.window.id() }
+    pub fn window_id(&self) -> WindowId { self.shell.id() }
 
     pub fn handle_event(&mut self, event: WindowEvent) {
-        match event {
-            WindowEvent::CloseRequested => self.outcome = Some(AboutOutcome::Closed),
-            WindowEvent::KeyboardInput {
-                event: winit::event::KeyEvent {
-                    logical_key: Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter),
-                    state: ElementState::Pressed, ..
-                }, ..
-            } => self.outcome = Some(AboutOutcome::Closed),
-            WindowEvent::CursorLeft { .. } => {
-                if self.title_bar.leave() { self.window.request_redraw(); }
+        match self.shell.input(event) {
+            Input::Close | Input::Key(NamedKey::Escape | NamedKey::Enter) => {
+                self.outcome = Some(AboutOutcome::Closed);
             }
-            WindowEvent::CursorMoved { position, .. } => {
-                let raw = (position.x as i32, position.y as i32);
-                if self.title_bar.hover_at(&self.window, raw) { self.window.request_redraw(); }
-                // The dialog's own coordinates start below the title strip.
-                self.cursor = (raw.0, raw.1 - crate::chrome::TITLE_H);
-                let new_hover = self.hit_test(self.cursor.0, self.cursor.1);
-                self.window.set_cursor(if new_hover.is_some() { CursorIcon::Pointer } else { CursorIcon::Default });
-                if new_hover != self.hover {
-                    self.hover = new_hover;
-                    self.window.request_redraw();
+            Input::Moved => {
+                let now = spot_at(self.shell.cursor);
+                self.shell.track_hover(&mut self.hover, now, now.is_some());
+            }
+            Input::Press => {
+                if let Some(i) = spot_at(self.shell.cursor) {
+                    self.outcome = Some(spots()[i].0.outcome());
                 }
             }
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Left, ..
-            } => {
-                match self.title_bar.press(&self.window, self.cursor) {
-                    Some(crate::chrome::TitlePart::Close) => return self.handle_event(WindowEvent::CloseRequested),
-                    Some(_) => return,
-                    None => {}
-                }
-                if let Some(i) = self.hit_test(self.cursor.0, self.cursor.1) {
-                    self.outcome = Some(match self.btns[i].kind {
-                        BtnKind::Project => AboutOutcome::OpenProject,
-                        BtnKind::Updates => AboutOutcome::OpenUpdates,
-                        BtnKind::Author  => AboutOutcome::OpenAuthor,
-                    });
-                }
-            }
-            WindowEvent::Resized(_) | WindowEvent::RedrawRequested => self.redraw(),
+            Input::Paint => self.paint(),
             _ => {}
         }
     }
 
-    fn hit_test(&self, x: i32, y: i32) -> Option<usize> {
-        self.btns.iter().position(|b| {
-            let (bx, by, bw, bh) = b.rect;
-            x >= bx && x < bx + bw && y >= by && y < by + bh
-        })
-    }
+    fn paint(&mut self) {
+        let Some(mut page) = self.shell.page() else { return };
 
-    fn build_btns(&self) -> Vec<Btn> {
-        // No Close button: the title bar's own closes the window.
-        let mut btns = Vec::new();
+        // The pixel font only has printable ASCII, so the separator is
+        // slashes rather than a middle dot.
+        let version = format!("v{}  //  a small, fast screenshot tool", env!("CARGO_PKG_VERSION"));
+        page.text(MARGIN, VERSION_Y, &version, TEXT_MUTED());
 
-        // Author byline hotspot. Geometry mirrors what `redraw` paints for
-        // the byline so the click hit-rect hugs the underlined name only
-        // (the lead-in stays non-clickable).
-        let lead_w = bitmap_font::measure(BYLINE_LEAD, 1);
-        let name_w = bitmap_font::measure(BYLINE_NAME, 1);
-        let author_y = AUTHOR_Y;
-        let author_x = PAD + lead_w;
-        // A bit of vertical padding so it's easy to hit.
-        btns.push(Btn {
-            kind:  BtnKind::Author,
-            label: "Author",
-            rect:  (author_x, author_y - 3, name_w, bitmap_font::GLYPH_H + 8),
-        });
+        page.text(MARGIN, BYLINE_Y, BYLINE_LEAD, TEXT_BRIGHT);
+        let (_, name) = spots()[0];
+        let link_ink = if self.hover == Some(0) { LASER() } else { SECTION_TINT() };
+        page.text(name.0, BYLINE_Y, AUTHOR, link_ink);
+        // Underlined so it reads as a link.
+        page.fill((name.0, BYLINE_Y + GLYPH_H, name.2, 1), link_ink);
 
-        // Body links — Project + Check for updates buttons centered above
-        // the bottom edge, side-by-side.
-        let link_w = 200;
-        let link_h = 36;
-        let y      = WIN_H as i32 - PAD - link_h;
-        let total  = link_w * 2 + 12;
-        let lx     = (WIN_W as i32 - total) / 2;
-        btns.push(Btn { kind: BtnKind::Project, label: "Project page",     rect: (lx,             y, link_w, link_h) });
-        btns.push(Btn { kind: BtnKind::Updates, label: "Check for updates", rect: (lx + link_w + 12, y, link_w, link_h) });
-        btns
-    }
-
-    fn redraw(&mut self) {
-        let phys = self.window.inner_size();
-        let (Some(w), Some(h)) = (NonZeroU32::new(phys.width), NonZeroU32::new(phys.height))
-            else { return; };
-        if let Err(e) = self.surface.resize(w, h) { eprintln!("about: surface.resize: {e}"); return; }
-        let mut frame = match self.surface.buffer_mut() {
-            Ok(b) => b,
-            Err(e) => { eprintln!("about: buffer_mut: {e}"); return; }
-        };
-        let win_w = w.get() as usize;
-        // The dialog draws into its own buffer, placed below the title strip.
-        let win_h = (h.get() as usize).saturating_sub(crate::chrome::TITLE_H as usize);
-        let mut buf = vec![0u32; win_w * win_h];
-        // The title bar holds the heading; the glowing rule runs along the
-        // body's top.
-        crate::hud::backdrop(&mut buf, win_w, win_h, 0);
-
-        let mut surf = BufferSurface { buf: &mut buf, w: win_w as i32, h: win_h as i32 };
-
-        // ASCII separator only — bitmap_font.rs ships glyphs for 0x20..=0x7E,
-        // so a U+00B7 middle dot would render as `?`.
-        let version = format!("v{}  //  the lightweight screenshot tool", env!("CARGO_PKG_VERSION"));
-        draw_text(&mut surf, PAD, BODY_Y, 1, &version, argb_to_framefang(TEXT_MUTED()));
-
-        // Body copy. The author's name is rendered separately so it can be
-        // a clickable link (hit-rect built in `build_btns` as a
-        // BtnKind::Author item).
-        let mut y = AUTHOR_Y;
-        let (lead, name) = (BYLINE_LEAD, BYLINE_NAME);
-        draw_text(&mut surf, PAD, y, 1, lead, argb_to_framefang(TEXT_BRIGHT));
-        let lead_w = bitmap_font::measure(lead, 1);
-        let name_x = PAD + lead_w;
-        let name_w = bitmap_font::measure(name, 1);
-        let author_hovered = self.btns.iter().enumerate()
-            .any(|(i, b)| b.kind == BtnKind::Author && self.hover == Some(i));
-        let name_color = if author_hovered { argb_to_framefang(LASER()) }
-                         else              { argb_to_framefang(SECTION_TINT()) };
-        draw_text(&mut surf, name_x, y, 1, name, name_color);
-        // Underline so it reads as a link.
-        let underline_y = y + bitmap_font::GLYPH_H;
-        for x in name_x..(name_x + name_w) {
-            surf.write(x, underline_y, [name_color.r, name_color.g, name_color.b, 255]);
-        }
-        y += 30;
-        draw_text(&mut surf, PAD, y, 1, "SOURCE",  argb_to_framefang(SECTION_TINT()));
-        draw_text(&mut surf, PAD + 60, y, 1, "github.com/winters27/framefang",       argb_to_framefang(TEXT_BRIGHT));
-        y += 18;
-        draw_text(&mut surf, PAD, y, 1, "LICENSE", argb_to_framefang(SECTION_TINT()));
-        draw_text(&mut surf, PAD + 60, y, 1, "Apache-2.0",                           argb_to_framefang(TEXT_BRIGHT));
-        y += 18;
-        // FFmpeg is bundled (GPL) and invoked as a separate process for
-        // recording + format conversion; Framefang itself stays Apache-2.0.
-        draw_text(&mut surf, PAD, y, 1, "CREDITS", argb_to_framefang(SECTION_TINT()));
-        draw_text(&mut surf, PAD + 60, y, 1, "Built with FFmpeg (ffmpeg.org)",       argb_to_framefang(TEXT_BRIGHT));
-
-        // Buttons.
-        for (i, b) in self.btns.iter().enumerate() {
-            let hovered = self.hover == Some(i);
-            render_btn(&mut surf, b, hovered);
+        for (row, (label, value)) in FACTS.iter().enumerate() {
+            let y = FACTS_Y + row as i32 * FACT_STEP;
+            page.text(MARGIN, y, label, SECTION_TINT());
+            page.text(FACT_VALUE_X, y, value, TEXT_BRIGHT);
         }
 
-        self.title_bar.draw(&mut frame, win_w, &buf, "// ABOUT", BG_TOP());
-        if let Err(e) = frame.present() { eprintln!("about: buf.present: {e}"); }
-    }
-}
-
-fn render_btn<S: painter::Surface>(surf: &mut S, b: &Btn, hovered: bool) {
-    // The Author hit-rect is painted as part of the body copy in `redraw`,
-    // not as a framed button — skip the box+label drawing entirely.
-    if b.kind == BtnKind::Author { return; }
-    let (x, y, w, h) = b.rect;
-    let border = if hovered { LASER_DIM() } else { PANEL_BORDER() };
-    if hovered { fill_rect(surf, x, y, w, h, argb_to_framefang(HOVER_FILL())); }
-    stroke_rect_argb(surf, x, y, w, h, argb_to_framefang(border));
-    let tw = bitmap_font::measure(b.label, 1);
-    let tx = x + (w - tw) / 2;
-    let ty = y + (h - bitmap_font::GLYPH_H) / 2;
-    draw_text(surf, tx, ty, 1, b.label, argb_to_framefang(TEXT_BRIGHT));
-}
-
-// ── tiny rendering helpers (same shape as settings_form) ────────────────────
-
-struct BufferSurface<'a> {
-    buf: &'a mut [u32],
-    w:   i32,
-    h:   i32,
-}
-
-impl painter::Surface for BufferSurface<'_> {
-    fn width(&self)  -> i32 { self.w }
-    fn height(&self) -> i32 { self.h }
-    fn read(&self, x: i32, y: i32) -> [u8; 4] {
-        if x < 0 || y < 0 || x >= self.w || y >= self.h { return [0, 0, 0, 0xFF]; }
-        let p = self.buf[(y as usize) * (self.w as usize) + (x as usize)];
-        [((p >> 16) & 0xFF) as u8, ((p >> 8) & 0xFF) as u8, (p & 0xFF) as u8, 0xFF]
-    }
-    fn write(&mut self, x: i32, y: i32, rgba: [u8; 4]) {
-        if x < 0 || y < 0 || x >= self.w || y >= self.h { return; }
-        let dst = (y as usize) * (self.w as usize) + (x as usize);
-        self.buf[dst] = ((rgba[0] as u32) << 16) | ((rgba[1] as u32) << 8) | rgba[2] as u32;
-    }
-}
-
-fn argb_to_framefang(argb: u32) -> FramefangRgba {
-    FramefangRgba {
-        r: ((argb >> 16) & 0xFF) as u8,
-        g: ((argb >>  8) & 0xFF) as u8,
-        b: ( argb        & 0xFF) as u8,
-        a: 255,
-    }
-}
-
-fn centered_origin(loop_target: &winit::event_loop::ActiveEventLoop, w: u32, h: u32) -> (i32, i32) {
-    let primary = loop_target.primary_monitor()
-        .or_else(|| loop_target.available_monitors().next());
-    let (mon_x, mon_y, mon_w, mon_h) = match primary {
-        Some(m) => {
-            let pos  = m.position();
-            let size = m.size();
-            (pos.x as i32, pos.y as i32, size.width as i32, size.height as i32)
+        // No Close button of its own: the title strip has one.
+        for (i, (spot, rect)) in spots().into_iter().enumerate() {
+            if let Some(caption) = spot.caption() {
+                page.button(rect, caption, false, self.hover == Some(i));
+            }
         }
-        None => (0, 0, 1920, 1080),
-    };
-    let x = mon_x + (mon_w - w as i32) / 2;
-    let y = mon_y + (mon_h - h as i32) / 2;
-    (x.max(mon_x), y.max(mon_y))
+
+        self.shell.show(page);
+    }
 }
 
-
-fn fill_rect<S: painter::Surface>(s: &mut S, x: i32, y: i32, w: i32, h: i32, color: FramefangRgba) {
-    let rgba = [color.r, color.g, color.b, color.a];
-    for yy in y..y + h { for xx in x..x + w { s.write(xx, yy, rgba); } }
+fn spot_at(p: (i32, i32)) -> Option<usize> {
+    spots().iter().position(|&(_, r)| inside(r, p))
 }
 
-fn stroke_rect_argb<S: painter::Surface>(s: &mut S, x: i32, y: i32, w: i32, h: i32, color: FramefangRgba) {
-    let rgba = [color.r, color.g, color.b, color.a];
-    for xx in x..x + w { s.write(xx, y, rgba); s.write(xx, y + h - 1, rgba); }
-    for yy in y..y + h { s.write(x, yy, rgba); s.write(x + w - 1, yy, rgba); }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn draw_text<S: painter::Surface>(s: &mut S, x: i32, y: i32, scale: i32, text: &str, color: FramefangRgba) {
-    painter::draw_text(s, x, y, scale, text, color);
+    #[test]
+    fn the_author_link_covers_just_the_name() {
+        let (spot, r) = spots()[0];
+        assert!(spot == Spot::Author);
+        let lead_end = MARGIN + bitmap_font::measure(BYLINE_LEAD, 1);
+        assert!(!inside(r, (lead_end - 1, BYLINE_Y)), "the lead-in isn't part of the link");
+        assert!(inside(r, (lead_end, BYLINE_Y)));
+        assert!(inside(r, (lead_end + bitmap_font::measure(AUTHOR, 1) - 1, BYLINE_Y + GLYPH_H)));
+        assert!(spot_at((lead_end + 1, BYLINE_Y)) == Some(0));
+    }
+
+    #[test]
+    fn about_buttons_sit_on_the_card_side_by_side_and_their_captions_fit() {
+        let [_, (_, a), (_, b)] = spots();
+        assert_eq!(a.1, b.1);
+        assert_eq!(b.0 - (a.0 + a.2), LINK_GAP);
+        assert_eq!(a.0, CARD_W as i32 - (b.0 + b.2), "centered");
+        assert!(b.1 + b.3 <= CARD_H as i32 - MARGIN);
+        for (spot, r) in spots() {
+            if let Some(caption) = spot.caption() {
+                assert!(bitmap_font::measure(caption, 1) < r.2 - 16, "{caption}");
+            }
+        }
+        for (label, value) in FACTS {
+            assert!(FACT_VALUE_X - MARGIN > bitmap_font::measure(label, 1), "{label}");
+            assert!(FACT_VALUE_X + bitmap_font::measure(value, 1) <= CARD_W as i32 - MARGIN, "{value}");
+        }
+    }
 }

@@ -1,435 +1,638 @@
-//! Floating recording control — small always-on-top window that appears
-//! whenever a screen recording is live, so the user has a one-click way to
-//! stop the capture without hunting through the tray menu.
-//!
-//! Layout (180 × 56, borderless):
-//!
-//!   ┌──────────────────────────────┐
-//!   │  ● REC  00:12        [STOP]  │
-//!   └──────────────────────────────┘
-//!
-//! The red dot flashes once per second (square wave, 60 % on). The "00:12"
-//! is a wall-clock timer counting from when the recording started.
-//! Left-drag the chrome to move; click [STOP] to end the recording.
-//!
-//! Lifecycle, same shape as `PinView`: `TrayApp` owns an
-//! `Option<RecordingIndicator>`, dispatches `WindowEvent`s by `WindowId`,
-//! and reads `stop_requested` after each event to learn when the STOP
-//! button was clicked.
-//!
-//! The panel must NEVER appear inside the recorded video, so `new()`
-//! excludes the window from screen capture before returning:
-//!   - Windows: `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` — DWM
-//!     omits the window from BitBlt/DXGI screen reads (what gdigrab sees).
-//!   - macOS: `NSWindow.sharingType = NSWindowSharingNone` — `screencapture`
-//!     skips windows that opt out of sharing.
-//!   - Linux/X11: no such API exists (x11grab reads the composited root
-//!     window), so the tray loop never creates the panel while recording —
-//!     see `start_recording` in tray_loop.rs.
-//! If exclusion fails (e.g. Windows 10 before 2004), `new()` returns Err and
-//! the caller records without a panel rather than burning it into the video.
-//!
-//! A **region** recording changes that calculus on X11: the panel is only a
-//! problem where the recorder is looking, so `new_at` lets the caller park it
-//! at a spot `framefang_core::region::indicator_placement` has certified as
-//! outside the recorded rectangle. `SIZE` is what that placement measures.
+/*!
+The floating recording panel: a small always-on-top window shown while a
+screen recording runs, so stopping it is one click instead of a trip to the
+tray menu.
 
-use std::num::NonZeroU32;
-use std::rc::Rc;
-use std::time::Instant;
+The panel is 220 by 56 pixels with no frame:
 
-use anyhow::{anyhow, Result};
-use softbuffer::{Context, Surface};
-use winit::dpi::{PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, MouseButton, WindowEvent};
-use winit::event_loop::ActiveEventLoop;
-use winit::window::{CursorIcon, Window, WindowAttributes, WindowId, WindowLevel};
+```text
++--------------------------------------+
+|  (o) REC  00:12             [ STOP ] |
++--------------------------------------+
+```
 
-use crate::bitmap_font;
-use crate::painter;
+The red dot blinks once a second (lit for the first 60% of each second) and
+the clock counts wall time since the recording began. Dragging anywhere but
+the button moves the panel; clicking STOP ends the recording.
 
-const WIN_W: u32 = 220;
-const WIN_H: u32 = 56;
+`TrayApp` holds an `Option<RecordingIndicator>`, forwards the panel's
+`WindowEvent`s to it by `WindowId`, and checks `stop_requested` after each one
+to learn that STOP was pressed.
 
-/// Outer size of the panel, for callers positioning it around a recorded
-/// region. Same numbers `new()` builds the window with.
-pub const SIZE: (u32, u32) = (WIN_W, WIN_H);
+The panel must never end up in the video it controls, so `new_at` hides the
+window from screen capture before handing it back:
 
-// Colors (matches the void-black / laser-green / record-red palette).
-const BG:          u32 = 0x0010_1614;
-const BG_BORDER:   u32 = 0x0028_3a30;
-const TEXT_BRIGHT: u32 = 0x00e8_ffe8;
-const TEXT_DIM:    u32 = 0x008a_9c92;
-const REC_ON:      u32 = 0x00ff_3a3a;
-const REC_OFF:     u32 = 0x0044_1414;
-const STOP_FILL:   u32 = 0x00ff_3a3a;
-const STOP_BORDER: u32 = 0x00ff_6a6a;
-const STOP_TEXT:   u32 = 0x000a_0606;
+- Windows: `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`, which makes DWM
+  leave the window out of the BitBlt and DXGI reads gdigrab performs.
+- macOS: `NSWindow.sharingType = NSWindowSharingNone`, which `screencapture`
+  honours.
+- Linux on X11 has nothing comparable (x11grab reads the composited root
+  window). For a full-screen recording the tray loop never opens the panel
+  there (see `start_recording` in tray_loop.rs). For a region recording the
+  panel only matters if it overlaps the region, so the tray loop asks
+  `framefang_core::region::indicator_placement` for a spot outside it, and
+  that placement is sized from [`SIZE`].
+
+If hiding fails (Windows 10 before version 2004, for one), `new_at` returns an
+error and the recording goes ahead without a panel: better no STOP button than
+one recorded into the user's video.
+
+This module also holds the few window helpers the small floating windows
+(this panel and pinned images) share: their window attributes, the drawing
+surface, and the resize, draw and present cycle.
+*/
+
+use {
+    crate::{
+        bitmap_font::{measure, GLYPH_H},
+        painter::{self, Surface as _},
+    },
+    anyhow::{anyhow, bail, Result},
+    framefang_core::color::Rgba,
+    std::{
+        num::NonZeroU32,
+        rc::Rc,
+        time::{Duration, Instant},
+    },
+    winit::{
+        dpi::{PhysicalPosition, PhysicalSize},
+        event::{ElementState, MouseButton, WindowEvent},
+        event_loop::ActiveEventLoop,
+        window::{CursorIcon, Window, WindowAttributes, WindowId, WindowLevel},
+    },
+};
+
+/// The drawing surface a floating window paints into.
+pub(crate) type SoftSurface = softbuffer::Surface<Rc<Window>, Rc<Window>>;
+/// The softbuffer context a [`SoftSurface`] needs kept alive.
+pub(crate) type SoftContext = softbuffer::Context<Rc<Window>>;
+
+const PANEL_W: i32 = 220;
+const PANEL_H: i32 = 56;
+
+/// The panel's outer size in pixels, for placing it around a recorded
+/// region. `new_at` opens the window at exactly this size.
+pub const SIZE: (u32, u32) = (PANEL_W as u32, PANEL_H as u32);
+
+// Panel colours as 0x00RRGGBB, from the app's black, green and red palette.
+const PANEL_FILL:   u32 = 0x0010_1614;
+const PANEL_EDGE:   u32 = 0x0028_3a30;
+const LABEL_INK:    u32 = 0x00e8_ffe8;
+const CLOCK_INK:    u32 = 0x008a_9c92;
+const DOT_LIT:      u32 = 0x00ff_3a3a;
+const DOT_DARK:     u32 = 0x0044_1414;
+const BUTTON_FILL:  u32 = 0x00ff_3a3a;
+const BUTTON_HOVER: u32 = 0x00ff_6a6a;
+const BUTTON_EDGE:  u32 = 0x00ff_6a6a;
+const BUTTON_INK:   u32 = 0x000a_0606;
+
+/// Centre of the record dot.
+const DOT_CENTRE: (i32, i32) = (14, PANEL_H / 2);
+/// Radius of the dot itself; while lit, two fainter rings of glow are drawn
+/// over it, given here as `(radius, opacity)`.
+const DOT_RADIUS: i32 = 6;
+const GLOW: [(i32, u8); 2] = [(10, 70), (14, 30)];
+
+/// The STOP button: 60 by 24, 14 pixels in from the right edge, centred
+/// vertically.
+const BUTTON: Rect = {
+    let (w, h) = (60, 24);
+    Rect { x: PANEL_W - w - 14, y: (PANEL_H - h) / 2, w, h }
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Rect {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+}
+
+impl Rect {
+    fn contains(self, (px, py): (i32, i32)) -> bool {
+        (self.x..self.x + self.w).contains(&px) && (self.y..self.y + self.h).contains(&py)
+    }
+}
 
 pub struct RecordingIndicator {
-    window:      Rc<Window>,
-    _ctx:        Context<Rc<Window>>,
-    surface:     Surface<Rc<Window>, Rc<Window>>,
-    started:     Instant,
-    cursor:      (i32, i32),
-    hover_stop:  bool,
-    /// Set to `true` when the user clicks the STOP button. The tray loop
-    /// polls this after each event and drops the indicator + calls
-    /// `stop_recording` when it flips.
+    window: Rc<Window>,
+    // Never read, but the surface is only valid while its context lives.
+    _context: SoftContext,
+    surface: SoftSurface,
+    started: Instant,
+    pointer: (i32, i32),
+    over_button: bool,
+    /// Becomes `true` when the user presses STOP (or closes the window).
+    /// The tray loop checks it after every event, and when it flips drops the
+    /// panel and stops the recording.
     pub stop_requested: bool,
 }
 
 impl RecordingIndicator {
-    /// Open the panel at a caller-chosen screen position.
-    ///
-    /// The position is not cosmetic: the panel has to land outside the recorded
-    /// rectangle, which is the difference between a visible STOP button and a
-    /// STOP button burned into the user's video on X11. `tray_loop` picks it
-    /// with `framefang_core::region::indicator_placement`.
-    pub fn new_at(loop_target: &ActiveEventLoop, origin: (i32, i32)) -> Result<Self> {
-        let (x, y) = origin;
+    /// Open the panel with its top-left corner at `origin`. Where it goes
+    /// matters: on X11 a panel inside the recorded rectangle ends up in the
+    /// video, so `tray_loop` chooses `origin` with
+    /// `framefang_core::region::indicator_placement`.
+    pub fn new_at(
+        loop_target: &ActiveEventLoop,
+        origin: (i32, i32),
+    ) -> Result<Self> {
+        let attrs = floating_attrs("Frame Fang: recording", SIZE, origin);
+        // Refuse to carry on if the panel would be recorded.
+        let panel = open_window(loop_target, attrs, "recording indicator")
+            .and_then(|panel| exclude_from_capture(&panel).map(|()| panel))?;
+        panel.set_cursor(CursorIcon::Default);
+        let (context, surface) = drawing_surface(&panel, "recording indicator")?;
 
-        let attrs = WindowAttributes::default()
-            .with_title("Frame Fang: recording")
-            .with_decorations(false)
-            .with_resizable(false)
-            .with_inner_size(PhysicalSize::new(WIN_W, WIN_H))
-            .with_position(PhysicalPosition::new(x, y))
-            .with_window_icon(crate::brand_icon::shared())
-            .with_window_level(WindowLevel::AlwaysOnTop);
-
-        let window = loop_target
-            .create_window(attrs)
-            .map(Rc::new)
-            .map_err(|e| anyhow!("create_window (recording indicator): {e}"))?;
-
-        // Keep the panel out of the recording itself. Hard-fail on error:
-        // no panel beats a panel burned into the user's video.
-        exclude_from_capture(&window)?;
-
-        window.set_cursor(CursorIcon::Default);
-
-        let ctx = Context::new(window.clone())
-            .map_err(|e| anyhow!("softbuffer Context::new (recording indicator): {e}"))?;
-        let surface = Surface::new(&ctx, window.clone())
-            .map_err(|e| anyhow!("softbuffer Surface::new (recording indicator): {e}"))?;
-
-        let mut me = RecordingIndicator {
-            window, _ctx: ctx, surface,
-            started: Instant::now(),
-            cursor: (0, 0),
-            hover_stop: false,
-            stop_requested: false,
+        let mut indicator = Self {
+            window: panel, _context: context, surface, started: Instant::now(),
+            pointer: (0, 0), over_button: false, stop_requested: false,
         };
-        me.redraw();
-        Ok(me)
+        indicator.repaint_now();
+        Ok(indicator)
     }
 
-    pub fn window_id(&self) -> WindowId { self.window.id() }
+    pub fn window_id(&self) -> WindowId {
+        self.window.id()
+    }
 
-    /// Drive the flashing dot — called every poll tick from the tray loop
-    /// so the dot animates whether or not the user moves the mouse over us.
+    /// Called on every tray-loop poll so the dot keeps blinking and the clock
+    /// keeps counting even when nothing else happens to the window.
     pub fn tick(&self) {
-        self.window.request_redraw();
+        self.window.request_redraw()
     }
 
     pub fn handle_event(&mut self, event: WindowEvent) {
-        match event {
-            WindowEvent::CloseRequested => {
-                self.stop_requested = true;
-            }
-            WindowEvent::CursorMoved { position, .. } => {
-                self.cursor = (position.x as i32, position.y as i32);
-                let new_hover = self.hit_stop(self.cursor.0, self.cursor.1);
-                let new_cursor = if new_hover { CursorIcon::Pointer } else { CursorIcon::Move };
-                self.window.set_cursor(new_cursor);
-                if new_hover != self.hover_stop {
-                    self.hover_stop = new_hover;
-                    self.window.request_redraw();
-                }
-            }
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Left, ..
-            } => {
-                if self.hit_stop(self.cursor.0, self.cursor.1) {
-                    self.stop_requested = true;
-                } else {
-                    // Anywhere else inside the chrome → start a window drag
-                    // (delegates to the WM via `_NET_WM_MOVERESIZE` on X11,
-                    // the equivalent on Wayland / Win32 / Cocoa). Same trick
-                    // PinView uses.
-                    let _ = self.window.drag_window();
-                }
-            }
-            WindowEvent::Resized(_) | WindowEvent::RedrawRequested => self.redraw(),
-            _ => {}
+        use WindowEvent as Ev;
+        match &event {
+            Ev::CloseRequested => self.stop_requested = true,
+            Ev::CursorMoved { position: at, .. } => self.pointer_moved((at.x as i32, at.y as i32)),
+            Ev::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => self.left_pressed(),
+            Ev::Resized(_) | Ev::RedrawRequested => self.repaint_now(),
+            _ => (),
         }
     }
 
-    fn hit_stop(&self, x: i32, y: i32) -> bool {
-        let (sx, sy, sw, sh) = stop_rect();
-        x >= sx && x < sx + sw && y >= sy && y < sy + sh
+    fn pointer_moved(&mut self, at: (i32, i32)) {
+        self.pointer = at;
+        let over = BUTTON.contains(at);
+        self.window.set_cursor(if over { CursorIcon::Pointer } else { CursorIcon::Move });
+        if over != self.over_button {
+            self.over_button = over;
+            self.window.request_redraw();
+        }
     }
 
-    fn redraw(&mut self) {
-        let phys = self.window.inner_size();
-        let (Some(w), Some(h)) = (NonZeroU32::new(phys.width), NonZeroU32::new(phys.height))
-            else { return; };
-        if let Err(e) = self.surface.resize(w, h) {
-            eprintln!("recording indicator: surface.resize: {e}"); return;
+    fn left_pressed(&mut self) {
+        if BUTTON.contains(self.pointer) {
+            self.stop_requested = true;
+            return;
         }
-        let mut buf = match self.surface.buffer_mut() {
-            Ok(b) => b,
-            Err(e) => { eprintln!("recording indicator: buffer_mut: {e}"); return; }
-        };
-        let win_w = w.get() as usize;
-        let win_h = h.get() as usize;
+        // Anywhere else is a handle for moving the panel. The window manager
+        // runs the drag, as it does for pins; if it declines, nothing moves.
+        self.window.drag_window().ok();
+    }
 
-        // Background + border.
-        for i in 0..(win_w * win_h) { buf[i] = BG; }
-        for x in 0..win_w {
-            buf[x] = BG_BORDER;
-            buf[(win_h - 1) * win_w + x] = BG_BORDER;
+    fn repaint_now(&mut self) {
+        let (elapsed, over_button) = (self.started.elapsed(), self.over_button);
+        repaint(&self.window, &mut self.surface, "recording indicator", |px, w, h| {
+            let mut canvas = Canvas { px, w: w as i32, h: h as i32 };
+            paint(&mut canvas, elapsed, over_button);
+        });
+    }
+}
+
+// Shared by the small floating windows (this panel and pinned images).
+
+/// Window attributes for a small frameless window that floats above
+/// everything: `size` and `at` are in physical pixels.
+pub(crate) fn floating_attrs(title: &str, size: (u32, u32), at: (i32, i32)) -> WindowAttributes {
+    let icon = crate::brand_icon::shared();
+    WindowAttributes::default()
+        .with_title(title)
+        .with_decorations(false).with_resizable(false)
+        .with_inner_size(PhysicalSize::new(size.0, size.1))
+        .with_position(PhysicalPosition::new(at.0, at.1))
+        .with_window_icon(icon).with_window_level(WindowLevel::AlwaysOnTop)
+}
+
+/// Create the window, naming `what` it was for if the OS refuses.
+pub(crate) fn open_window(loop_target: &ActiveEventLoop, attrs: WindowAttributes, what: &str) -> Result<Rc<Window>> {
+    match loop_target.create_window(attrs) {
+        Ok(window) => Ok(Rc::new(window)),
+        Err(e) => bail!("couldn't open the {what} window: {e}"),
+    }
+}
+
+/// The softbuffer context and surface for drawing into `window`.
+pub(crate) fn drawing_surface(window: &Rc<Window>, what: &str) -> Result<(SoftContext, SoftSurface)> {
+    let context = SoftContext::new(Rc::clone(window))
+        .map_err(|e| anyhow!("couldn't set up drawing for the {what} window: {e}"))?;
+    let surface = SoftSurface::new(&context, Rc::clone(window))
+        .map_err(|e| anyhow!("couldn't create the {what} window's drawing surface: {e}"))?;
+    Ok((context, surface))
+}
+
+/// Size `surface` to `window`, let `draw` fill the 0RGB pixels (given with
+/// the width and height), and show the result. A zero-sized window (such as
+/// a minimised one) is skipped. Failures are logged under `what`, since a
+/// missed frame is not worth more than that.
+pub(crate) fn repaint(
+    window: &Window,
+    surface: &mut SoftSurface,
+    what: &str,
+    draw: impl FnOnce(&mut [u32], usize, usize),
+) {
+    let inner = window.inner_size();
+    let (Some(width), Some(height)) = (NonZeroU32::new(inner.width), NonZeroU32::new(inner.height)) else {
+        return;
+    };
+    let cycle = || -> Result<(), String> {
+        surface.resize(width, height).map_err(|e| format!("couldn't resize the surface: {e}"))?;
+        let mut frame = surface.buffer_mut().map_err(|e| format!("couldn't get a frame to draw in: {e}"))?;
+        draw(&mut *frame, width.get() as usize, height.get() as usize);
+        frame.present().map_err(|e| format!("couldn't show the frame: {e}"))
+    };
+    if let Err(why) = cycle() {
+        eprintln!("{what}: {why}");
+    }
+}
+
+// Drawing the panel
+
+/// Whether the dot is lit `elapsed` into the recording: on for the first
+/// 600 ms of every second.
+fn dot_lit(elapsed: Duration) -> bool {
+    elapsed.subsec_millis() < 600
+}
+
+/// The clock text, minutes and seconds with two digits each. Minutes keep
+/// counting past 99 instead of wrapping.
+fn clock_text(elapsed: Duration) -> String {
+    let (minutes, seconds) = (elapsed.as_secs() / 60, elapsed.as_secs() % 60);
+    format!("{minutes:02}:{seconds:02}")
+}
+
+/// Draw the whole panel. Positions come from the panel's design size, not
+/// the window's, so a window the system resized just shows more or less of
+/// the same layout.
+fn paint(canvas: &mut Canvas, elapsed: Duration, over_button: bool) {
+    let whole = Rect { x: 0, y: 0, w: canvas.w, h: canvas.h };
+    fill(canvas, whole, PANEL_FILL);
+    outline(canvas, whole, PANEL_EDGE);
+
+    let (cx, cy) = DOT_CENTRE;
+    let lit = dot_lit(elapsed);
+    disc(canvas, DOT_CENTRE, DOT_RADIUS, if lit { DOT_LIT } else { DOT_DARK }, 255);
+    if lit {
+        for (radius, opacity) in GLOW {
+            disc(canvas, DOT_CENTRE, radius, DOT_LIT, opacity);
         }
-        for y in 0..win_h {
-            buf[y * win_w] = BG_BORDER;
-            buf[y * win_w + (win_w - 1)] = BG_BORDER;
-        }
+    }
 
-        let mut surf = BufferSurface { buf: &mut buf, w: win_w as i32, h: win_h as i32 };
+    let label = "REC";
+    let label_x = cx + 12;
+    let text_y = cy - GLYPH_H / 2;
+    painter::draw_text(canvas, label_x, text_y, 1, label, ink(LABEL_INK));
+    let clock_x = label_x + measure(label, 1) + 12;
+    painter::draw_text(canvas, clock_x, text_y, 1, &clock_text(elapsed), ink(CLOCK_INK));
 
-        // Red dot — flashes once per second (square wave, 60 % on).
-        let elapsed = self.started.elapsed().as_secs_f32();
-        let cycle = (elapsed * 1.0).fract();
-        let dot_on = cycle < 0.6;
-        let dot_color = if dot_on { REC_ON } else { REC_OFF };
-        let dx = 14;
-        let dy = WIN_H as i32 / 2;
-        fill_disc(&mut surf, dx, dy, 6, argb_to_rgba(dot_color));
-        if dot_on {
-            // Soft outer halo when bright.
-            fill_disc_alpha(&mut surf, dx, dy, 10, 0xff, 0x3a, 0x3a, 70);
-            fill_disc_alpha(&mut surf, dx, dy, 14, 0xff, 0x3a, 0x3a, 30);
-        }
+    fill(canvas, BUTTON, if over_button { BUTTON_HOVER } else { BUTTON_FILL });
+    outline(canvas, BUTTON, BUTTON_EDGE);
+    let caption = "STOP";
+    painter::draw_text(
+        canvas,
+        BUTTON.x + (BUTTON.w - measure(caption, 1)) / 2,
+        BUTTON.y + (BUTTON.h - GLYPH_H) / 2,
+        1,
+        caption,
+        ink(BUTTON_INK),
+    );
+}
 
-        // "REC" label.
-        let rec_text = "REC";
-        let rec_x = dx + 12;
-        let rec_y = dy - bitmap_font::GLYPH_H / 2;
-        draw_text(&mut surf, rec_x, rec_y, 1, rec_text, argb_to_rgba(TEXT_BRIGHT));
+fn ink(rgb: u32) -> Rgba {
+    let [_, r, g, b] = rgb.to_be_bytes();
+    Rgba { r, g, b, a: 255 }
+}
 
-        // Timer "MM:SS".
-        let total = self.started.elapsed().as_secs();
-        let mins = total / 60;
-        let secs = total % 60;
-        let timer = format!("{:02}:{:02}", mins, secs);
-        let timer_x = rec_x + bitmap_font::measure(rec_text, 1) + 12;
-        let timer_y = rec_y;
-        draw_text(&mut surf, timer_x, timer_y, 1, &timer, argb_to_rgba(TEXT_DIM));
+/// A view of a 0RGB pixel buffer as a `painter::Surface`, dropping writes
+/// that fall outside it (a resized window can be smaller than the layout).
+struct Canvas<'a> {
+    px: &'a mut [u32],
+    w: i32,
+    h: i32,
+}
 
-        // STOP button.
-        let (sx, sy, sw, sh) = stop_rect();
-        let fill = if self.hover_stop { 0x00ff_6a6a } else { STOP_FILL };
-        fill_rect(&mut surf, sx, sy, sw, sh, argb_to_rgba(fill));
-        stroke_rect(&mut surf, sx, sy, sw, sh, argb_to_rgba(STOP_BORDER));
-        let label = "STOP";
-        let lw = bitmap_font::measure(label, 1);
-        let lx = sx + (sw - lw) / 2;
-        let ly = sy + (sh - bitmap_font::GLYPH_H) / 2;
-        draw_text(&mut surf, lx, ly, 1, label, argb_to_rgba(STOP_TEXT));
+impl Canvas<'_> {
+    fn slot(&self, x: i32, y: i32) -> Option<usize> {
+        let inside = (0..self.w).contains(&x) && (0..self.h).contains(&y);
+        inside.then(|| y as usize * self.w as usize + x as usize)
+    }
+}
 
-        if let Err(e) = buf.present() {
-            eprintln!("recording indicator: buf.present: {e}");
+impl painter::Surface for Canvas<'_> {
+    fn width(&self) -> i32 { self.w }
+    fn height(&self) -> i32 { self.h }
+
+    fn read(&self, x: i32, y: i32) -> [u8; 4] {
+        let [_, r, g, b] = self.slot(x, y).map_or(0, |i| self.px[i]).to_be_bytes();
+        [r, g, b, 0xFF]
+    }
+
+    fn write(&mut self, x: i32, y: i32, rgba: [u8; 4]) {
+        if let Some(i) = self.slot(x, y) {
+            let [r, g, b, _] = rgba;
+            self.px[i] = u32::from_be_bytes([0, r, g, b]);
         }
     }
 }
 
-/// Exclude the indicator window from screen capture so it never shows up
-/// inside the recorded video. Windows 10 2004+ (build 19041): the DWM
-/// drops the window from BitBlt/DXGI screen reads — exactly what ffmpeg's
-/// gdigrab performs (same trick OBS and KeePassXC ship).
-///
-/// MUST be version-gated, not just error-checked: on older builds the call
-/// *succeeds* but degrades to WDA_MONITOR semantics — the panel would show
-/// as a solid black box in the recording, strictly worse than showing it.
-/// On gate/API failure we bubble the Err up; the tray loop then records
-/// without a floating panel (tray menu still stops).
+fn fill(canvas: &mut Canvas, r: Rect, rgb: u32) {
+    let colour = rgb_bytes(rgb);
+    for y in r.y..r.y + r.h {
+        for x in r.x..r.x + r.w {
+            canvas.write(x, y, colour);
+        }
+    }
+}
+
+/// A one pixel border just inside `r`.
+fn outline(canvas: &mut Canvas, r: Rect, rgb: u32) {
+    let colour = rgb_bytes(rgb);
+    let (right, bottom) = (r.x + r.w - 1, r.y + r.h - 1);
+    for x in r.x..r.x + r.w {
+        canvas.write(x, r.y, colour);
+        canvas.write(x, bottom, colour);
+    }
+    for y in r.y..r.y + r.h {
+        canvas.write(r.x, y, colour);
+        canvas.write(right, y, colour);
+    }
+}
+
+/// A filled circle mixed over what is there at `opacity` out of 255 (255
+/// paints it solid), rounding to the nearest value.
+fn disc(canvas: &mut Canvas, (cx, cy): (i32, i32), radius: i32, rgb: u32, opacity: u8) {
+    let colour = rgb_bytes(rgb);
+    let keep = 255 - u32::from(opacity);
+    let mix = |over: u8, under: u8| {
+        ((u32::from(over) * u32::from(opacity) + u32::from(under) * keep + 127) / 255) as u8
+    };
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            if dx * dx + dy * dy > radius * radius {
+                continue;
+            }
+            let (x, y) = (cx + dx, cy + dy);
+            let under = canvas.read(x, y);
+            let mixed = [0, 1, 2].map(|c| mix(colour[c], under[c]));
+            canvas.write(x, y, [mixed[0], mixed[1], mixed[2], 255]);
+        }
+    }
+}
+
+fn rgb_bytes(rgb: u32) -> [u8; 4] {
+    let [_, r, g, b] = rgb.to_be_bytes();
+    [r, g, b, 255]
+}
+
+// Keeping the panel out of recordings
+
+/// The window's native handle, for the platform calls below.
+#[cfg(any(windows, target_os = "macos"))]
+fn native_handle(window: &Window) -> Result<winit::raw_window_handle::RawWindowHandle> {
+    use winit::raw_window_handle::HasWindowHandle as _;
+    match window.window_handle() {
+        Ok(handle) => Ok(handle.as_raw()),
+        Err(e) => bail!("couldn't get the native handle of a floating window: {e}"),
+    }
+}
+
+/// Hide `window` from screen capture so it never appears in a recording.
+/// From Windows 10 version 2004 (build 19041) `WDA_EXCLUDEFROMCAPTURE` makes
+/// DWM drop the window from BitBlt and DXGI screen reads, which is what
+/// ffmpeg's gdigrab does (OBS and KeePassXC rely on the same flag). The build
+/// has to be checked first, because on older builds the call still succeeds
+/// but behaves like `WDA_MONITOR`: the panel would record as a solid black
+/// box, which is worse than recording it. Any failure comes back as an error,
+/// and the tray loop records without the panel (the tray menu can still stop
+/// it).
 #[cfg(windows)]
 pub(crate) fn exclude_from_capture(window: &Rc<Window>) -> Result<()> {
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE,
+    use {
+        windows::Win32::{Foundation::HWND, UI::WindowsAndMessaging::{SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE}},
+        winit::raw_window_handle::RawWindowHandle,
     };
-    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-    // First Windows build where WDA_EXCLUDEFROMCAPTURE means "exclude"
-    // rather than "black box" (Windows 10 2004).
-    const MIN_BUILD: u32 = 19041;
-    let build = windows_build_number();
-    if build < MIN_BUILD {
-        return Err(anyhow!(
-            "Windows build {build} < {MIN_BUILD}: capture exclusion unavailable \
-             (would record a black box) — recording without the floating panel."
-        ));
+    /// Windows 10 version 2004, where the flag starts meaning "leave out".
+    const FIRST_EXCLUDING_BUILD: u32 = 19041;
+
+    let found = windows_build_number();
+    if found < FIRST_EXCLUDING_BUILD {
+        bail!(
+            "this is Windows build {found}, and hiding windows from capture needs build \
+             {FIRST_EXCLUDING_BUILD} or later (older ones record a black box instead), so the \
+             recording runs without the floating panel"
+        );
     }
-
-    let handle = window
-        .window_handle()
-        .map_err(|e| anyhow!("window_handle (recording indicator): {e}"))?;
-    let RawWindowHandle::Win32(h) = handle.as_raw() else {
-        return Err(anyhow!("recording indicator: not a Win32 window handle"));
+    let RawWindowHandle::Win32(win32) = native_handle(window)? else {
+        bail!("the recording panel's handle is not a Win32 window");
     };
-    let hwnd = HWND(h.hwnd.get() as *mut core::ffi::c_void);
-    unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) }
-        .map_err(|e| anyhow!("SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE): {e}"))
+    let hwnd = HWND(win32.hwnd.get() as *mut core::ffi::c_void);
+    // SAFETY: `hwnd` is the live window winit just created on this thread.
+    let excluded = unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) };
+    excluded.map_err(|e| anyhow!("Windows refused to hide the recording panel from capture: {e}"))
 }
 
-/// Build number from the registry (`CurrentBuildNumber`). `GetVersionEx`
-/// lies without a compatibility manifest; the registry value doesn't.
-/// Returns 0 when unreadable — callers treat that as "too old".
+/// The Windows build number, read from `CurrentBuildNumber` in the registry
+/// because `GetVersionEx` reports an old version to apps without a
+/// compatibility manifest. 0 when it cannot be read, which callers treat as
+/// too old for anything.
 #[cfg(windows)]
 pub(crate) fn windows_build_number() -> u32 {
-    use windows::core::w;
-    use windows::Win32::System::Registry::{
-        RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ,
+    use windows::{
+        core::{w, PCWSTR},
+        Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ},
     };
 
-    let mut buf = [0u16; 32];
-    let mut size = (buf.len() * 2) as u32;
-    let status = unsafe {
-        RegGetValueW(
-            HKEY_LOCAL_MACHINE,
-            w!("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion"),
-            w!("CurrentBuildNumber"),
-            RRF_RT_REG_SZ,
-            None,
-            Some(buf.as_mut_ptr().cast()),
-            Some(&mut size),
-        )
+    const VERSION_KEY: PCWSTR = w!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion");
+    const BUILD_VALUE: PCWSTR = w!("CurrentBuildNumber");
+
+    let mut text = [0u16; 32];
+    let mut bytes = std::mem::size_of_val(&text) as u32;
+    // SAFETY: `text` and `bytes` outlive the call, and `bytes` tells the API
+    // how much room `text` has.
+    let read = unsafe {
+        RegGetValueW(HKEY_LOCAL_MACHINE, VERSION_KEY, BUILD_VALUE, RRF_RT_REG_SZ, None,
+                     Some(text.as_mut_ptr().cast()), Some(&mut bytes))
     };
-    if status.is_err() {
-        return 0;
-    }
-    let len = (size as usize / 2).saturating_sub(1).min(buf.len());
-    String::from_utf16_lossy(&buf[..len]).trim().parse().unwrap_or(0)
+    read.ok().map_or(0, |()| build_from_reg_sz(&text, bytes))
 }
 
-/// macOS: `NSWindow.sharingType = NSWindowSharingNone` — the window keeps
-/// rendering on the monitor but opts out of being read by capture APIs,
-/// including the `screencapture -v` process the recorder spawns.
+/// Parse a `REG_SZ` the registry wrote into `text`. `bytes` is the size it
+/// reported, which counts the terminating NUL.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn build_from_reg_sz(text: &[u16], bytes: u32) -> u32 {
+    let units = (bytes as usize / 2).saturating_sub(1).min(text.len());
+    String::from_utf16_lossy(&text[..units]).trim().parse().unwrap_or(0)
+}
+
+/// macOS: setting `NSWindow.sharingType` to `NSWindowSharingNone` keeps the
+/// window on the display but hidden from capture APIs, including the
+/// `screencapture -v` process the recorder runs.
 #[cfg(target_os = "macos")]
-fn exclude_from_capture(window: &Rc<Window>) -> Result<()> {
-    use objc2::msg_send;
-    use objc2::runtime::AnyObject;
-    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-
-    let handle = window
-        .window_handle()
-        .map_err(|e| anyhow!("window_handle (recording indicator): {e}"))?;
-    let RawWindowHandle::AppKit(h) = handle.as_raw() else {
-        return Err(anyhow!("recording indicator: not an AppKit window handle"));
+fn exclude_from_capture(panel: &Rc<Window>) -> Result<()> {
+    use {
+        objc2::{msg_send, runtime::AnyObject},
+        winit::raw_window_handle::RawWindowHandle,
     };
-    unsafe {
-        let view = h.ns_view.as_ptr() as *mut AnyObject;
-        let ns_window: *mut AnyObject = msg_send![&*view, window];
-        if ns_window.is_null() {
-            return Err(anyhow!("recording indicator: NSView has no NSWindow"));
-        }
-        // 0 = NSWindowSharingNone (NSUInteger).
-        let _: () = msg_send![&*ns_window, setSharingType: 0usize];
-    }
+
+    /// `NSWindowSharingNone`, an NSUInteger.
+    const SHARING_NONE: usize = 0;
+
+    let RawWindowHandle::AppKit(appkit) = native_handle(panel)? else {
+        bail!("the recording panel's handle is not an AppKit view");
+    };
+    // SAFETY: `ns_view` is the live NSView winit created for this window,
+    // and `window` is a plain NSView getter.
+    let owner: Option<&AnyObject> = unsafe {
+        let view: &AnyObject = &*appkit.ns_view.as_ptr().cast::<AnyObject>();
+        let ns_window: *mut AnyObject = msg_send![view, window];
+        ns_window.as_ref()
+    };
+    let Some(ns_window) = owner else {
+        bail!("the recording panel's view has no NSWindow");
+    };
+    // SAFETY: `ns_window` is that view's live NSWindow, and
+    // `setSharingType:` exists on every macOS release Frame Fang runs on.
+    let _: () = unsafe { msg_send![ns_window, setSharingType: SHARING_NONE] };
     Ok(())
 }
 
-/// Linux/X11: x11grab records the composited root window — there is no
-/// per-window capture-exclusion API, so the tray loop never creates the
-/// panel while recording (see `start_recording`). This stub keeps the
-/// call site uniform if it's ever reached.
-#[cfg(not(any(windows, target_os = "macos")))]
-fn exclude_from_capture(_window: &Rc<Window>) -> Result<()> {
+/// Linux and the BSDs: X11 has no way to hide one window from x11grab, which
+/// is why the tray loop decides where (and whether) to show the panel. This
+/// keeps `new_at` the same on every platform.
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn exclude_from_capture(_: &Rc<Window>) -> Result<()> {
     Ok(())
 }
 
-fn stop_rect() -> (i32, i32, i32, i32) {
-    let w = 60;
-    let h = 24;
-    let x = WIN_W as i32 - w - 14;
-    let y = (WIN_H as i32 - h) / 2;
-    (x, y, w, h)
-}
+#[cfg(test)]
+mod checks {
+    use super::{
+        build_from_reg_sz, clock_text, dot_lit, paint, Canvas, Duration, Rect, BUTTON, BUTTON_EDGE,
+        BUTTON_FILL, BUTTON_HOVER, DOT_CENTRE, DOT_DARK, DOT_LIT, PANEL_EDGE, PANEL_FILL, PANEL_H,
+        PANEL_W, SIZE,
+    };
 
-// ── tiny rendering helpers, scoped to this file ─────────────────────────────
-
-struct BufferSurface<'a, 'b> {
-    buf: &'a mut softbuffer::Buffer<'b, Rc<Window>, Rc<Window>>,
-    w:   i32,
-    h:   i32,
-}
-
-impl<'a, 'b> painter::Surface for BufferSurface<'a, 'b> {
-    fn width(&self)  -> i32 { self.w }
-    fn height(&self) -> i32 { self.h }
-    fn read(&self, x: i32, y: i32) -> [u8; 4] {
-        if x < 0 || y < 0 || x >= self.w || y >= self.h { return [0, 0, 0, 0xFF]; }
-        let p = self.buf[(y as usize) * (self.w as usize) + (x as usize)];
-        [((p >> 16) & 0xFF) as u8, ((p >> 8) & 0xFF) as u8, (p & 0xFF) as u8, 0xFF]
+    fn painted(elapsed: Duration, over_button: bool) -> Vec<u32> {
+        let mut px = vec![0u32; (PANEL_W * PANEL_H) as usize];
+        let mut canvas = Canvas { px: &mut px, w: PANEL_W, h: PANEL_H };
+        paint(&mut canvas, elapsed, over_button);
+        px
     }
-    fn write(&mut self, x: i32, y: i32, rgba: [u8; 4]) {
-        if x < 0 || y < 0 || x >= self.w || y >= self.h { return; }
-        let dst = (y as usize) * (self.w as usize) + (x as usize);
-        self.buf[dst] = ((rgba[0] as u32) << 16) | ((rgba[1] as u32) << 8) | rgba[2] as u32;
+
+    fn at(px: &[u32], x: i32, y: i32) -> u32 {
+        px[(y * PANEL_W + x) as usize]
     }
-}
 
-fn argb_to_rgba(argb: u32) -> framefang_core::color::Rgba {
-    framefang_core::color::Rgba {
-        r: ((argb >> 16) & 0xFF) as u8,
-        g: ((argb >>  8) & 0xFF) as u8,
-        b: ( argb        & 0xFF) as u8,
-        a: 255,
+    #[test]
+    fn button_sits_where_the_layout_puts_it() {
+        assert_eq!(BUTTON, Rect { x: 146, y: 16, w: 60, h: 24 });
+        assert_eq!(SIZE, (220, 56));
     }
-}
 
-fn fill_rect<S: painter::Surface>(s: &mut S, x: i32, y: i32, w: i32, h: i32, color: framefang_core::color::Rgba) {
-    let rgba = [color.r, color.g, color.b, color.a];
-    for yy in y..y + h { for xx in x..x + w { s.write(xx, yy, rgba); } }
-}
+    #[test]
+    fn button_hit_test_is_inclusive_left_and_top_only() {
+        assert!(BUTTON.contains((146, 16)));
+        assert!(BUTTON.contains((205, 39)));
+        assert!(!BUTTON.contains((206, 20)));
+        assert!(!BUTTON.contains((150, 40)));
+        assert!(!BUTTON.contains((145, 20)));
+        assert!(!BUTTON.contains((150, 15)));
+    }
 
-fn stroke_rect<S: painter::Surface>(s: &mut S, x: i32, y: i32, w: i32, h: i32, color: framefang_core::color::Rgba) {
-    let rgba = [color.r, color.g, color.b, color.a];
-    for xx in x..x + w { s.write(xx, y, rgba); s.write(xx, y + h - 1, rgba); }
-    for yy in y..y + h { s.write(x, yy, rgba); s.write(x + w - 1, yy, rgba); }
-}
+    #[test]
+    fn dot_is_lit_for_the_first_six_tenths_of_each_second() {
+        assert!(dot_lit(Duration::ZERO));
+        assert!(dot_lit(Duration::from_millis(599)));
+        assert!(!dot_lit(Duration::from_millis(600)));
+        assert!(!dot_lit(Duration::from_millis(999)));
+        assert!(dot_lit(Duration::from_millis(61_250)));
+    }
 
-fn fill_disc<S: painter::Surface>(s: &mut S, cx: i32, cy: i32, r: i32, color: framefang_core::color::Rgba) {
-    let r2 = r * r;
-    for dy in -r..=r {
-        for dx in -r..=r {
-            if dx * dx + dy * dy <= r2 {
-                s.write(cx + dx, cy + dy, [color.r, color.g, color.b, 255]);
-            }
+    #[test]
+    fn clock_shows_minutes_and_seconds() {
+        assert_eq!(clock_text(Duration::ZERO), "00:00");
+        assert_eq!(clock_text(Duration::from_millis(12_900)), "00:12");
+        assert_eq!(clock_text(Duration::from_secs(61)), "01:01");
+        assert_eq!(clock_text(Duration::from_secs(100 * 60 + 5)), "100:05");
+    }
+
+    #[test]
+    fn panel_has_a_one_pixel_edge_around_its_fill() {
+        let px = painted(Duration::from_millis(700), false);
+        for (x, y) in [(0, 0), (219, 0), (0, 55), (219, 55), (100, 0), (0, 30)] {
+            assert_eq!(at(&px, x, y), PANEL_EDGE, "({x}, {y})");
         }
+        assert_eq!(at(&px, 1, 1), PANEL_FILL);
+        assert_eq!(at(&px, 120, 50), PANEL_FILL);
     }
-}
 
-fn fill_disc_alpha<S: painter::Surface>(s: &mut S, cx: i32, cy: i32, r: i32, rr: u8, gg: u8, bb: u8, a: u8) {
-    let r2 = r * r;
-    let inv = 255 - a as u32;
-    let ra = a as u32;
-    for dy in -r..=r {
-        for dx in -r..=r {
-            if dx * dx + dy * dy <= r2 {
-                let cur = s.read(cx + dx, cy + dy);
-                let nr = ((rr as u32 * ra + cur[0] as u32 * inv + 127) / 255).min(255) as u8;
-                let ng = ((gg as u32 * ra + cur[1] as u32 * inv + 127) / 255).min(255) as u8;
-                let nb = ((bb as u32 * ra + cur[2] as u32 * inv + 127) / 255).min(255) as u8;
-                s.write(cx + dx, cy + dy, [nr, ng, nb, 255]);
-            }
-        }
+    #[test]
+    fn button_changes_colour_under_the_pointer() {
+        let corner_inside = (BUTTON.x + 2, BUTTON.y + 2);
+        let idle = painted(Duration::ZERO, false);
+        let hovered = painted(Duration::ZERO, true);
+        assert_eq!(at(&idle, corner_inside.0, corner_inside.1), BUTTON_FILL);
+        assert_eq!(at(&hovered, corner_inside.0, corner_inside.1), BUTTON_HOVER);
+        assert_eq!(at(&idle, BUTTON.x, BUTTON.y), BUTTON_EDGE);
     }
-}
 
-fn draw_text<S: painter::Surface>(s: &mut S, x: i32, y: i32, scale: i32, text: &str, color: framefang_core::color::Rgba) {
-    painter::draw_text(s, x, y, scale, text, color);
+    #[test]
+    fn dot_blinks_and_glows_only_while_lit() {
+        let (cx, cy) = DOT_CENTRE;
+        let lit = painted(Duration::from_millis(100), false);
+        let dark = painted(Duration::from_millis(700), false);
+        assert_eq!(at(&lit, cx, cy), DOT_LIT);
+        assert_eq!(at(&dark, cx, cy), DOT_DARK);
+        // Just outside the dot, inside the first glow ring.
+        assert_ne!(at(&lit, cx + 8, cy), PANEL_FILL);
+        assert_eq!(at(&dark, cx + 8, cy), PANEL_FILL);
+    }
+
+    #[test]
+    fn glow_mixes_with_rounding() {
+        // 70/255 of 0xff3a3a over the panel fill, rounded to nearest, then
+        // 30/255 more of the same red on top.
+        let (cx, cy) = DOT_CENTRE;
+        let px = painted(Duration::ZERO, false);
+        let mix = |over: u32, under: u32, a: u32| (over * a + under * (255 - a) + 127) / 255;
+        let channel = |shift: u32| {
+            let red = (DOT_LIT >> shift) & 0xFF;
+            let base = (PANEL_FILL >> shift) & 0xFF;
+            mix(red, mix(red, base, 70), 30)
+        };
+        let want = channel(16) << 16 | channel(8) << 8 | channel(0);
+        assert_eq!(at(&px, cx + 9, cy), want);
+    }
+
+    #[test]
+    fn painting_a_smaller_window_clips_instead_of_panicking() {
+        let mut px = vec![0u32; 30 * 10];
+        let mut canvas = Canvas { px: &mut px, w: 30, h: 10 };
+        paint(&mut canvas, Duration::ZERO, true);
+        assert_eq!(px[0], PANEL_EDGE);
+    }
+
+    #[test]
+    fn registry_build_text_parses_without_its_nul() {
+        let text: Vec<u16> = "19045\0".encode_utf16().collect();
+        assert_eq!(build_from_reg_sz(&text, 12), 19045);
+        let padded: Vec<u16> = " 22631 \0".encode_utf16().collect();
+        assert_eq!(build_from_reg_sz(&padded, 16), 22631);
+        assert_eq!(build_from_reg_sz(&text, 0), 0);
+        let junk: Vec<u16> = "abc\0".encode_utf16().collect();
+        assert_eq!(build_from_reg_sz(&junk, 8), 0);
+    }
 }

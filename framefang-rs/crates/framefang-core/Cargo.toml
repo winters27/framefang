@@ -1,24 +1,24 @@
 [package]
-name        = "framefang-core"
-version     = { workspace = true }
-edition     = { workspace = true }
-authors     = { workspace = true }
-license     = { workspace = true }
-repository  = { workspace = true }
-description = "Framefang — platform-agnostic core (tools, annotations, settings, theme, state)"
+name = "framefang-core"
+description = "Frame Fang's OS-free core: tools, annotations, settings, theme and editor state"
+version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
 
 [dependencies]
-serde       = { workspace = true }
-serde_json  = { workspace = true }
-directories = { workspace = true }
-chrono      = { workspace = true }
-thiserror   = { workspace = true }
-bitflags    = { version = "2", features = ["serde"] }
+bitflags = { version = "2", features = ["serde"] }
+chrono.workspace = true
+directories.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
 
-# Text-annotation rasterizer. Pure Rust, no system font stack, no C deps —
-# the typeface is compiled in from `assets/fonts/`, so a Text annotation
-# renders identically on Windows / Linux / macOS. (MIT OR Apache-2.0.)
-fontdue = { version = "0.9", default-features = false, features = ["std"] }
-# Grapheme-cluster segmentation so Backspace removes one *visible* character
-# rather than one Unicode scalar. (MIT OR Apache-2.0.)
+# Text annotations are drawn with the font compiled in from assets/fonts/,
+# rasterized by fontdue, so they look the same on every OS and need no system
+# font library. unicode-segmentation lets Backspace remove a whole visible
+# character (an emoji, an accented letter), not one code point. Both are
+# MIT OR Apache-2.0.
+fontdue = { version = "0.9", features = ["std"], default-features = false }
 unicode-segmentation = "1"

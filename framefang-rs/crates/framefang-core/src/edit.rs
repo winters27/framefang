@@ -1,500 +1,544 @@
-//! Annotation editing geometry: hit-testing, bounding boxes, and the
-//! translate transform used by both the Select tool and the commit-time
-//! crop.
+//! Geometry for editing marks after they are drawn: which mark a click
+//! lands on, the box a mark covers, and moving a mark. The Select tool uses
+//! all three; saving a crop uses the move to shift marks into the cropped
+//! picture's coordinates.
 //!
-//! Everything here is pure math so it can be unit-tested without a window.
-//! The constants mirror what `framefang-app`'s painter actually rasterizes —
-//! if a glyph metric or the step-marker radius ever changes there, change
-//! it here too or the click target drifts away from the visible ink.
+//! It is plain arithmetic, tested without a window. The sizes it works from
+//! have to match what the app's painter draws (glyph sizes come from
+//! `crate::text`, step markers from `crate::step`); if the painter changes,
+//! this must follow, or clicks stop landing where the ink is.
 
 use crate::annotation::{Annotation, AnnotationKind, Point2, Rect};
 
-/// Extra slack, in pixels, around an annotation's painted body that still
-/// counts as a hit. Thin 2-px ink is otherwise nearly impossible to click.
+/// How many pixels outside a mark's ink a click may land and still pick it.
+/// Without it a 2 px line would be almost impossible to click.
 pub const HIT_SLOP: f32 = 5.0;
 
-/// What a step marker covers on the canvas, from its look (`crate::step`).
-fn step_rect(center: Point2, number: u32, look: &crate::step::StepLook) -> Rect {
-    let (l, t, r, b) = crate::step::extent(number, look);
-    Rect { x: center.x + l, y: center.y + t, w: r - l, h: b - t }
-}
-
-/// Painted width x height of a text annotation. `font_size` is the pixel
-/// em-size the Text tool renders at, so the box comes straight from the same
-/// rasterizer (`framefang_core::text::measure`) that paints the glyphs — a
-/// select-mode click lands on exactly the ink the user sees, multi-line
-/// blocks included.
+/// The width and height a text mark paints. `font_size` is the pixel
+/// em-size the Text tool draws with, and the measurement comes from the
+/// same text layout that draws it, so the clickable box is the visible ink,
+/// lines and all. Empty text is one empty line tall.
 pub fn text_extent(text: &str, font_size: f32) -> (f32, f32) {
-    if text.is_empty() {
-        return (0.0, crate::text::line_height(crate::text::clamp_px(font_size)));
-    }
-    crate::text::measure(text, font_size)
-}
-
-/// How far from the ink's centerline a click still lands on it.
-fn stroke_tolerance(thickness: f32) -> f32 {
-    thickness / 2.0 + HIT_SLOP
-}
-
-/// Distance from `p` to the segment `a`-`b`. Degenerate segments collapse
-/// to the point distance.
-fn segment_distance(p: Point2, a: Point2, b: Point2) -> f32 {
-    let vx = b.x - a.x;
-    let vy = b.y - a.y;
-    let len2 = vx * vx + vy * vy;
-    if len2 <= f32::EPSILON {
-        return ((p.x - a.x).powi(2) + (p.y - a.y).powi(2)).sqrt();
-    }
-    let t = (((p.x - a.x) * vx + (p.y - a.y) * vy) / len2).clamp(0.0, 1.0);
-    let px = a.x + vx * t;
-    let py = a.y + vy * t;
-    ((p.x - px).powi(2) + (p.y - py).powi(2)).sqrt()
-}
-
-fn polyline_hit(points: &[Point2], p: Point2, tol: f32) -> bool {
-    match points {
-        []     => false,
-        [only] => segment_distance(p, *only, *only) <= tol,
-        _      => points.windows(2).any(|w| segment_distance(p, w[0], w[1]) <= tol),
+    match text {
+        "" => (0.0, crate::text::line_height(crate::text::clamp_px(font_size))),
+        words => crate::text::measure(words, font_size),
     }
 }
 
-/// Hit-test the four edges of the rect spanned by `a`-`b`. The interior is
-/// deliberately *not* a hit: a Rectangle annotation is a hollow outline, so
-/// clicking the middle of a big frame must reach whatever is underneath it.
-fn rect_outline_hit(a: Point2, b: Point2, p: Point2, tol: f32) -> bool {
-    let r = Rect::from_corners(a, b);
-    let tl = Point2::new(r.x, r.y);
-    let tr = Point2::new(r.x + r.w, r.y);
-    let br = Point2::new(r.x + r.w, r.y + r.h);
-    let bl = Point2::new(r.x, r.y + r.h);
-    [(tl, tr), (tr, br), (br, bl), (bl, tl)]
-        .iter()
-        .any(|(s, e)| segment_distance(p, *s, *e) <= tol)
+/// The box a text mark's ink fills, with its top left corner at `position`.
+fn text_box(position: Point2, text: &str, font_size: f32) -> Rect {
+    let (width, height) = text_extent(text, font_size);
+    Rect { x: position.x, y: position.y, w: width, h: height }
 }
 
-/// Hit-test the ellipse outline inscribed in the rect spanned by `a`-`b`.
-/// Compares the click's distance from the center against the ellipse radius
-/// along the same ray, which is exact on that ray and cheap.
-fn ellipse_outline_hit(a: Point2, b: Point2, p: Point2, tol: f32) -> bool {
-    let r = Rect::from_corners(a, b);
-    let (rx, ry) = (r.w / 2.0, r.h / 2.0);
-    // A collapsed axis draws as a line, not an ellipse — fall back to the
-    // bounding outline so a flat "ellipse" is still selectable.
-    if rx <= tol || ry <= tol {
-        return rect_outline_hit(a, b, p, tol);
+/// Straight-line distance between two points.
+fn dist(a: Point2, b: Point2) -> f32 {
+    let (dx, dy) = (a.x - b.x, a.y - b.y);
+    (dx * dx + dy * dy).sqrt()
+}
+
+/// Distance from `p` to the nearest point of the segment from `a` to `b`.
+/// A segment with no length is treated as the point `a`.
+fn dist_to_segment(p: Point2, a: Point2, b: Point2) -> f32 {
+    let (ux, uy) = (b.x - a.x, b.y - a.y);
+    let length_sq = ux * ux + uy * uy;
+    if length_sq <= f32::EPSILON {
+        return dist(p, a);
     }
-    let cx = r.x + rx;
-    let cy = r.y + ry;
-    let dx = p.x - cx;
-    let dy = p.y - cy;
-    let len = (dx * dx + dy * dy).sqrt();
-    if len <= f32::EPSILON {
-        return rx.min(ry) <= tol;
+    // How far along the segment the closest point sits, 0 at `a`, 1 at `b`.
+    let along = (((p.x - a.x) * ux + (p.y - a.y) * uy) / length_sq).clamp(0.0, 1.0);
+    dist(p, Point2::new(a.x + ux * along, a.y + uy * along))
+}
+
+/// How close to a stroke's centre line a click must be: half the stroke,
+/// plus the slop.
+fn reach(thickness: f32) -> f32 {
+    HIT_SLOP + thickness * 0.5
+}
+
+/// Whether `p` is within `within` of a path joining `points` in order. A
+/// path of one point is a dot; a path of none is nothing.
+fn near_path(points: &[Point2], p: Point2, within: f32) -> bool {
+    if let [dot] = points {
+        return dist(p, *dot) <= within;
     }
-    let ux = dx / len;
-    let uy = dy / len;
-    let denom = ((ux / rx).powi(2) + (uy / ry).powi(2)).sqrt();
-    if denom <= f32::EPSILON {
+    points.windows(2).any(|pair| dist_to_segment(p, pair[0], pair[1]) <= within)
+}
+
+/// Whether `p` is within `within` of the outline of the box with corners
+/// `a` and `b`. Only the outline counts: a rectangle mark is a hollow frame,
+/// and a click in its middle belongs to whatever lies beneath.
+fn near_box_outline(a: Point2, b: Point2, p: Point2, within: f32) -> bool {
+    let frame = Rect::from_corners(a, b);
+    let (left, top) = (frame.x, frame.y);
+    let (right, bottom) = (frame.x + frame.w, frame.y + frame.h);
+    let ring = [
+        Point2::new(left, top),
+        Point2::new(right, top),
+        Point2::new(right, bottom),
+        Point2::new(left, bottom),
+        Point2::new(left, top),
+    ];
+    near_path(&ring, p, within)
+}
+
+/// Whether `p` is within `within` of the outline of the ellipse filling the
+/// box with corners `a` and `b`. It compares how far the click is from the
+/// centre with how far the curve is from the centre in the same direction:
+/// exact along that line, and cheap.
+fn near_ellipse_outline(a: Point2, b: Point2, p: Point2, within: f32) -> bool {
+    let frame = Rect::from_corners(a, b);
+    let (half_w, half_h) = (frame.w / 2.0, frame.h / 2.0);
+    // Squashed flat, an ellipse draws as a line; its box outline is then
+    // the honest click target.
+    if half_w <= within || half_h <= within {
+        return near_box_outline(a, b, p, within);
+    }
+    let centre = Point2::new(frame.x + half_w, frame.y + half_h);
+    let from_centre = dist(p, centre);
+    if from_centre <= f32::EPSILON {
+        return half_w.min(half_h) <= within;
+    }
+    let (dir_x, dir_y) = ((p.x - centre.x) / from_centre, (p.y - centre.y) / from_centre);
+    let inverse_radius = ((dir_x / half_w).powi(2) + (dir_y / half_h).powi(2)).sqrt();
+    if inverse_radius <= f32::EPSILON {
         return false;
     }
-    (len - 1.0 / denom).abs() <= tol
+    (from_centre - 1.0 / inverse_radius).abs() <= within
 }
 
-/// Does `p` land on the painted body of `a`?
+/// `r` with `by` added on every side.
+fn grow(r: Rect, by: f32) -> Rect {
+    Rect { x: r.x - by, y: r.y - by, w: r.w + by * 2.0, h: r.h + by * 2.0 }
+}
+
+/// The box a step marker covers, worked out from its look.
+fn step_box(center: Point2, number: u32, look: &crate::step::StepLook) -> Rect {
+    let (left, top, right, bottom) = crate::step::extent(number, look);
+    Rect { x: center.x + left, y: center.y + top, w: right - left, h: bottom - top }
+}
+
+/// How far an arrow's head reaches out from its tip: twice the stroke, never
+/// less than 5 px.
+fn arrow_head_reach(thickness: f32) -> f32 {
+    (thickness * 2.0).max(5.0)
+}
+
+/// Whether a click at `p` lands on the ink of `a`.
 pub fn hit_test(a: &Annotation, p: Point2) -> bool {
+    use AnnotationKind as K;
     match &a.kind {
-        AnnotationKind::Pen { stroke, points } | AnnotationKind::Marker { stroke, points } => {
-            polyline_hit(points, p, stroke_tolerance(stroke.thickness))
+        K::Pen { stroke, points } | K::Marker { stroke, points } => {
+            near_path(points, p, reach(stroke.thickness))
         }
-        AnnotationKind::Line { stroke, start, end } => {
-            segment_distance(p, *start, *end) <= stroke_tolerance(stroke.thickness)
+        K::Line { stroke, start, end } => near_path(&[*start, *end], p, reach(stroke.thickness)),
+        K::Arrow { stroke, start, end } => {
+            // The head is wider than the shaft, so near the tip the head's
+            // own reach applies.
+            dist_to_segment(p, *start, *end) <= reach(stroke.thickness)
+                || dist(p, *end) <= arrow_head_reach(stroke.thickness) + HIT_SLOP
         }
-        AnnotationKind::Arrow { stroke, start, end } => {
-            // The head is wider than the shaft, so the tip gets the head's
-            // half-width as its tolerance instead of the shaft's.
-            let shaft = stroke_tolerance(stroke.thickness);
-            let head  = (stroke.thickness * 2.0).max(5.0) + HIT_SLOP;
-            segment_distance(p, *start, *end) <= shaft
-                || segment_distance(p, *end, *end) <= head
+        K::Rectangle { stroke, start, end } => {
+            near_box_outline(*start, *end, p, reach(stroke.thickness))
         }
-        AnnotationKind::Rectangle { stroke, start, end } => {
-            rect_outline_hit(*start, *end, p, stroke_tolerance(stroke.thickness))
+        K::Ellipse { stroke, start, end } => {
+            near_ellipse_outline(*start, *end, p, reach(stroke.thickness))
         }
-        AnnotationKind::Ellipse { stroke, start, end } => {
-            ellipse_outline_hit(*start, *end, p, stroke_tolerance(stroke.thickness))
+        K::Text { position, text, font_size, .. } => {
+            grow(text_box(*position, text, *font_size), HIT_SLOP).contains(p)
         }
-        AnnotationKind::Text { position, text, font_size, .. } => {
-            let (w, h) = text_extent(text, *font_size);
-            Rect {
-                x: position.x - HIT_SLOP,
-                y: position.y - HIT_SLOP,
-                w: w + HIT_SLOP * 2.0,
-                h: h + HIT_SLOP * 2.0,
-            }
-            .contains(p)
+        K::Step { center, number, look } => grow(step_box(*center, *number, look), HIT_SLOP).contains(p),
+        K::TextMark { rects, .. } => rects.iter().any(|line| grow(*line, HIT_SLOP).contains(p)),
+        // Blur and spotlight fill their whole box.
+        K::Pixelate { start, end, .. } | K::Spotlight { start, end } => {
+            grow(Rect::from_corners(*start, *end), HIT_SLOP).contains(p)
         }
-        AnnotationKind::Step { center, number, look } => {
-            let r = step_rect(*center, *number, look);
-            Rect { x: r.x - HIT_SLOP, y: r.y - HIT_SLOP, w: r.w + HIT_SLOP * 2.0, h: r.h + HIT_SLOP * 2.0 }.contains(p)
-        }
-        AnnotationKind::TextMark { rects, .. } => rects.iter()
-            .any(|r| Rect { x: r.x - HIT_SLOP, y: r.y - HIT_SLOP, w: r.w + HIT_SLOP * 2.0, h: r.h + HIT_SLOP * 2.0 }.contains(p)),
-        AnnotationKind::Pixelate { start, end, .. } | AnnotationKind::Spotlight { start, end } => {
-            // Filled effects: the whole rect is the body.
-            let r = Rect::from_corners(*start, *end);
-            Rect { x: r.x - HIT_SLOP, y: r.y - HIT_SLOP, w: r.w + HIT_SLOP * 2.0, h: r.h + HIT_SLOP * 2.0 }
-                .contains(p)
-        }
-        AnnotationKind::Magnify { center, edge, .. } => {
-            let r = crate::annotation::magnify_radius(*center, *edge);
-            ((p.x - center.x).powi(2) + (p.y - center.y).powi(2)).sqrt() <= r + HIT_SLOP
+        K::Magnify { center, edge, .. } => {
+            dist(p, *center) <= crate::annotation::magnify_radius(*center, *edge) + HIT_SLOP
         }
     }
 }
 
-/// Index of the topmost (last-drawn) annotation under `p`. A spotlight is
-/// drawn under all the ink whatever its place in the list, so ink over it
-/// wins the click, and a spotlight is only picked where nothing else is.
+/// The index of the mark a click at `p` picks: the last drawn one under it.
+/// Spotlights are painted beneath all other marks wherever they sit in the
+/// list, so any other mark under the click wins, and a spotlight is picked
+/// only where nothing else is.
 pub fn hit_test_topmost(annotations: &[Annotation], p: Point2) -> Option<usize> {
-    let spot = |a: &Annotation| matches!(a.kind, AnnotationKind::Spotlight { .. });
-    annotations.iter().rposition(|a| !spot(a) && hit_test(a, p))
-        .or_else(|| annotations.iter().rposition(|a| spot(a) && hit_test(a, p)))
-}
-
-/// Axis-aligned box covering everything the annotation paints, including
-/// stroke width and arrow heads. Used to draw the selection highlight.
-pub fn bounds(a: &Annotation) -> Rect {
-    fn span(points: &[Point2], pad: f32) -> Rect {
-        let (mut x0, mut y0) = (f32::MAX, f32::MAX);
-        let (mut x1, mut y1) = (f32::MIN, f32::MIN);
-        for p in points {
-            x0 = x0.min(p.x); y0 = y0.min(p.y);
-            x1 = x1.max(p.x); y1 = y1.max(p.y);
-        }
-        if points.is_empty() {
-            return Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
-        }
-        Rect { x: x0 - pad, y: y0 - pad, w: (x1 - x0) + pad * 2.0, h: (y1 - y0) + pad * 2.0 }
-    }
-    match &a.kind {
-        AnnotationKind::Pen { stroke, points } | AnnotationKind::Marker { stroke, points } => {
-            span(points, stroke.thickness / 2.0)
-        }
-        AnnotationKind::Line { stroke, start, end }
-        | AnnotationKind::Rectangle { stroke, start, end }
-        | AnnotationKind::Ellipse { stroke, start, end } => {
-            span(&[*start, *end], stroke.thickness / 2.0)
-        }
-        AnnotationKind::Arrow { stroke, start, end } => {
-            span(&[*start, *end], (stroke.thickness * 2.0).max(5.0))
-        }
-        AnnotationKind::Pixelate { start, end, .. } | AnnotationKind::Spotlight { start, end } =>
-            span(&[*start, *end], 0.0),
-        AnnotationKind::Magnify { stroke, center, edge, .. } => {
-            let r = crate::annotation::magnify_radius(*center, *edge) + stroke.thickness / 2.0;
-            Rect { x: center.x - r, y: center.y - r, w: r * 2.0, h: r * 2.0 }
-        }
-        AnnotationKind::Text { position, text, font_size, .. } => {
-            let (w, h) = text_extent(text, *font_size);
-            Rect { x: position.x, y: position.y, w, h }
-        }
-        AnnotationKind::Step { center, number, look } => step_rect(*center, *number, look),
-        AnnotationKind::TextMark { rects, look } => crate::mark::bounds(rects, look.style),
-    }
-}
-
-/// Shift every coordinate of `a` by (dx, dy), in place.
-pub fn translate(a: &mut Annotation, dx: f32, dy: f32) {
-    let shift = |p: &mut Point2| { p.x += dx; p.y += dy; };
-    match &mut a.kind {
-        AnnotationKind::Pen { points, .. } | AnnotationKind::Marker { points, .. } => {
-            for p in points.iter_mut() { shift(p); }
-        }
-        AnnotationKind::Line { start, end, .. }
-        | AnnotationKind::Arrow { start, end, .. }
-        | AnnotationKind::Rectangle { start, end, .. }
-        | AnnotationKind::Ellipse { start, end, .. }
-        | AnnotationKind::Pixelate { start, end, .. }
-        | AnnotationKind::Spotlight { start, end } => { shift(start); shift(end); }
-        AnnotationKind::Magnify { center, edge, .. } => { shift(center); shift(edge); }
-        AnnotationKind::Text { position, .. } => shift(position),
-        AnnotationKind::Step { center, .. }   => shift(center),
-        AnnotationKind::TextMark { rects, .. } => for r in rects.iter_mut() { r.x += dx; r.y += dy; },
-    }
-}
-
-/// Non-mutating `translate`. The commit path uses this to move window-space
-/// coordinates into the cropped output's local space.
-pub fn translated(a: &Annotation, dx: f32, dy: f32) -> Annotation {
-    let mut out = a.clone();
-    translate(&mut out, dx, dy);
-    out
-}
-
-/// The number the next `Tool::Step` click should get: one past the highest
-/// step already on the canvas. Keeps the counter honest after an undo, a
-/// redo, or a deleted step marker.
-pub fn next_step_number(annotations: &[Annotation]) -> u32 {
-    annotations
-        .iter()
-        .filter_map(|a| match a.kind {
-            AnnotationKind::Step { number, .. } => Some(number),
-            _ => None,
+    let topmost = |want_spotlight: bool| {
+        annotations.iter().rposition(|a| {
+            matches!(a.kind, AnnotationKind::Spotlight { .. }) == want_spotlight && hit_test(a, p)
         })
-        .max()
-        .map_or(1, |n| n.saturating_add(1))
+    };
+    topmost(false).or_else(|| topmost(true))
+}
+
+/// The smallest box around `points`, with `pad` added on every side. No
+/// points give an empty box at the origin.
+fn span(points: &[Point2], pad: f32) -> Rect {
+    let Some(first) = points.first() else {
+        return Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+    };
+    let (mut low, mut high) = (*first, *first);
+    for q in points {
+        low = Point2::new(low.x.min(q.x), low.y.min(q.y));
+        high = Point2::new(high.x.max(q.x), high.y.max(q.y));
+    }
+    Rect {
+        x: low.x - pad,
+        y: low.y - pad,
+        w: (high.x - low.x) + pad * 2.0,
+        h: (high.y - low.y) + pad * 2.0,
+    }
+}
+
+/// An upright box around everything `a` paints, stroke width and arrow
+/// head included. The selection highlight is drawn around it.
+pub fn bounds(a: &Annotation) -> Rect {
+    use AnnotationKind as K;
+    match &a.kind {
+        K::Pen { stroke, points } | K::Marker { stroke, points } => span(points, stroke.thickness / 2.0),
+        K::Line { stroke, start, end }
+        | K::Rectangle { stroke, start, end }
+        | K::Ellipse { stroke, start, end } => span(&[*start, *end], stroke.thickness / 2.0),
+        K::Arrow { stroke, start, end } => span(&[*start, *end], arrow_head_reach(stroke.thickness)),
+        K::Pixelate { start, end, .. } | K::Spotlight { start, end } => span(&[*start, *end], 0.0),
+        K::Magnify { stroke, center, edge, .. } => {
+            let outer = crate::annotation::magnify_radius(*center, *edge) + stroke.thickness / 2.0;
+            grow(Rect { x: center.x, y: center.y, w: 0.0, h: 0.0 }, outer)
+        }
+        K::Text { position, text, font_size, .. } => text_box(*position, text, *font_size),
+        K::Step { center, number, look } => step_box(*center, *number, look),
+        K::TextMark { rects, look } => crate::mark::bounds(rects, look.style),
+    }
+}
+
+/// Move every point of `a` by (dx, dy), changing it in place.
+pub fn translate(a: &mut Annotation, dx: f32, dy: f32) {
+    use AnnotationKind as K;
+    let nudge = |q: &mut Point2| *q = Point2::new(q.x + dx, q.y + dy);
+    match &mut a.kind {
+        K::Pen { points, .. } | K::Marker { points, .. } => points.iter_mut().for_each(nudge),
+        K::Line { start, end, .. }
+        | K::Arrow { start, end, .. }
+        | K::Rectangle { start, end, .. }
+        | K::Ellipse { start, end, .. }
+        | K::Pixelate { start, end, .. }
+        | K::Spotlight { start, end }
+        | K::Magnify { center: start, edge: end, .. } => {
+            nudge(start);
+            nudge(end);
+        }
+        K::Text { position: anchor, .. } | K::Step { center: anchor, .. } => nudge(anchor),
+        K::TextMark { rects, .. } => {
+            for line in rects.iter_mut() {
+                line.x += dx;
+                line.y += dy;
+            }
+        }
+    }
+}
+
+/// A moved copy of `a`, leaving `a` alone. Saving uses it to carry marks
+/// from window coordinates into the cropped picture's own.
+pub fn translated(a: &Annotation, dx: f32, dy: f32) -> Annotation {
+    let mut copy = a.clone();
+    translate(&mut copy, dx, dy);
+    copy
+}
+
+/// The number the Step tool's next click gives: one more than the highest
+/// step on the canvas, or 1 when there is none. Reading it from the canvas
+/// keeps the count right after undo, redo, or deleting a step.
+pub fn next_step_number(annotations: &[Annotation]) -> u32 {
+    let highest = annotations.iter().filter_map(|a| match a.kind {
+        AnnotationKind::Step { number, .. } => Some(number),
+        _ => None,
+    });
+    highest.max().map_or(1, |n| n.saturating_add(1))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::annotation::Stroke;
-    use crate::color::Rgba;
+    use crate::{annotation::Stroke, color::Rgba};
 
-    fn stroke() -> Stroke { Stroke { color: Rgba::RED, thickness: 4.0 } }
-    fn p(x: f32, y: f32) -> Point2 { Point2::new(x, y) }
+    fn pt(x: f32, y: f32) -> Point2 { Point2::new(x, y) }
 
-    // ── hit-testing, one test per annotation kind ───────────────────────
+    /// A 4 px red stroke, so the reach is 2 + 5 = 7 px from the centre line.
+    fn ink() -> Stroke { Stroke { color: Rgba::RED, thickness: 4.0 } }
 
-    #[test]
-    fn hit_test_pen_path() {
-        let mut a = Annotation::pen(stroke(), p(10.0, 10.0));
-        a.extend(p(50.0, 10.0));
-        a.extend(p(50.0, 40.0));
-        assert!(hit_test(&a, p(30.0, 11.0)), "on the first segment");
-        assert!(hit_test(&a, p(50.0, 30.0)), "on the second segment");
-        assert!(!hit_test(&a, p(30.0, 35.0)), "inside the elbow but off the ink");
-        assert!(!hit_test(&a, p(200.0, 200.0)), "far away");
+    /// `start` dragged to `end` with `make`, the way the editor builds one.
+    fn dragged(make: fn(Stroke, Point2) -> Annotation, start: Point2, end: Point2) -> Annotation {
+        let mut mark = make(ink(), start);
+        mark.extend(end);
+        mark
     }
 
     #[test]
-    fn hit_test_single_point_pen_path() {
-        let a = Annotation::pen(stroke(), p(10.0, 10.0));
-        assert!(hit_test(&a, p(11.0, 11.0)));
-        assert!(!hit_test(&a, p(40.0, 40.0)));
+    fn a_pen_path_is_hit_along_each_segment_only() {
+        let mut path = Annotation::pen(ink(), pt(10.0, 10.0));
+        path.extend(pt(50.0, 10.0));
+        path.extend(pt(50.0, 40.0));
+        assert!(hit_test(&path, pt(30.0, 12.0)), "first leg");
+        assert!(hit_test(&path, pt(48.0, 30.0)), "second leg");
+        assert!(!hit_test(&path, pt(30.0, 35.0)), "inside the corner, away from ink");
+        assert!(!hit_test(&path, pt(200.0, 200.0)));
     }
 
     #[test]
-    fn hit_test_line() {
-        let mut a = Annotation::line(stroke(), p(0.0, 0.0));
-        a.extend(p(100.0, 100.0));
-        assert!(hit_test(&a, p(50.0, 50.0)));
-        assert!(!hit_test(&a, p(50.0, 70.0)));
-        assert!(!hit_test(&a, p(-40.0, -40.0)), "past the endpoint, not on the segment");
+    fn a_one_point_pen_path_is_a_dot() {
+        let dot = Annotation::pen(ink(), pt(10.0, 10.0));
+        assert!(hit_test(&dot, pt(14.0, 14.0)));
+        assert!(!hit_test(&dot, pt(40.0, 40.0)));
     }
 
     #[test]
-    fn hit_test_arrow_shaft_and_head() {
-        let mut a = Annotation::arrow(stroke(), p(0.0, 0.0));
-        a.extend(p(100.0, 0.0));
-        assert!(hit_test(&a, p(50.0, 1.0)), "shaft");
-        assert!(hit_test(&a, p(100.0, 10.0)), "head is wider than the shaft");
-        assert!(!hit_test(&a, p(50.0, 30.0)));
+    fn a_line_is_hit_on_the_segment_not_beyond_it() {
+        let line = dragged(Annotation::line, pt(0.0, 0.0), pt(100.0, 100.0));
+        assert!(hit_test(&line, pt(51.0, 49.0)));
+        assert!(!hit_test(&line, pt(50.0, 70.0)));
+        assert!(!hit_test(&line, pt(-40.0, -40.0)), "on the line's extension, past its end");
     }
 
     #[test]
-    fn hit_test_rectangle_is_outline_only() {
-        let mut a = Annotation::rectangle(stroke(), p(10.0, 10.0));
-        a.extend(p(110.0, 60.0));
-        assert!(hit_test(&a, p(60.0, 10.0)), "top edge");
-        assert!(hit_test(&a, p(110.0, 35.0)), "right edge");
-        assert!(!hit_test(&a, p(60.0, 35.0)), "hollow interior must not swallow clicks");
+    fn an_arrow_head_reaches_further_than_its_shaft() {
+        let arrow = dragged(Annotation::arrow, pt(0.0, 0.0), pt(100.0, 0.0));
+        assert!(hit_test(&arrow, pt(50.0, 6.0)), "shaft");
+        assert!(!hit_test(&arrow, pt(50.0, 10.0)), "10 px off the shaft is a miss");
+        assert!(hit_test(&arrow, pt(100.0, 10.0)), "10 px off the tip is the head");
+        assert!(!hit_test(&arrow, pt(50.0, 30.0)));
     }
 
     #[test]
-    fn hit_test_ellipse_is_outline_only() {
-        let mut a = Annotation::ellipse(stroke(), p(0.0, 0.0));
-        a.extend(p(200.0, 100.0));
-        assert!(hit_test(&a, p(100.0, 0.0)),   "top of the curve");
-        assert!(hit_test(&a, p(200.0, 50.0)),  "right of the curve");
-        assert!(!hit_test(&a, p(100.0, 50.0)), "center is hollow");
-        assert!(!hit_test(&a, p(0.0, 0.0)),    "bbox corner is outside the curve");
+    fn a_rectangle_is_a_hollow_frame() {
+        let frame = dragged(Annotation::rectangle, pt(10.0, 10.0), pt(110.0, 60.0));
+        assert!(hit_test(&frame, pt(60.0, 12.0)), "top");
+        assert!(hit_test(&frame, pt(108.0, 35.0)), "right");
+        assert!(hit_test(&frame, pt(60.0, 60.0)), "bottom");
+        assert!(!hit_test(&frame, pt(60.0, 35.0)), "the middle is see-through");
     }
 
     #[test]
-    fn hit_test_flat_ellipse_falls_back_to_its_box() {
-        let mut a = Annotation::ellipse(stroke(), p(0.0, 50.0));
-        a.extend(p(100.0, 50.0));
-        assert!(hit_test(&a, p(50.0, 50.0)), "a collapsed ellipse draws as a line");
+    fn an_ellipse_is_a_hollow_ring() {
+        let ring = dragged(Annotation::ellipse, pt(0.0, 0.0), pt(200.0, 100.0));
+        assert!(hit_test(&ring, pt(100.0, 2.0)), "top");
+        assert!(hit_test(&ring, pt(198.0, 50.0)), "right");
+        assert!(!hit_test(&ring, pt(100.0, 50.0)), "the middle is see-through");
+        assert!(!hit_test(&ring, pt(0.0, 0.0)), "its box corner is off the curve");
     }
 
     #[test]
-    fn hit_test_marker_uses_its_fat_stroke() {
-        // Marker thickness is 6x, so its click target is much wider.
-        let mut a = Annotation::marker(stroke(), p(0.0, 0.0), 0xC8);
-        a.extend(p(100.0, 0.0));
-        assert!(hit_test(&a, p(50.0, 11.0)), "inside the 24-px band");
-        assert!(!hit_test(&a, p(50.0, 40.0)));
+    fn a_flattened_ellipse_is_hit_like_a_line() {
+        let flat = dragged(Annotation::ellipse, pt(0.0, 50.0), pt(100.0, 50.0));
+        assert!(hit_test(&flat, pt(50.0, 52.0)));
+        assert!(!hit_test(&flat, pt(50.0, 70.0)));
     }
 
     #[test]
-    fn hit_test_text_box() {
-        let a = Annotation::text(Rgba::RED, p(20.0, 30.0), "hi");
-        // font_size 14 -> scale 2 -> 2 glyphs = 2*10 + 2 = 22 wide, 14 tall.
-        assert!(hit_test(&a, p(25.0, 35.0)));
-        assert!(hit_test(&a, p(41.0, 43.0)), "trailing edge, within slop");
-        assert!(!hit_test(&a, p(80.0, 35.0)));
-        assert!(!hit_test(&a, p(25.0, 80.0)));
+    fn the_marker_is_six_times_wider_to_click() {
+        let mut swipe = Annotation::marker(ink(), pt(0.0, 0.0), 0xC8);
+        swipe.extend(pt(100.0, 0.0));
+        // 4 px becomes 24 px: a reach of 12 + 5.
+        assert!(hit_test(&swipe, pt(50.0, 16.0)));
+        assert!(!hit_test(&swipe, pt(50.0, 18.0)));
     }
 
     #[test]
-    fn hit_test_step_disc() {
-        let a = Annotation::step(Rgba::RED, p(100.0, 100.0), 3);
-        assert!(hit_test(&a, p(100.0, 100.0)), "center");
-        assert!(hit_test(&a, p(112.0, 100.0)), "inside the disc");
-        assert!(!hit_test(&a, p(130.0, 100.0)), "outside disc + slop");
+    fn text_is_hit_inside_its_measured_box_plus_slop() {
+        let at = pt(20.0, 30.0);
+        let label = Annotation::text(Rgba::RED, at, "hi");
+        let (w, h) = text_extent("hi", crate::text::DEFAULT_PX);
+        assert!(w > 0.0 && h > 0.0);
+        assert!(hit_test(&label, pt(at.x + 2.0, at.y + 2.0)));
+        assert!(hit_test(&label, pt(at.x + w + HIT_SLOP - 1.0, at.y + h + HIT_SLOP - 1.0)), "corner, within slop");
+        assert!(!hit_test(&label, pt(at.x + w + HIT_SLOP + 1.0, at.y + 2.0)), "right of it");
+        assert!(!hit_test(&label, pt(at.x + 2.0, at.y + h + HIT_SLOP + 1.0)), "below it");
     }
 
     #[test]
-    fn hit_test_pixelate_is_filled() {
-        let mut a = Annotation::pixelate(p(10.0, 10.0));
-        a.extend(p(60.0, 40.0));
-        assert!(hit_test(&a, p(35.0, 25.0)), "blur is a filled effect");
-        assert!(!hit_test(&a, p(90.0, 25.0)));
+    fn empty_text_is_one_line_tall_and_no_width() {
+        let (w, h) = text_extent("", 30.0);
+        assert_eq!(w, 0.0);
+        assert_eq!(h, crate::text::line_height(crate::text::clamp_px(30.0)));
     }
 
     #[test]
-    fn hit_test_topmost_prefers_the_last_drawn() {
-        let mut under = Annotation::rectangle(stroke(), p(0.0, 0.0));
-        under.extend(p(100.0, 100.0));
-        let over = Annotation::step(Rgba::RED, p(0.0, 0.0), 1);
-        let list = vec![under, over];
-        assert_eq!(hit_test_topmost(&list, p(0.0, 0.0)), Some(1));
-        assert_eq!(hit_test_topmost(&list, p(100.0, 50.0)), Some(0));
-        assert_eq!(hit_test_topmost(&list, p(400.0, 400.0)), None);
+    fn a_step_disc_is_hit_across_its_face() {
+        let step = Annotation::step(Rgba::RED, pt(100.0, 100.0), 3);
+        assert!(hit_test(&step, pt(100.0, 100.0)));
+        assert!(hit_test(&step, pt(112.0, 100.0)));
+        assert!(!hit_test(&step, pt(130.0, 100.0)), "past the disc and the slop");
     }
 
     #[test]
-    fn a_spotlight_is_clicked_only_where_no_ink_is() {
-        let mut arrow = Annotation::arrow(stroke(), p(0.0, 50.0));
-        arrow.extend(p(100.0, 50.0));
-        let mut spot = Annotation::spotlight(p(0.0, 0.0));
-        spot.extend(p(200.0, 200.0));
-        // The spotlight came later, but it is drawn under the arrow.
-        let list = vec![arrow, spot];
-        assert_eq!(hit_test_topmost(&list, p(50.0, 50.0)), Some(0), "the arrow on top wins");
-        assert_eq!(hit_test_topmost(&list, p(150.0, 150.0)), Some(1), "the spotlight elsewhere");
+    fn a_blur_is_hit_anywhere_inside() {
+        let mut blur = Annotation::pixelate(pt(10.0, 10.0));
+        blur.extend(pt(60.0, 40.0));
+        assert!(hit_test(&blur, pt(35.0, 25.0)));
+        assert!(hit_test(&blur, pt(64.0, 25.0)), "within slop of its edge");
+        assert!(!hit_test(&blur, pt(90.0, 25.0)));
     }
 
     #[test]
-    fn a_lens_is_a_filled_disc_and_too_small_ones_are_dropped() {
-        let mut lens = Annotation::magnify(stroke(), p(100.0, 100.0), 2);
-        assert!(lens.is_degenerate(), "a click is no lens");
-        lens.extend(p(140.0, 100.0));
+    fn the_last_drawn_mark_wins_a_shared_spot() {
+        let frame = dragged(Annotation::rectangle, pt(0.0, 0.0), pt(100.0, 100.0));
+        let step = Annotation::step(Rgba::RED, pt(0.0, 0.0), 1);
+        let marks = [frame, step];
+        assert_eq!(hit_test_topmost(&marks, pt(0.0, 0.0)), Some(1));
+        assert_eq!(hit_test_topmost(&marks, pt(100.0, 50.0)), Some(0));
+        assert_eq!(hit_test_topmost(&marks, pt(400.0, 400.0)), None);
+    }
+
+    #[test]
+    fn a_spotlight_loses_to_any_ink_over_it() {
+        let arrow = dragged(Annotation::arrow, pt(0.0, 50.0), pt(100.0, 50.0));
+        let mut spot = Annotation::spotlight(pt(0.0, 0.0));
+        spot.extend(pt(200.0, 200.0));
+        // Later in the list, yet painted beneath the arrow.
+        let marks = [arrow, spot];
+        assert_eq!(hit_test_topmost(&marks, pt(50.0, 50.0)), Some(0));
+        assert_eq!(hit_test_topmost(&marks, pt(150.0, 150.0)), Some(1));
+    }
+
+    #[test]
+    fn a_lens_is_a_solid_disc_with_a_capped_size() {
+        let mut lens = Annotation::magnify(ink(), pt(100.0, 100.0), 2);
+        assert!(lens.is_degenerate(), "a bare click makes no lens");
+        lens.extend(pt(140.0, 100.0));
         assert!(!lens.is_degenerate());
-        assert!(hit_test(&lens, p(100.0, 100.0)) && hit_test(&lens, p(130.0, 110.0)));
-        assert!(!hit_test(&lens, p(200.0, 100.0)));
-        let mut far = Annotation::magnify(stroke(), p(0.0, 0.0), 9);
-        far.extend(p(5000.0, 0.0));
-        assert_eq!(bounds(&far).w, (crate::annotation::MAGNIFY_MAX_RADIUS + 2.0) * 2.0, "capped");
-        let AnnotationKind::Magnify { zoom, .. } = far.kind else { unreachable!() };
-        assert_eq!(zoom, 4, "zoom stays 2 to 4");
-        let mut thin = Annotation::spotlight(p(0.0, 0.0));
-        thin.extend(p(300.0, 2.0));
-        assert!(thin.is_degenerate(), "a sliver lights nothing");
+        assert!(hit_test(&lens, pt(100.0, 100.0)) && hit_test(&lens, pt(130.0, 110.0)));
+        assert!(!hit_test(&lens, pt(200.0, 100.0)));
+        let mut huge = Annotation::magnify(ink(), pt(0.0, 0.0), 9);
+        huge.extend(pt(5000.0, 0.0));
+        let widest = (crate::annotation::MAGNIFY_MAX_RADIUS + 2.0) * 2.0;
+        assert_eq!(bounds(&huge).w, widest, "radius capped, plus half the stroke");
+        let AnnotationKind::Magnify { zoom, .. } = huge.kind else { unreachable!() };
+        assert_eq!(zoom, 4, "zoom is held to 2 through 4");
+        let mut sliver = Annotation::spotlight(pt(0.0, 0.0));
+        sliver.extend(pt(300.0, 2.0));
+        assert!(sliver.is_degenerate(), "a sliver spotlights nothing");
     }
 
     #[test]
-    fn hit_test_topmost_on_empty_canvas() {
-        assert_eq!(hit_test_topmost(&[], p(1.0, 1.0)), None);
+    fn nothing_is_hit_on_an_empty_canvas() {
+        assert_eq!(hit_test_topmost(&[], pt(1.0, 1.0)), None);
     }
 
-    // ── translate, one assertion per annotation kind ────────────────────
-
-    fn all_kinds() -> Vec<Annotation> {
-        let mut pen = Annotation::pen(stroke(), p(1.0, 2.0));
-        pen.extend(p(3.0, 4.0));
-        let mut marker = Annotation::marker(stroke(), p(1.0, 2.0), 0xC8);
-        marker.extend(p(3.0, 4.0));
-        let mut line = Annotation::line(stroke(), p(1.0, 2.0));       line.extend(p(3.0, 4.0));
-        let mut arrow = Annotation::arrow(stroke(), p(1.0, 2.0));     arrow.extend(p(3.0, 4.0));
-        let mut rect = Annotation::rectangle(stroke(), p(1.0, 2.0));  rect.extend(p(3.0, 4.0));
-        let mut ell = Annotation::ellipse(stroke(), p(1.0, 2.0));     ell.extend(p(3.0, 4.0));
-        let mut blur = Annotation::pixelate(p(1.0, 2.0));             blur.extend(p(3.0, 4.0));
-        let mut spot = Annotation::spotlight(p(1.0, 2.0));            spot.extend(p(30.0, 40.0));
-        let mut lens = Annotation::magnify(stroke(), p(50.0, 50.0), 2); lens.extend(p(80.0, 50.0));
+    /// One of every kind of mark, each with some size to it.
+    fn one_of_each() -> Vec<Annotation> {
+        let (from, to) = (pt(1.0, 2.0), pt(3.0, 4.0));
+        let mut pen = Annotation::pen(ink(), from);
+        pen.extend(to);
+        let mut swipe = Annotation::marker(ink(), from, 0xC8);
+        swipe.extend(to);
+        let mut blur = Annotation::pixelate(from);
+        blur.extend(to);
+        let mut spot = Annotation::spotlight(from);
+        spot.extend(pt(30.0, 40.0));
+        let mut lens = Annotation::magnify(ink(), pt(50.0, 50.0), 2);
+        lens.extend(pt(80.0, 50.0));
         vec![
-            pen, marker, line, arrow, rect, ell, blur, spot, lens,
-            Annotation::text(Rgba::RED, p(1.0, 2.0), "abc"),
-            Annotation::step(Rgba::RED, p(1.0, 2.0), 7),
+            pen,
+            swipe,
+            dragged(Annotation::line, from, to),
+            dragged(Annotation::arrow, from, to),
+            dragged(Annotation::rectangle, from, to),
+            dragged(Annotation::ellipse, from, to),
+            blur,
+            spot,
+            lens,
+            Annotation::text(Rgba::RED, from, "abc"),
+            Annotation::step(Rgba::RED, from, 7),
         ]
     }
 
+    fn close(a: f32, b: f32) -> bool { (a - b).abs() < 0.001 }
+
     #[test]
-    fn translate_moves_every_annotation_kind() {
-        for a in all_kinds() {
-            let before = bounds(&a);
-            let moved  = translated(&a, 25.0, -13.0);
-            let after  = bounds(&moved);
-            assert!((after.x - (before.x + 25.0)).abs() < 0.001, "x for {:?}", a.kind);
-            assert!((after.y - (before.y - 13.0)).abs() < 0.001, "y for {:?}", a.kind);
-            assert!((after.w - before.w).abs() < 0.001, "width must not change for {:?}", a.kind);
-            assert!((after.h - before.h).abs() < 0.001, "height must not change for {:?}", a.kind);
+    fn moving_shifts_the_box_of_every_kind_without_resizing_it() {
+        for mark in one_of_each() {
+            let was = bounds(&mark);
+            let now = bounds(&translated(&mark, 25.0, -13.0));
+            assert!(close(now.x, was.x + 25.0) && close(now.y, was.y - 13.0), "{:?}", mark.kind);
+            assert!(close(now.w, was.w) && close(now.h, was.h), "{:?} changed size", mark.kind);
         }
     }
 
     #[test]
-    fn translate_round_trips_to_the_original() {
-        for a in all_kinds() {
-            let mut moved = a.clone();
-            translate(&mut moved, 40.0, 90.0);
-            translate(&mut moved, -40.0, -90.0);
-            assert_eq!(moved, a, "move then unmove must restore {:?}", a.kind);
+    fn moving_there_and_back_restores_every_kind_exactly() {
+        for mark in one_of_each() {
+            let mut moved = mark.clone();
+            translate(&mut moved, 37.5, -64.0);
+            translate(&mut moved, -37.5, 64.0);
+            assert_eq!(moved, mark);
         }
     }
 
     #[test]
-    fn translate_keeps_hit_test_and_style_in_sync() {
-        for a in all_kinds() {
-            let b = bounds(&a);
-            let probe = p(b.x + b.w / 2.0, b.y + b.h / 2.0);
-            let moved = translated(&a, 500.0, 500.0);
-            assert!(!hit_test(&moved, probe),
-                    "moved ink must not answer to the old location: {:?}", a.kind);
-            assert_eq!(std::mem::discriminant(&a.kind), std::mem::discriminant(&moved.kind));
-            assert_eq!(a.time, moved.time, "time window survives a move");
+    fn a_moved_mark_no_longer_answers_where_it_was() {
+        for mark in one_of_each() {
+            let b = bounds(&mark);
+            let old_middle = pt(b.x + b.w / 2.0, b.y + b.h / 2.0);
+            let moved = translated(&mark, 500.0, 500.0);
+            assert!(!hit_test(&moved, old_middle), "{:?}", mark.kind);
+            assert_eq!(std::mem::discriminant(&mark.kind), std::mem::discriminant(&moved.kind));
+            assert_eq!(moved.time, mark.time);
         }
     }
 
     #[test]
-    fn translate_preserves_the_time_window() {
-        let mut a = Annotation::pen(stroke(), p(0.0, 0.0));
-        a.time = Some((1.0, 4.0));
-        assert_eq!(translated(&a, 5.0, 5.0).time, Some((1.0, 4.0)));
+    fn moving_keeps_a_video_time_window() {
+        let mut pen = Annotation::pen(ink(), pt(0.0, 0.0));
+        pen.time = Some((1.0, 4.0));
+        assert_eq!(translated(&pen, 5.0, 5.0).time, Some((1.0, 4.0)));
     }
 
-    // ── bounds + step numbering ────────────────────────────────────────
+    #[test]
+    fn a_highlight_moves_every_line_box() {
+        let mut mark = Annotation {
+            kind: AnnotationKind::TextMark {
+                rects: vec![Rect { x: 1.0, y: 2.0, w: 30.0, h: 10.0 }, Rect { x: 1.0, y: 14.0, w: 20.0, h: 10.0 }],
+                look: Default::default(),
+            },
+            time: None,
+        };
+        translate(&mut mark, 10.0, 5.0);
+        let AnnotationKind::TextMark { rects, .. } = &mark.kind else { unreachable!() };
+        assert_eq!((rects[0].x, rects[0].y, rects[1].x, rects[1].y), (11.0, 7.0, 11.0, 19.0));
+        assert_eq!((rects[0].w, rects[1].w), (30.0, 20.0), "sizes untouched");
+    }
 
     #[test]
-    fn bounds_cover_the_painted_body() {
-        let a = Annotation::step(Rgba::RED, p(100.0, 100.0), 1);
-        let b = bounds(&a);
-        assert_eq!((b.x, b.y, b.w, b.h), (85.0, 85.0, 30.0, 30.0), "a 15 px disc");
-        // A pin stands above the spot it marks.
+    fn a_step_box_covers_its_shape() {
+        let disc = Annotation::step(Rgba::RED, pt(100.0, 100.0), 1);
+        let b = bounds(&disc);
+        assert_eq!((b.x, b.y, b.w, b.h), (85.0, 85.0, 30.0, 30.0), "a disc of radius 15");
+        // A pin rises above the point it marks.
         use crate::step::{StepLook, StepShape};
-        let pin = Annotation::step_styled(p(100.0, 100.0), 1, StepLook::recipe(StepShape::Pin, Rgba::RED));
+        let pin = Annotation::step_styled(pt(100.0, 100.0), 1, StepLook::recipe(StepShape::Pin, Rgba::RED));
         let b = bounds(&pin);
         assert!(b.y < 60.0 && b.y + b.h <= 103.0, "{b:?}");
-        assert!(hit_test(&pin, p(100.0, 75.0)), "its head");
-        assert!(!hit_test(&pin, p(100.0, 115.0)), "below its tip");
+        assert!(hit_test(&pin, pt(100.0, 75.0)), "the head");
+        assert!(!hit_test(&pin, pt(100.0, 115.0)), "under the point");
     }
 
     #[test]
-    fn bounds_of_an_empty_path_are_empty() {
-        let a = Annotation { kind: AnnotationKind::Pen { stroke: stroke(), points: vec![] }, time: None };
-        assert!(bounds(&a).is_empty());
+    fn a_path_with_no_points_has_an_empty_box() {
+        let bare = Annotation { kind: AnnotationKind::Pen { stroke: ink(), points: Vec::new() }, time: None };
+        assert!(bounds(&bare).is_empty());
+        assert!(!hit_test(&bare, pt(0.0, 0.0)));
     }
 
     #[test]
-    fn next_step_number_follows_the_highest_marker() {
-        assert_eq!(next_step_number(&[]), 1);
-        let list = vec![
-            Annotation::step(Rgba::RED, p(0.0, 0.0), 1),
-            Annotation::pen(stroke(), p(0.0, 0.0)),
-            Annotation::step(Rgba::RED, p(0.0, 0.0), 2),
+    fn the_next_step_follows_the_highest_on_the_canvas() {
+        assert_eq!(next_step_number(&Vec::new()), 1, "the first step is 1");
+        let marks = [
+            Annotation::step(Rgba::RED, pt(0.0, 0.0), 1),
+            Annotation::pen(ink(), pt(0.0, 0.0)),
+            Annotation::step(Rgba::RED, pt(0.0, 0.0), 2),
         ];
-        assert_eq!(next_step_number(&list), 3);
-        assert_eq!(next_step_number(&list[..1]), 2);
+        assert_eq!(next_step_number(&marks), 3);
+        assert_eq!(next_step_number(&marks[..1]), 2);
+        assert_eq!(next_step_number(&[Annotation::step(Rgba::RED, pt(0.0, 0.0), u32::MAX)]), u32::MAX);
     }
 }

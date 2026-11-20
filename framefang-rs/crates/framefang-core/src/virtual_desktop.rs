@@ -1,27 +1,27 @@
-//! Virtual-desktop geometry: the union of every monitor, and the coordinate
-//! mappings between the overlay's framebuffer and virtual-screen space.
+//! Multi-monitor geometry: the box around every monitor, and the conversions
+//! between the overlay window, the stitched screenshot and the OS's virtual
+//! screen.
 //!
-//! Three coordinate spaces are in play once a second monitor exists, and
-//! mixing them up is what makes a region selected on a non-primary monitor
-//! crop the wrong pixels:
+//! With two or more monitors there are three coordinate spaces, and using the
+//! wrong one is how a region picked on a secondary monitor ends up cropping
+//! someone else's pixels:
 //!
-//! | Space | Origin | Used by |
-//! |---|---|---|
-//! | virtual-screen | wherever the OS puts it — `(0, 0)` is the *primary* monitor's top-left, so a monitor placed left of / above it has **negative** coordinates | monitor rects, window positions (winit), the pin window |
-//! | bitmap | top-left of the stitched capture = the union's top-left | `capture_all_screens`'s bitmap, the crop rect |
-//! | frame | top-left of the overlay window's client area | mouse events, annotations, every painter call |
+//! | Space | Its `(0, 0)` | Who uses it |
+//! | --- | --- | --- |
+//! | virtual screen | the primary monitor's top-left; monitors left of or above it have negative coordinates | monitor rects, window positions (winit), the pin window |
+//! | bitmap | the top-left of the stitched capture, which is the corner of the box around all monitors | the captured bitmap, the crop rectangle |
+//! | frame | the top-left of the overlay window's client area | mouse events, annotations, all painting |
 //!
-//! When the overlay covers the whole virtual desktop, frame == bitmap and
-//! both differ from virtual-screen space by the union origin. The overlay
-//! re-derives its frame origin from the window itself each redraw, so a
-//! window manager that refuses the requested geometry shifts the mapping
-//! instead of silently capturing the wrong region.
+//! When the overlay covers the whole virtual desktop, frame and bitmap are
+//! the same space, offset from virtual-screen space by the box's corner. The
+//! overlay reads its real position back from the window on every redraw, so
+//! a window manager that ignores the requested placement shifts these
+//! mappings instead of quietly cropping the wrong pixels.
 //!
-//! Everything here is unit-agnostic: feed it logical or physical pixels
-//! consistently and it stays correct. Scale-factor conversion is a separate
-//! concern and composes on top of these functions rather than inside them.
+//! None of this cares about units. Use logical or physical pixels, just the
+//! same kind everywhere. DPI scaling is layered on top by the caller.
 
-/// One monitor's rectangle in virtual-screen coordinates.
+/// A monitor's rectangle in virtual-screen coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MonitorRect {
     pub x: i32,
@@ -32,311 +32,343 @@ pub struct MonitorRect {
 
 impl MonitorRect {
     pub const fn new(x: i32, y: i32, width: u32, height: u32) -> Self {
-        Self { x, y, width, height }
+        MonitorRect { x, y, width, height }
     }
 
-    /// Exclusive right edge.
-    pub const fn right(&self) -> i32 { self.x + self.width as i32 }
+    /// The first column past the monitor.
+    pub const fn right(&self) -> i32 {
+        self.width as i32 + self.x
+    }
 
-    /// Exclusive bottom edge.
-    pub const fn bottom(&self) -> i32 { self.y + self.height as i32 }
+    /// The first row past the monitor.
+    pub const fn bottom(&self) -> i32 {
+        self.height as i32 + self.y
+    }
 
+    /// True when the point is on this monitor. The right and bottom edges
+    /// belong to the neighbour, so a point on a seam is on exactly one
+    /// monitor.
     pub const fn contains(&self, (px, py): (i32, i32)) -> bool {
-        px >= self.x && px < self.right() && py >= self.y && py < self.bottom()
+        self.x <= px && px < self.right() && self.y <= py && py < self.bottom()
     }
 }
 
-/// Bounding box of every monitor, in virtual-screen coordinates, plus the
-/// monitors themselves. `None` when the list is empty — a machine with no
-/// monitors has no desktop to describe.
+/// The box around every monitor, as `(top-left corner, (width, height))` in
+/// virtual-screen coordinates. `None` for an empty list, since no monitors
+/// means no desktop.
 pub fn union_bounds(monitors: &[MonitorRect]) -> Option<((i32, i32), (u32, u32))> {
-    let first = monitors.first()?;
-    let mut min_x = first.x;
-    let mut min_y = first.y;
-    let mut max_x = first.right();
-    let mut max_y = first.bottom();
-    for m in &monitors[1..] {
-        min_x = min_x.min(m.x);
-        min_y = min_y.min(m.y);
-        max_x = max_x.max(m.right());
-        max_y = max_y.max(m.bottom());
-    }
-    Some((
-        (min_x, min_y),
-        ((max_x - min_x).max(0) as u32, (max_y - min_y).max(0) as u32),
-    ))
+    let (first, rest) = monitors.split_first()?;
+    let start = (first.x, first.y, first.right(), first.bottom());
+    let (left, top, right, bottom) = rest.iter().fold(start, |(l, t, r, b), m| {
+        (l.min(m.x), t.min(m.y), r.max(m.right()), b.max(m.bottom()))
+    });
+    let extent = |lo: i32, hi: i32| (hi - lo).max(0) as u32;
+    Some(((left, top), (extent(left, right), extent(top, bottom))))
 }
 
-/// The virtual desktop: where the stitched capture starts in virtual-screen
-/// space, how big it is, and which monitors make it up.
+/// The virtual desktop as the overlay sees it: where the stitched capture
+/// starts in virtual-screen space, its size, and the monitors in it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DesktopGeometry {
-    origin: (i32, i32),
-    size: (u32, u32),
-    monitors: Vec<MonitorRect>,
+    /// Virtual-screen position of the bitmap's top-left pixel.
+    corner: (i32, i32),
+    extent: (u32, u32),
+    screens: Vec<MonitorRect>,
 }
 
 impl DesktopGeometry {
-    /// Build from a monitor list. `None` when the list is empty.
+    /// The desktop made of these monitors, or `None` when there are none.
     pub fn from_monitors(monitors: Vec<MonitorRect>) -> Option<Self> {
-        let (origin, size) = union_bounds(&monitors)?;
-        Some(Self { origin, size, monitors })
+        let bounds = union_bounds(&monitors);
+        bounds.map(|(corner, extent)| DesktopGeometry { corner, extent, screens: monitors })
     }
 
-    /// A bitmap that is not a screen capture (a video frame, say): rooted at
-    /// `(0, 0)` with no monitor list, so chrome lays out against the whole
-    /// framebuffer instead of against a monitor.
+    /// For an image that did not come from the screen (a video frame, for
+    /// instance): anchored at `(0, 0)` and with no monitors, so the chrome
+    /// lays out against the whole image instead of one monitor.
     pub fn bitmap(width: u32, height: u32) -> Self {
-        Self { origin: (0, 0), size: (width, height), monitors: Vec::new() }
+        DesktopGeometry { extent: (width, height), ..Default::default() }
     }
 
-    /// Virtual-screen coordinates of the bitmap's top-left pixel.
-    pub fn origin(&self) -> (i32, i32) { self.origin }
+    /// Where the bitmap's top-left pixel is in virtual-screen coordinates.
+    pub fn origin(&self) -> (i32, i32) {
+        self.corner
+    }
 
-    pub fn size(&self) -> (u32, u32) { self.size }
+    pub fn size(&self) -> (u32, u32) {
+        self.extent
+    }
 
-    pub fn monitors(&self) -> &[MonitorRect] { &self.monitors }
+    pub fn monitors(&self) -> &[MonitorRect] {
+        self.screens.as_slice()
+    }
 
-    /// True when a window that merely fills the primary monitor would miss
-    /// part of the desktop — more than one monitor, or a union that starts
-    /// somewhere other than the origin. That is exactly the case where the
-    /// overlay has to be placed by hand instead of asking for fullscreen.
+    /// True when a window sized to the primary monitor would not cover the
+    /// whole desktop: there is more than one monitor, or the desktop does
+    /// not start at the origin. In that case the overlay has to be placed
+    /// explicitly rather than simply made fullscreen.
     pub fn spans_multiple_monitors(&self) -> bool {
-        self.monitors.len() > 1 || self.origin != (0, 0)
+        self.corner != (0, 0) || self.screens.len() > 1
     }
 }
 
-/// Framebuffer point -> virtual-screen point.
-pub fn frame_to_virtual(frame_origin: (i32, i32), (x, y): (i32, i32)) -> (i32, i32) {
-    (frame_origin.0 + x, frame_origin.1 + y)
+/// `p` moved by `by`.
+fn shifted((x, y): (i32, i32), by: (i32, i32)) -> (i32, i32) {
+    (x + by.0, y + by.1)
 }
 
-/// Virtual-screen point -> framebuffer point.
-pub fn virtual_to_frame(frame_origin: (i32, i32), (x, y): (i32, i32)) -> (i32, i32) {
-    (x - frame_origin.0, y - frame_origin.1)
+/// `p` moved back by `by`.
+fn unshifted((x, y): (i32, i32), by: (i32, i32)) -> (i32, i32) {
+    (x - by.0, y - by.1)
 }
 
-/// Framebuffer rect -> virtual-screen rect. Size is unchanged; only the
-/// origin moves.
-pub fn frame_rect_to_virtual(
-    frame_origin: (i32, i32),
-    (x, y, w, h): (i32, i32, i32, i32),
-) -> (i32, i32, i32, i32) {
-    let (vx, vy) = frame_to_virtual(frame_origin, (x, y));
-    (vx, vy, w, h)
+/// A point in the overlay window to the same point on the virtual screen.
+pub fn frame_to_virtual(frame_origin: (i32, i32), p: (i32, i32)) -> (i32, i32) {
+    shifted(p, frame_origin)
 }
 
-/// Framebuffer point -> pixel coordinates in the stitched capture.
+/// A point on the virtual screen to the same point in the overlay window.
+pub fn virtual_to_frame(frame_origin: (i32, i32), p: (i32, i32)) -> (i32, i32) {
+    unshifted(p, frame_origin)
+}
+
+/// A rectangle in the overlay window to virtual-screen coordinates. Only the
+/// corner moves; the size is the same in both spaces.
+pub fn frame_rect_to_virtual(frame_origin: (i32, i32), (x, y, w, h): (i32, i32, i32, i32)) -> (i32, i32, i32, i32) {
+    let moved = shifted((x, y), frame_origin);
+    (moved.0, moved.1, w, h)
+}
+
+/// A point in the overlay window to a pixel in the stitched capture.
 ///
-/// `bitmap_origin` is the capture's virtual-screen origin (the union's
-/// top-left, negative whenever a monitor sits left of / above the primary
-/// one); `frame_origin` is the overlay window's own virtual-screen origin.
-/// They are equal when the overlay covers the whole desktop as asked, and
-/// the difference is exactly the correction a partly-placed overlay needs.
-pub fn frame_to_bitmap(
-    bitmap_origin: (i32, i32),
-    frame_origin: (i32, i32),
-    p: (i32, i32),
-) -> (i32, i32) {
-    virtual_to_frame(bitmap_origin, frame_to_virtual(frame_origin, p))
+/// `bitmap_origin` is where the capture starts on the virtual screen (the
+/// corner of the box around all monitors, negative when a monitor sits left
+/// of or above the primary). `frame_origin` is where the overlay window
+/// actually is. The two match when the overlay covers the desktop as
+/// requested; any difference between them is precisely the correction a
+/// misplaced overlay needs.
+pub fn frame_to_bitmap(bitmap_origin: (i32, i32), frame_origin: (i32, i32), p: (i32, i32)) -> (i32, i32) {
+    unshifted(shifted(p, frame_origin), bitmap_origin)
 }
 
-/// Framebuffer rect -> rect in the stitched capture. This is the mapping
-/// the crop goes through: a selection dragged on a monitor left of the
-/// primary one has negative virtual coordinates but lands at a positive
-/// bitmap offset.
+/// A rectangle in the overlay window to a rectangle in the stitched capture.
+/// The crop goes through this: a selection on a monitor left of the primary
+/// has negative virtual-screen coordinates but a positive place in the
+/// bitmap.
 pub fn frame_rect_to_bitmap(
-    bitmap_origin: (i32, i32),
-    frame_origin: (i32, i32),
-    (x, y, w, h): (i32, i32, i32, i32),
+    bitmap_origin: (i32, i32), frame_origin: (i32, i32), (x, y, w, h): (i32, i32, i32, i32),
 ) -> (i32, i32, i32, i32) {
-    let (bx, by) = frame_to_bitmap(bitmap_origin, frame_origin, (x, y));
-    (bx, by, w, h)
+    let in_bitmap = frame_to_bitmap(bitmap_origin, frame_origin, (x, y));
+    (in_bitmap.0, in_bitmap.1, w, h)
 }
 
-/// Offset, in bitmap pixels, of the framebuffer's top-left corner inside
-/// the capture. Sampling helper for blits that walk the framebuffer.
+/// Where the overlay window's top-left pixel falls in the stitched capture.
+/// Blits that walk the window add this to every coordinate.
 pub fn bitmap_offset(bitmap_origin: (i32, i32), frame_origin: (i32, i32)) -> (i32, i32) {
-    frame_to_bitmap(bitmap_origin, frame_origin, (0, 0))
+    // The window's own (0, 0), moved onto the screen and then into the bitmap.
+    unshifted(frame_origin, bitmap_origin)
 }
 
-/// Intersection of two rects given as `(x, y, w, h)`. `None` when they
-/// don't overlap or either is empty.
-pub fn intersect_rect(
-    a: (i32, i32, i32, i32),
-    b: (i32, i32, i32, i32),
-) -> Option<(i32, i32, i32, i32)> {
-    let x0 = a.0.max(b.0);
-    let y0 = a.1.max(b.1);
-    let x1 = (a.0 + a.2).min(b.0 + b.2);
-    let y1 = (a.1 + a.3).min(b.1 + b.3);
-    if x1 > x0 && y1 > y0 { Some((x0, y0, x1 - x0, y1 - y0)) } else { None }
+/// The overlap of two `(x, y, w, h)` rectangles, or `None` when they share
+/// no area (which includes either one being empty).
+pub fn intersect_rect(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> Option<(i32, i32, i32, i32)> {
+    let left = a.0.max(b.0);
+    let top = a.1.max(b.1);
+    let right = (a.0 + a.2).min(b.0 + b.2);
+    let bottom = (a.1 + a.3).min(b.1 + b.3);
+    let has_area = right > left && bottom > top;
+    has_area.then(|| (left, top, right - left, bottom - top))
 }
 
-/// Framebuffer-space rect the floating chrome (tool panel, action panel,
-/// magnifier, hint chip) should lay itself out inside: the monitor holding
-/// `point`, clipped to the framebuffer.
+/// The area, in overlay-window coordinates, that floating chrome (tool
+/// panel, action panel, magnifier, hint chip) should keep itself inside:
+/// the monitor under `point`, trimmed to the window.
 ///
-/// Falls back to the whole framebuffer when no monitor claims the point —
-/// which is also what an empty monitor list gives, so a non-capture bitmap
-/// keeps the single-surface behaviour.
+/// When no monitor is under the point (a gap in an L-shaped layout, or an
+/// empty monitor list for a non-screen image) the whole window is used.
 pub fn monitor_bounds_in_frame(
-    monitors: &[MonitorRect],
-    frame_origin: (i32, i32),
-    frame_size: (u32, u32),
-    point: (i32, i32),
+    monitors: &[MonitorRect], frame_origin: (i32, i32), frame_size: (u32, u32), point: (i32, i32),
 ) -> (i32, i32, i32, i32) {
-    let whole = (0, 0, frame_size.0 as i32, frame_size.1 as i32);
-    let virt = frame_to_virtual(frame_origin, point);
-    let Some(m) = monitors.iter().find(|m| m.contains(virt)) else { return whole };
-    let (mx, my) = virtual_to_frame(frame_origin, (m.x, m.y));
-    intersect_rect((mx, my, m.width as i32, m.height as i32), whole).unwrap_or(whole)
+    let window = (0, 0, frame_size.0 as i32, frame_size.1 as i32);
+    let on_screen = frame_to_virtual(frame_origin, point);
+    monitors
+        .iter()
+        .find(|m| m.contains(on_screen))
+        .and_then(|m| {
+            let (fx, fy) = virtual_to_frame(frame_origin, (m.x, m.y));
+            intersect_rect((fx, fy, m.width as i32, m.height as i32), window)
+        })
+        .unwrap_or(window)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Second monitor to the LEFT of the primary one: the union starts at a
-    /// negative x, which is the layout that made region capture pick the
-    /// wrong pixels.
-    fn left_of_primary() -> DesktopGeometry {
-        DesktopGeometry::from_monitors(vec![
-            MonitorRect::new(0, 0, 1920, 1080),
-            MonitorRect::new(-1600, -200, 1600, 900),
-        ])
-        .unwrap()
+    /// The layout that used to crop the wrong pixels: a 1600 x 900 monitor
+    /// left of and slightly above a 1080p primary, so the desktop starts at
+    /// negative coordinates.
+    fn laptop_left_of_primary() -> DesktopGeometry {
+        desktop(&[PRIMARY, LAPTOP])
+    }
+
+    const PRIMARY: MonitorRect = MonitorRect::new(0, 0, 1920, 1080);
+    const LAPTOP: MonitorRect = MonitorRect::new(-1600, -200, 1600, 900);
+
+    fn desktop(monitors: &[MonitorRect]) -> DesktopGeometry {
+        DesktopGeometry::from_monitors(monitors.to_vec()).expect("at least one monitor")
     }
 
     #[test]
-    fn union_of_one_monitor_is_that_monitor() {
-        let g = DesktopGeometry::from_monitors(vec![MonitorRect::new(0, 0, 1920, 1080)]).unwrap();
-        assert_eq!(g.origin(), (0, 0));
-        assert_eq!(g.size(), (1920, 1080));
-        assert!(!g.spans_multiple_monitors());
+    fn one_monitor_is_its_own_desktop() {
+        let single = desktop(&[PRIMARY]);
+        assert_eq!((single.origin(), single.size()), ((0, 0), (1920, 1080)));
+        assert!(!single.spans_multiple_monitors(), "one monitor at the origin");
     }
 
     #[test]
-    fn union_spans_negative_origins() {
-        let g = left_of_primary();
-        assert_eq!(g.origin(), (-1600, -200));
-        assert_eq!(g.size(), (3520, 1280));
-        assert!(g.spans_multiple_monitors());
+    fn the_desktop_box_reaches_into_negative_coordinates() {
+        let g = laptop_left_of_primary();
+        assert_eq!((g.origin(), g.size()), ((-1600, -200), (3520, 1280)));
+        assert_eq!(g.monitors(), &[PRIMARY, LAPTOP]);
+        assert!(g.spans_multiple_monitors(), "two monitors");
     }
 
     #[test]
-    fn union_of_no_monitors_is_none() {
-        assert!(DesktopGeometry::from_monitors(Vec::new()).is_none());
-        assert!(union_bounds(&[]).is_none());
+    fn no_monitors_means_no_desktop() {
+        assert_eq!(DesktopGeometry::from_monitors(vec![]), None);
+        assert_eq!(union_bounds(&[]), None);
     }
 
     #[test]
-    fn bitmap_geometry_has_no_monitors() {
-        let g = DesktopGeometry::bitmap(1280, 720);
-        assert_eq!(g.origin(), (0, 0));
-        assert_eq!(g.size(), (1280, 720));
-        assert!(g.monitors().is_empty());
-        assert!(!g.spans_multiple_monitors());
+    fn the_box_covers_gaps_between_monitors() {
+        let gapped = [MonitorRect::new(0, 0, 100, 100), MonitorRect::new(300, 50, 100, 100)];
+        assert_eq!(union_bounds(&gapped), Some(((0, 0), (400, 150))));
     }
 
     #[test]
-    fn frame_and_virtual_round_trip() {
-        let origin = (-1600, -200);
-        for p in [(0, 0), (10, 20), (3519, 1279)] {
-            assert_eq!(virtual_to_frame(origin, frame_to_virtual(origin, p)), p);
+    fn a_lone_monitor_off_the_origin_still_needs_explicit_placement() {
+        assert!(desktop(&[MonitorRect::new(-1920, 0, 1920, 1080)]).spans_multiple_monitors());
+    }
+
+    #[test]
+    fn a_plain_bitmap_has_no_monitors() {
+        let video = DesktopGeometry::bitmap(1280, 720);
+        assert_eq!((video.origin(), video.size(), video.monitors().len()), ((0, 0), (1280, 720), 0));
+        assert!(!video.spans_multiple_monitors(), "nothing to span");
+        assert_eq!(DesktopGeometry::default(), DesktopGeometry::bitmap(0, 0));
+    }
+
+    #[test]
+    fn monitor_edges_are_half_open() {
+        let m = MonitorRect::new(-100, -50, 100, 50);
+        assert_eq!((m.right(), m.bottom()), (0, 0));
+        assert!(m.contains((-100, -50)));
+        assert!(m.contains((-1, -1)));
+        assert!(!m.contains((0, -1)), "the right edge belongs to the next monitor");
+        assert!(!m.contains((-1, 0)), "so does the bottom edge");
+    }
+
+    #[test]
+    fn frame_and_virtual_convert_both_ways() {
+        let window_at = laptop_left_of_primary().origin();
+        for p in [(0, 0), (7, 31), (1600, 200), (3519, 1279)] {
+            let on_screen = frame_to_virtual(window_at, p);
+            assert_eq!(virtual_to_frame(window_at, on_screen), p);
         }
-        assert_eq!(frame_to_virtual(origin, (0, 0)), (-1600, -200));
-        assert_eq!(frame_to_virtual(origin, (1600, 200)), (0, 0));
+        // The window's corner is the desktop's corner, and the primary
+        // monitor's corner is the virtual-screen origin.
+        assert_eq!(frame_to_virtual(window_at, (0, 0)), window_at);
+        assert_eq!(virtual_to_frame(window_at, (0, 0)), (1600, 200));
     }
 
-    /// The whole point of the fix: a selection on the left-hand monitor maps
-    /// to a positive offset in the stitched bitmap, and to a negative
-    /// virtual-screen position for the pin window.
+    /// A selection on the left monitor sits at a positive offset in the
+    /// bitmap but a negative position on the virtual screen (where the pin
+    /// window goes).
     #[test]
-    fn selection_on_left_monitor_maps_into_the_bitmap() {
-        let g = left_of_primary();
-        let origin = g.origin();
-        // Overlay covers the whole desktop, so frame origin == bitmap origin.
-        let sel = (100, 50, 400, 300);
-        assert_eq!(frame_rect_to_bitmap(origin, origin, sel), (100, 50, 400, 300));
-        assert_eq!(frame_rect_to_virtual(origin, sel), (-1500, -150, 400, 300));
+    fn a_selection_on_the_left_monitor_lands_inside_the_bitmap() {
+        // The overlay covers the whole desktop, so the window and the bitmap
+        // start at the same place.
+        let corner = laptop_left_of_primary().origin();
+        let picked = (100, 50, 400, 300);
+        assert_eq!(frame_rect_to_bitmap(corner, corner, picked), picked);
+        assert_eq!(frame_rect_to_virtual(corner, picked), (-1600 + 100, -200 + 50, 400, 300));
     }
 
-    /// Same selection, but the window manager refused the placement and put
-    /// the overlay at (0, 0). The crop has to shift by the difference or it
-    /// grabs pixels from the wrong monitor.
+    /// The window manager put the overlay at (0, 0) instead of where it was
+    /// asked to go. The crop must move by the difference, or it takes pixels
+    /// from the other monitor.
     #[test]
-    fn misplaced_overlay_shifts_the_crop() {
-        let bitmap_origin = (-1600, -200);
-        let frame_origin = (0, 0);
-        assert_eq!(bitmap_offset(bitmap_origin, frame_origin), (1600, 200));
-        assert_eq!(
-            frame_rect_to_bitmap(bitmap_origin, frame_origin, (100, 50, 400, 300)),
-            (1700, 250, 400, 300)
-        );
-        assert_eq!(frame_rect_to_virtual(frame_origin, (100, 50, 400, 300)), (100, 50, 400, 300));
+    fn a_misplaced_overlay_moves_the_crop() {
+        let capture_at = LAPTOP_CORNER;
+        let window_at = (0, 0);
+        let picked = (100, 50, 400, 300);
+        assert_eq!(bitmap_offset(capture_at, window_at), (1600, 200));
+        assert_eq!(frame_rect_to_bitmap(capture_at, window_at, picked), (1600 + 100, 200 + 50, 400, 300));
+        // On the virtual screen it is wherever the window really is.
+        assert_eq!(frame_rect_to_virtual(window_at, picked), picked);
     }
 
-    #[test]
-    fn aligned_overlay_has_no_bitmap_offset() {
-        assert_eq!(bitmap_offset((-1600, -200), (-1600, -200)), (0, 0));
-        assert_eq!(bitmap_offset((0, 0), (0, 0)), (0, 0));
-    }
+    const LAPTOP_CORNER: (i32, i32) = (LAPTOP.x, LAPTOP.y);
 
     #[test]
-    fn intersect_rect_clips_and_rejects() {
-        assert_eq!(intersect_rect((0, 0, 100, 100), (50, 50, 100, 100)), Some((50, 50, 50, 50)));
-        assert_eq!(intersect_rect((0, 0, 100, 100), (100, 0, 10, 10)), None);
-        assert_eq!(intersect_rect((0, 0, 0, 100), (0, 0, 10, 10)), None);
-        assert_eq!(intersect_rect((-40, -40, 80, 80), (0, 0, 10, 10)), Some((0, 0, 10, 10)));
-    }
-
-    /// Chrome anchored to a selection on the left-hand monitor must lay out
-    /// inside that monitor's slice of the framebuffer, not the whole
-    /// 3520-px-wide desktop — otherwise the tool panel lands on the monitor
-    /// next door.
-    #[test]
-    fn chrome_bounds_follow_the_monitor_under_the_point() {
-        let g = left_of_primary();
-        let origin = g.origin();
-        let size = g.size();
-        // Point on the secondary (left/top) monitor.
-        assert_eq!(
-            monitor_bounds_in_frame(g.monitors(), origin, size, (10, 10)),
-            (0, 0, 1600, 900)
-        );
-        // Point on the primary monitor: its frame-space origin is the
-        // negated union origin.
-        assert_eq!(
-            monitor_bounds_in_frame(g.monitors(), origin, size, (1700, 300)),
-            (1600, 200, 1920, 1080)
-        );
+    fn a_correctly_placed_overlay_has_no_offset() {
+        for corner in [LAPTOP_CORNER, (0, 0), (5, 5)] {
+            assert_eq!(bitmap_offset(corner, corner), (0, 0), "{corner:?}");
+            assert_eq!(frame_to_bitmap(corner, corner, (7, 9)), (7, 9));
+        }
     }
 
     #[test]
-    fn chrome_bounds_fall_back_to_the_frame() {
-        let g = left_of_primary();
-        // Dead zone: the union covers it but no monitor does.
-        let dead = (10, 1200);
-        assert_eq!(
-            monitor_bounds_in_frame(g.monitors(), g.origin(), g.size(), dead),
-            (0, 0, 3520, 1280)
-        );
-        // No monitor list at all (a video frame).
-        assert_eq!(
-            monitor_bounds_in_frame(&[], (0, 0), (1280, 720), (5, 5)),
-            (0, 0, 1280, 720)
-        );
+    fn intersection_trims_and_refuses_empty_results() {
+        let unit = (0, 0, 100, 100);
+        let cases = [
+            ((50, 50, 100, 100), Some((50, 50, 50, 50))),
+            ((100, 0, 10, 10), None),        // touching the right edge only
+            ((-40, -40, 80, 80), Some((0, 0, 40, 40))),
+            ((20, 30, 10, 10), Some((20, 30, 10, 10))),
+            ((0, 0, 100, 100), Some(unit)),
+        ];
+        for (other, want) in cases {
+            assert_eq!(intersect_rect(unit, other), want, "{other:?}");
+            assert_eq!(intersect_rect(other, unit), want, "order must not matter");
+        }
+        assert_eq!(intersect_rect((0, 0, 0, 100), (0, 0, 10, 10)), None, "empty input");
     }
 
-    /// A monitor that hangs off the framebuffer (window smaller than the
-    /// desktop) is clipped to what is actually drawable.
+    /// Chrome for a selection on the left monitor has to stay on that
+    /// monitor, not spread over the 3520-pixel-wide desktop and end up on
+    /// the next screen.
     #[test]
-    fn chrome_bounds_clip_to_the_framebuffer() {
-        let monitors = [MonitorRect::new(0, 0, 1920, 1080)];
-        assert_eq!(
-            monitor_bounds_in_frame(&monitors, (0, 0), (1280, 720), (5, 5)),
-            (0, 0, 1280, 720)
-        );
+    fn chrome_stays_on_the_monitor_under_the_point() {
+        let g = laptop_left_of_primary();
+        let area_at = |p| monitor_bounds_in_frame(g.monitors(), g.origin(), g.size(), p);
+        // On the laptop, which fills the window's top-left.
+        assert_eq!(area_at((10, 10)), (0, 0, 1600, 900));
+        // On the primary: its corner in the window is the desktop origin
+        // negated, (1600, 200).
+        let primary_in_window = (1600, 200, 1920, 1080);
+        assert_eq!(area_at((1700, 300)), primary_in_window);
+        // Exactly on the seam between them belongs to the primary.
+        assert_eq!(area_at((1600, 300)), primary_in_window);
+    }
+
+    #[test]
+    fn chrome_uses_the_whole_window_off_every_monitor() {
+        let g = laptop_left_of_primary();
+        let whole_window = (0, 0, g.size().0 as i32, g.size().1 as i32);
+        // Inside the desktop box but under no monitor.
+        assert_eq!(monitor_bounds_in_frame(g.monitors(), g.origin(), g.size(), (10, 1200)), whole_window);
+        // A video frame has no monitors at all.
+        assert_eq!(monitor_bounds_in_frame(&[], (0, 0), (1280, 720), (5, 5)), (0, 0, 1280, 720));
+    }
+
+    /// A window smaller than its monitor only offers the part it covers.
+    #[test]
+    fn chrome_is_trimmed_to_the_window() {
+        assert_eq!(monitor_bounds_in_frame(&[PRIMARY], (0, 0), (1280, 720), (5, 5)), (0, 0, 1280, 720));
+        // A window starting 1000 px across the monitor only has the last
+        // 920 px of it to offer.
+        assert_eq!(monitor_bounds_in_frame(&[PRIMARY], (1000, 0), (1280, 720), (5, 5)), (0, 0, 920, 720));
     }
 }

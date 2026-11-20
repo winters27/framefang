@@ -1,299 +1,275 @@
-//! Cross-platform screen capture via the `xcap` crate.
+//! Taking a picture of every screen at once.
 //!
-//! `xcap` is built on `windows-capture` (Win), `xcb` / `wayland-rs` (Linux),
-//! and `core-graphics` (macOS) under the hood. It already handles the
-//! "different OS API per platform" reality so we don't have to maintain
-//! three implementations of this file.
+//! The per-OS work of reading pixels belongs to `xcap` (Windows Graphics
+//! Capture, XCB or a Wayland protocol, CoreGraphics). What this module adds
+//! is the part every screenshot tool gets wrong at least once: putting the
+//! monitors side by side in one bitmap without losing pixels on a high-DPI
+//! screen.
 //!
-//! # High-DPI
+//! # Points and pixels
 //!
-//! A monitor's reported rect and the bitmap it hands back are *not* in the
-//! same units on every platform: macOS reports points and captures device
-//! pixels (2× on Retina), X11 divides its rects by `Xft.dpi/96`, Windows
-//! reports both in device pixels. `framefang_core::dpi` owns that mapping —
-//! [`DisplayMap`] measures the real ratio per monitor, lays every monitor out
-//! into one bitmap built at the sharpest scale, and is the single helper the
-//! overlay selection, the final crop, pin placement and any recording region
-//! convert through. The 1× case maps through it unchanged.
-//!
-//! Returned `Captured` carries raw RGBA8 bytes laid out row-major, the
-//! virtual-screen offset of the stitched bitmap, and the map that relates the
-//! two coordinate spaces.
+//! The rectangle a monitor reports and the bitmap it captures are not always
+//! in the same unit. macOS reports points and captures device pixels (twice
+//! as many on Retina), X11 shrinks its rectangles by `Xft.dpi/96`, and
+//! Windows uses device pixels for both. So the scale is measured, monitor by
+//! monitor, from the two sizes we actually hold, and `framefang_core::dpi`'s
+//! [`DisplayMap`] lays the monitors out at the sharpest scale among them. The
+//! overlay, the final crop, pins and recording regions all convert through
+//! that one map, and at 1x it changes nothing.
 
 use crate::{Error, Result};
-use image::{ImageBuffer, Rgba};
 use framefang_core::dpi::{effective_scale, sample_index, DisplayMap, MonitorGeometry, PhysicalRect};
 use framefang_core::region::DesktopBounds;
 use framefang_core::virtual_desktop::{DesktopGeometry, MonitorRect};
+use image::{ImageBuffer, Rgba, RgbaImage};
 
+/// One capture of the whole desktop.
 #[derive(Debug, Clone)]
 pub struct Captured {
-    /// Stitched bitmap covering the bounding box of all monitors, in
-    /// **physical** (device) pixels.
+    /// Every monitor drawn into one RGBA8 bitmap, in device pixels, covering
+    /// the bounding box of the layout.
     pub bitmap: ImageBuffer<Rgba<u8>, Vec<u8>>,
-    /// Bounding-box origin in virtual-screen coordinates (top-left), in
-    /// **logical** units. `map.physical_origin()` is the same point in
+    /// The bitmap's top-left corner on the virtual screen, in the logical
+    /// units the OS reports. `map.physical_origin()` gives the same corner in
     /// device pixels.
     pub virtual_origin: (i32, i32),
-    /// Logical ↔ physical mapping for `bitmap`. Everything that turns a
-    /// screen coordinate into a bitmap pixel (or back) goes through this.
+    /// How screen coordinates and bitmap pixels relate. Any conversion
+    /// between the two goes through here.
     pub map: DisplayMap,
-    /// Per-monitor frames, in screen order. Already drawn into `bitmap`,
-    /// kept around so callers can do per-monitor logic if they need to.
+    /// The monitors the bitmap was built from, in the order the OS listed
+    /// them, for callers that need to know where one screen ends.
     pub monitors: Vec<MonitorFrame>,
 }
 
-impl Captured {
-    /// The virtual-desktop rectangle this capture covers.
-    ///
-    /// Region recording clamps the user's selection against exactly this — the
-    /// bitmap the selection was dragged over — so the rectangle handed to the
-    /// encoder can never name a pixel that wasn't on screen, and so both sides
-    /// agree on where the desktop's corner is even if the monitor layout
-    /// changes between the capture and the start of the recording.
-    ///
-    /// Device pixels, like `geometry()`: the origin is the display map's
-    /// physical origin and the size is the stitched bitmap's, so a selection
-    /// made on the overlay clamps against the very pixels it was drawn on.
-    /// The map's scale rides along so a backend that addresses the screen in
-    /// points (macOS `screencapture`) can convert back.
-    pub fn desktop_bounds(&self) -> DesktopBounds {
-        let (ox, oy) = self.map.physical_origin();
-        DesktopBounds::new(ox, oy, self.bitmap.width(), self.bitmap.height())
-            .with_scale(self.map.scale())
-    }
-}
-
+/// One monitor's part of a [`Captured`].
 #[derive(Debug, Clone)]
 pub struct MonitorFrame {
-    /// Monitor origin/size as the platform reports it — logical units.
+    /// Position and size as the OS reports them (logical units).
     pub x: i32,
     pub y: i32,
     pub width:  u32,
     pub height: u32,
     pub name:   String,
-    /// Scale factor as reported by the OS. Informational: it disagrees with
-    /// reality on some platforms (see `effective_scale`).
+    /// The OS's own scale factor. Kept for information only: some systems
+    /// report one that doesn't match the pixels (see `effective_scale`).
     pub scale_factor: f32,
-    /// Physical pixels per logical unit, measured from the bitmap this
-    /// monitor actually produced.
+    /// Device pixels per logical unit, worked out from the bitmap this
+    /// monitor really returned.
     pub effective_scale: f32,
-    /// Where this monitor's pixels live inside `Captured::bitmap`.
+    /// This monitor's slot inside `Captured::bitmap`.
     pub physical: PhysicalRect,
 }
 
 impl Captured {
-    /// Virtual-desktop geometry of this capture: where the stitched bitmap
-    /// starts in virtual-screen space, how big it is, and the monitors it
-    /// was built from. The overlay places itself with this and maps every
-    /// selection back through it, so a region picked on a monitor left of
-    /// (or above) the primary one crops the pixels the user actually saw.
+    /// The desktop rectangle this capture shows, for clamping a recording
+    /// region.
     ///
-    /// Everything here is in *device* pixels — the unit the bitmap, the
-    /// overlay window and winit's cursor all share — so the monitor slots are
-    /// the `physical` rects the stitch produced, offset by the desktop's
-    /// device-pixel origin. At 1x that is exactly the OS-reported layout.
+    /// It is measured in device pixels, the same as [`Captured::geometry`]:
+    /// the corner is the map's physical origin and the size is the bitmap's,
+    /// so a selection dragged over the overlay is clamped against exactly the
+    /// pixels it was dragged over, even if the monitors change before the
+    /// recording starts. The scale goes along for backends that address the
+    /// screen in points (macOS `screencapture`).
+    pub fn desktop_bounds(&self) -> DesktopBounds {
+        let (x, y) = self.map.physical_origin();
+        DesktopBounds::new(x, y, self.bitmap.width(), self.bitmap.height()).with_scale(self.map.scale())
+    }
+
+    /// Where the bitmap sits on the virtual desktop and which monitor slots
+    /// it is made of, all in device pixels: the unit the bitmap, the overlay
+    /// window and winit's pointer share.
+    ///
+    /// The overlay places itself with this and maps selections back through
+    /// it, which is what lets a region on a monitor left of or above the
+    /// primary one crop the pixels the user saw. If the slots don't add up to
+    /// the bitmap's size, the bitmap alone is the answer.
     pub fn geometry(&self) -> DesktopGeometry {
-        let (ox, oy) = self.map.physical_origin();
-        let rects: Vec<MonitorRect> = self.monitors.iter()
-            .map(|m| MonitorRect::new(ox + m.physical.x, oy + m.physical.y,
-                                      m.physical.w, m.physical.h))
+        let (w, h) = (self.bitmap.width(), self.bitmap.height());
+        let (x, y) = self.map.physical_origin();
+        let slots = self.monitors.iter()
+            .map(|m| MonitorRect::new(x + m.physical.x, y + m.physical.y, m.physical.w, m.physical.h))
             .collect();
-        DesktopGeometry::from_monitors(rects)
-            .filter(|g| g.size() == (self.bitmap.width(), self.bitmap.height()))
-            .unwrap_or_else(|| DesktopGeometry::bitmap(self.bitmap.width(), self.bitmap.height()))
+        match DesktopGeometry::from_monitors(slots) {
+            Some(g) if g.size() == (w, h) => g,
+            _ => DesktopGeometry::bitmap(w, h),
+        }
     }
 }
 
-/// Capture every monitor and stitch into one bitmap.
+/// Capture every monitor into one bitmap.
 ///
-/// Pixel `(px, py)` of `bitmap` is the logical point
-/// `map.physical_to_logical((px, py))` on the virtual screen; the inverse,
-/// `map.logical_to_physical`, turns a screen coordinate into a bitmap pixel.
-/// At 1× that is `(virtual_origin.0 + px, virtual_origin.1 + py)`, exactly as
-/// before.
+/// Bitmap pixel `(px, py)` is the screen point `map.physical_to_logical((px,
+/// py))`, and `map.logical_to_physical` goes the other way; at 1x that is
+/// just `virtual_origin` plus the pixel.
 ///
-/// `xcap` handles the per-OS capture, Wayland included — under Wayland its
-/// `capture_image` goes out through `org.gnome.Shell.Screenshot`, the
-/// screenshot portal, or wlroots' `wlr-screencopy`, whichever answers first.
-/// What it has no Wayland path for is *enumerating* monitors, which always
-/// runs over XCB/RandR; see [`fallback_capture`].
+/// Under Wayland `xcap` still reads the pixels (GNOME Shell's screenshot
+/// call, the screenshot portal or wlroots screencopy, whichever answers),
+/// but it can only list monitors over XCB/RandR. When that listing fails,
+/// [`fallback_capture`] gets a second try.
 pub fn capture_all_screens() -> Result<Captured> {
-    match capture_all_screens_native() {
-        Ok(captured) => Ok(captured),
-        Err(e)       => fallback_capture(e),
-    }
+    capture_with_xcap().or_else(fallback_capture)
 }
 
-/// The pixels of one area of one screen, `(x, y, w, h)` in desktop pixels:
-/// the screen under its middle, the area cut to it. A few milliseconds on
-/// Windows, so scrolling capture can take one between every scroll.
+/// The pixels of one rectangle `(x, y, w, h)` in desktop pixels, from the
+/// monitor under its centre and cut to that monitor's edges. Fast enough on
+/// Windows (a few milliseconds) to take one between every scroll step.
 pub fn capture_area(x: i32, y: i32, w: u32, h: u32) -> Result<image::RgbaImage> {
-    let fail = |e: xcap::XCapError| Error::Capture(format!("capture_area: {e}"));
-    let m = xcap::Monitor::from_point(x + w as i32 / 2, y + h as i32 / 2).map_err(fail)?;
-    let (mx, my) = (m.x().map_err(fail)?, m.y().map_err(fail)?);
-    let (mw, mh) = (m.width().map_err(fail)?, m.height().map_err(fail)?);
-    let (rx, ry) = ((x - mx).max(0) as u32, (y - my).max(0) as u32);
-    let (rw, rh) = (w.min(mw.saturating_sub(rx)), h.min(mh.saturating_sub(ry)));
-    m.capture_region(rx, ry, rw, rh).map_err(fail)
+    let failed = |e: xcap::XCapError| Error::Capture(format!("reading part of the screen: {e}"));
+    let screen = xcap::Monitor::from_point(x + w as i32 / 2, y + h as i32 / 2).map_err(failed)?;
+    let left = screen.x().map_err(failed)?;
+    let top = screen.y().map_err(failed)?;
+    let screen_w = screen.width().map_err(failed)?;
+    let screen_h = screen.height().map_err(failed)?;
+    // Relative to the monitor, never left of or above it, never past it.
+    let dx = (x - left).max(0) as u32;
+    let dy = (y - top).max(0) as u32;
+    let cut_w = w.min(screen_w.saturating_sub(dx));
+    let cut_h = h.min(screen_h.saturating_sub(dy));
+    screen.capture_region(dx, dy, cut_w, cut_h).map_err(failed)
 }
 
-/// Last resort when the native path can't produce a capture.
+/// What to do when `xcap` can't produce a capture.
 ///
-/// Only Wayland has one: a Wayland-only session (no XWayland) fails monitor
-/// enumeration outright, and the screenshot portal can still hand over the
-/// screen. Everywhere else — and on X11 — the original error is the answer,
-/// because there is no second mechanism that would do better.
+/// Only a Wayland session has a second way in: with no XWayland the monitor
+/// listing fails outright, but the screenshot portal can still hand over the
+/// screen. On X11 the first error stands, since nothing else would do better.
 #[cfg(target_os = "linux")]
-fn fallback_capture(native_error: Error) -> Result<Captured> {
-    if !crate::session::is_wayland() {
-        return Err(native_error);
+fn fallback_capture(first: Error) -> Result<Captured> {
+    match crate::session::is_wayland() {
+        true => crate::capture_portal::capture_via_portal().map_err(|second| Error::Capture(format!(
+            "this Wayland session wouldn't give up the screen. Reading it directly failed \
+             ({first}), and so did the desktop's screenshot portal ({second})"
+        ))),
+        false => Err(first),
     }
-    crate::capture_portal::capture_via_portal().map_err(|portal_error| Error::Capture(format!(
-        "capture failed on this Wayland session. Reading the screen directly: \
-         {native_error}. Asking the desktop's screenshot portal instead: {portal_error}"
-    )))
 }
 
+/// Elsewhere there is no other way in, so the first error is the answer.
 #[cfg(not(target_os = "linux"))]
-fn fallback_capture(native_error: Error) -> Result<Captured> {
-    Err(native_error)
+fn fallback_capture(first: Error) -> Result<Captured> {
+    Err(first)
 }
 
-fn capture_all_screens_native() -> Result<Captured> {
-    let monitors = xcap::Monitor::all()
-        .map_err(|e| Error::Capture(format!("Monitor::all: {e}")))?;
-    if monitors.is_empty() {
-        return Err(Error::Capture("no monitors found".into()));
-    }
+/// One monitor as `xcap` gave it to us: its frame (slot not placed yet), its
+/// layout entry and its pixels.
+struct Shot {
+    frame: MonitorFrame,
+    layout: MonitorGeometry,
+    pixels: RgbaImage,
+}
 
-    // Grab every monitor first: the scale that relates a monitor's reported
-    // rect to its pixels can only be measured once we hold both.
-    let mut frames: Vec<MonitorFrame> = Vec::with_capacity(monitors.len());
-    let mut panels: Vec<(MonitorGeometry, ImageBuffer<Rgba<u8>, Vec<u8>>)> =
-        Vec::with_capacity(monitors.len());
-    for m in monitors {
-        let x = m.x().map_err(|e| Error::Capture(format!("monitor x: {e}")))?;
-        let y = m.y().map_err(|e| Error::Capture(format!("monitor y: {e}")))?;
-        let w = m.width().map_err(|e| Error::Capture(format!("monitor w: {e}")))?;
-        let h = m.height().map_err(|e| Error::Capture(format!("monitor h: {e}")))?;
-        let name = m.name().map_err(|e| Error::Capture(format!("monitor name: {e}")))?;
-        let scale = m.scale_factor().map_err(|e| Error::Capture(format!("scale: {e}")))?;
+fn shoot(monitor: &xcap::Monitor) -> Result<Shot> {
+    let fail = |what: &str, e: xcap::XCapError| Error::Capture(format!("reading the monitor's {what}: {e}"));
+    let x = monitor.x().map_err(|e| fail("position", e))?;
+    let y = monitor.y().map_err(|e| fail("position", e))?;
+    let width = monitor.width().map_err(|e| fail("size", e))?;
+    let height = monitor.height().map_err(|e| fail("size", e))?;
+    let name = monitor.name().map_err(|e| fail("name", e))?;
+    let scale_factor = monitor.scale_factor().map_err(|e| fail("scale", e))?;
+    let pixels = monitor.capture_image()
+        .map_err(|e| Error::Capture(format!("reading the pixels of {name}: {e}")))?;
 
-        let img = m.capture_image()
-            .map_err(|e| Error::Capture(format!("capture {name}: {e}")))?;
-
-        let effective = effective_scale((w, h), (img.width(), img.height()), scale);
-        frames.push(MonitorFrame {
-            x, y, width: w, height: h, name,
-            scale_factor: scale,
-            effective_scale: effective,
+    // Only now, holding both sizes, can the real scale be known.
+    let measured = effective_scale((width, height), pixels.dimensions(), scale_factor);
+    Ok(Shot {
+        layout: MonitorGeometry::new(x, y, width, height, measured),
+        frame: MonitorFrame {
+            x, y, width, height, name, scale_factor,
+            effective_scale: measured,
             physical: PhysicalRect::ZERO,
-        });
-        panels.push((MonitorGeometry::new(x, y, w, h, effective), img));
-    }
-
-    let (canvas, map) = stitch(&panels)?;
-    drop(panels);
-
-    for (frame, placement) in frames.iter_mut().zip(map.monitors()) {
-        frame.physical = placement.physical;
-    }
-
-    Ok(Captured {
-        bitmap: canvas,
-        virtual_origin: map.origin(),
-        map,
-        monitors: frames,
+        },
+        pixels,
     })
 }
 
-/// Lay every monitor's bitmap out into one virtual-desktop bitmap.
-///
-/// Split out from `capture_all_screens` so the geometry — which is all the
-/// high-DPI risk lives in — is testable without a screen attached.
-fn stitch(
-    panels: &[(MonitorGeometry, ImageBuffer<Rgba<u8>, Vec<u8>>)],
-) -> Result<(ImageBuffer<Rgba<u8>, Vec<u8>>, DisplayMap)> {
-    let geometries: Vec<MonitorGeometry> = panels.iter().map(|(g, _)| *g).collect();
-    let map = DisplayMap::from_monitors(&geometries);
-    let (total_w, total_h) = map.physical_size();
-    if total_w == 0 || total_h == 0 {
-        return Err(Error::Capture("monitor layout has zero area".into()));
+fn capture_with_xcap() -> Result<Captured> {
+    let screens = xcap::Monitor::all().map_err(|e| Error::Capture(format!("listing the monitors: {e}")))?;
+    if screens.is_empty() {
+        return Err(Error::Capture("the system reports no monitors".into()));
     }
 
-    let mut canvas: ImageBuffer<Rgba<u8>, Vec<u8>> =
-        ImageBuffer::from_pixel(total_w, total_h, Rgba([0, 0, 0, 255]));
-    for (idx, (_, img)) in panels.iter().enumerate() {
-        blit(&mut canvas, total_w, total_h, map.monitors()[idx].physical, img);
+    let mut frames = Vec::with_capacity(screens.len());
+    let mut panels = Vec::with_capacity(screens.len());
+    for monitor in &screens {
+        let shot = shoot(monitor)?;
+        frames.push(shot.frame);
+        panels.push((shot.layout, shot.pixels));
+    }
+
+    let (bitmap, map) = stitch(&panels)?;
+    for (frame, placed) in frames.iter_mut().zip(map.monitors()) {
+        frame.physical = placed.physical;
+    }
+    Ok(Captured { bitmap, virtual_origin: map.origin(), map, monitors: frames })
+}
+
+/// Lay each monitor's pixels into one desktop-sized bitmap.
+///
+/// Kept apart from the capture itself because all of the high-DPI risk is in
+/// this arithmetic, and here it can be tested with no screen attached.
+fn stitch(panels: &[(MonitorGeometry, RgbaImage)]) -> Result<(RgbaImage, DisplayMap)> {
+    let layout: Vec<MonitorGeometry> = panels.iter().map(|(g, _)| *g).collect();
+    let map = DisplayMap::from_monitors(&layout);
+    let (w, h) = map.physical_size();
+    if w == 0 || h == 0 {
+        return Err(Error::Capture("the monitor layout covers no pixels".into()));
+    }
+
+    // Opaque black wherever no monitor reaches (beside a shorter screen).
+    let mut canvas = ImageBuffer::from_pixel(w, h, Rgba([0, 0, 0, 255]));
+    for ((_, pixels), placed) in panels.iter().zip(map.monitors()) {
+        blit(&mut canvas, w, h, placed.physical, pixels);
     }
     Ok((canvas, map))
 }
 
-/// Draw one monitor's capture into its slot in the stitched canvas.
+/// Copy one monitor's pixels into its slot on the canvas.
 ///
-/// The common case — every monitor at the same scale — lands here with the
-/// source and the slot exactly the same size, so it is a row-wise memcpy and
-/// no resampling happens. A mixed-scale layout stretches the lower-DPI
-/// monitor into its slot (nearest-neighbour: a screenshot has hard edges and
-/// text, and smoothing them looks worse than the blockiness). A one- or
-/// two-pixel disagreement — the rounding slack a fractional scale leaves —
-/// copies straight across instead of resampling the whole screen for it.
-fn blit(
-    canvas: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
-    canvas_w: u32,
-    canvas_h: u32,
-    dest: PhysicalRect,
-    src: &ImageBuffer<Rgba<u8>, Vec<u8>>,
-) {
-    if dest.is_empty() || src.width() == 0 || src.height() == 0 {
+/// When the source and the slot are the same size (every monitor at one
+/// scale, the usual case) each row is a single slice copy. Sizes within two
+/// pixels of each other count as the same: that is rounding left by a
+/// fractional scale, and not worth resampling a whole screen for. Otherwise
+/// the source is stretched with nearest-neighbour sampling, because blurring
+/// the hard edges of text and UI looks worse than the blockiness.
+fn blit(canvas: &mut RgbaImage, canvas_w: u32, canvas_h: u32, slot: PhysicalRect, src: &RgbaImage) {
+    let (sw, sh) = src.dimensions();
+    if slot.is_empty() || sw == 0 || sh == 0 {
         return;
     }
-    // Clip the slot to the canvas — by construction it already fits, but a
-    // blit that walks off the end would be a panic rather than a glitch.
-    let x0 = dest.x.max(0);
-    let y0 = dest.y.max(0);
-    let x1 = dest.right().min(canvas_w as i32);
-    let y1 = dest.bottom().min(canvas_h as i32);
-    if x1 <= x0 || y1 <= y0 {
+    // The layout always fits the canvas, but clipping here turns any mistake
+    // into a wrong pixel instead of an out-of-bounds panic.
+    let (left, top) = (slot.x.max(0), slot.y.max(0));
+    let right = slot.right().min(canvas_w as i32);
+    let bottom = slot.bottom().min(canvas_h as i32);
+    if right <= left || bottom <= top {
         return;
     }
 
-    let (sw, sh) = (src.width(), src.height());
-    let one_to_one = (sw as i64 - dest.w as i64).abs() <= 2 && (sh as i64 - dest.h as i64).abs() <= 2;
-    let stride = canvas_w as usize * 4;
-    let src_stride = sw as usize * 4;
-    let src_buf = src.as_raw();
-    let dst_buf: &mut [u8] = &mut *canvas;
+    let close = |a: u32, b: u32| a.abs_diff(b) <= 2;
+    let same_size = close(sw, slot.w) && close(sh, slot.h);
+    let src_row_len = sw as usize * 4;
+    let dst_row_len = canvas_w as usize * 4;
+    let skip = (left - slot.x) as usize;
+    let src_px = src.as_raw();
+    let dst_px: &mut [u8] = canvas;
 
-    for dy in y0..y1 {
-        let row_in_dest = (dy - dest.y) as u32;
-        let sy = if one_to_one { row_in_dest } else { sample_index(row_in_dest, dest.h, sh) };
-        if sy >= sh {
-            continue;
-        }
-        let src_row = sy as usize * src_stride;
-        let dst_row = dy as usize * stride;
+    // Each canvas row paired with the source row it shows.
+    let pick = |dy: u32| if same_size { dy } else { sample_index(dy, slot.h, sh) };
+    let rows = (top..bottom).map(|y| (y, pick((y - slot.y) as u32))).filter(|&(_, sy)| sy < sh);
 
-        if one_to_one {
-            let cols = ((x1 - x0) as usize).min(sw as usize - (x0 - dest.x).max(0) as usize);
-            if cols == 0 {
-                continue;
-            }
-            let sx0 = (x0 - dest.x).max(0) as usize;
-            let s = src_row + sx0 * 4;
-            let d = dst_row + x0 as usize * 4;
-            dst_buf[d..d + cols * 4].copy_from_slice(&src_buf[s..s + cols * 4]);
+    for (y, sy) in rows {
+        let from = &src_px[sy as usize * src_row_len..][..src_row_len];
+        let into = &mut dst_px[y as usize * dst_row_len..][..dst_row_len];
+        if same_size {
+            let n = ((right - left) as usize).min((sw as usize).saturating_sub(skip));
+            let at = left as usize * 4;
+            into[at..at + n * 4].copy_from_slice(&from[skip * 4..(skip + n) * 4]);
         } else {
-            for dx in x0..x1 {
-                let col_in_dest = (dx - dest.x) as u32;
-                let sx = sample_index(col_in_dest, dest.w, sw);
-                if sx >= sw {
-                    continue;
+            for x in left..right {
+                let sx = sample_index((x - slot.x) as u32, slot.w, sw) as usize;
+                if sx < sw as usize {
+                    into[x as usize * 4..][..4].copy_from_slice(&from[sx * 4..][..4]);
                 }
-                let s = src_row + sx as usize * 4;
-                let d = dst_row + dx as usize * 4;
-                dst_buf[d..d + 4].copy_from_slice(&src_buf[s..s + 4]);
             }
         }
     }
@@ -302,123 +278,161 @@ fn blit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use framefang_core::dpi::LogicalRect;
 
-    fn solid(w: u32, h: u32, c: [u8; 4]) -> ImageBuffer<Rgba<u8>, Vec<u8>> {
-        ImageBuffer::from_pixel(w, h, Rgba(c))
+    const BLACK: Rgba<u8> = Rgba([0, 0, 0, 255]);
+    const TOP_LEFT: Rgba<u8> = Rgba([1, 1, 1, 255]);
+    const BOTTOM_RIGHT: Rgba<u8> = Rgba([2, 2, 2, 255]);
+
+    fn flat(w: u32, h: u32, rgba: [u8; 4]) -> RgbaImage {
+        ImageBuffer::from_pixel(w, h, Rgba(rgba))
     }
 
-    /// A monitor's capture: `w`x`h` device pixels of `fill`, with a distinct
-    /// pixel in each corner so a flipped or offset blit is visible.
-    fn panel(g: MonitorGeometry, w: u32, h: u32, fill: [u8; 4]) -> (MonitorGeometry, ImageBuffer<Rgba<u8>, Vec<u8>>) {
-        let mut img = solid(w, h, fill);
-        img.put_pixel(0, 0, Rgba([1, 1, 1, 255]));
-        img.put_pixel(w - 1, h - 1, Rgba([2, 2, 2, 255]));
-        (g, img)
+    /// A fake monitor: `(x, y, lw, lh)` logical at `scale`, giving a `pw` x
+    /// `ph` bitmap of `fill` whose two corners are marked, so a shifted or
+    /// mirrored copy shows.
+    fn screen(at: (i32, i32, u32, u32), scale: f32, (pw, ph): (u32, u32), fill: [u8; 4])
+        -> (MonitorGeometry, RgbaImage)
+    {
+        let mut img = flat(pw, ph, fill);
+        img.put_pixel(0, 0, TOP_LEFT);
+        img.put_pixel(pw - 1, ph - 1, BOTTOM_RIGHT);
+        (MonitorGeometry::new(at.0, at.1, at.2, at.3, scale), img)
     }
 
-    #[test]
-    fn stitch_at_1x_is_unchanged() {
-        let panels = vec![
-            panel(MonitorGeometry::new(0, 0, 40, 30, 1.0), 40, 30, [10, 0, 0, 255]),
-            panel(MonitorGeometry::new(40, 0, 20, 30, 1.0), 20, 30, [0, 10, 0, 255]),
-        ];
-        let (canvas, map) = stitch(&panels).unwrap();
-        assert_eq!(map.scale(), 1.0);
-        assert_eq!((canvas.width(), canvas.height()), (60, 30));
-        assert_eq!(canvas.get_pixel(0, 0), &Rgba([1, 1, 1, 255]));
-        assert_eq!(canvas.get_pixel(39, 29), &Rgba([2, 2, 2, 255]));
-        assert_eq!(canvas.get_pixel(40, 0), &Rgba([1, 1, 1, 255]));
-        assert_eq!(canvas.get_pixel(59, 29), &Rgba([2, 2, 2, 255]));
-        assert_eq!(canvas.get_pixel(5, 5), &Rgba([10, 0, 0, 255]));
-        assert_eq!(canvas.get_pixel(45, 5), &Rgba([0, 10, 0, 255]));
-    }
-
-    #[test]
-    fn stitch_keeps_every_retina_pixel() {
-        // Reported rect in points, bitmap in device pixels — the macOS case
-        // that used to land a quarter of the screen in a quarter-sized canvas.
-        let panels = vec![panel(MonitorGeometry::new(0, 0, 40, 30, 2.0), 80, 60, [7, 7, 7, 255])];
-        let (canvas, map) = stitch(&panels).unwrap();
-        assert_eq!(map.scale(), 2.0);
-        assert_eq!((canvas.width(), canvas.height()), (80, 60));
-        assert_eq!(canvas.get_pixel(0, 0), &Rgba([1, 1, 1, 255]));
-        assert_eq!(canvas.get_pixel(79, 59), &Rgba([2, 2, 2, 255]));
-        // A selection made in the overlay is in these same pixels.
-        assert_eq!(
-            map.logical_rect_to_physical(framefang_core::dpi::LogicalRect::new(10.0, 10.0, 20.0, 10.0)),
-            PhysicalRect::new(20, 20, 40, 20)
-        );
+    /// Build a `Captured` from fake monitors the way the real capture does.
+    fn captured(panels: &[(MonitorGeometry, RgbaImage)]) -> Captured {
+        let (bitmap, map) = stitch(panels).unwrap();
+        let monitors = map.monitors().iter().zip(panels).map(|(p, (g, img))| MonitorFrame {
+            x: g.x, y: g.y, width: g.width, height: g.height, name: "fake".into(),
+            scale_factor: 1.0, effective_scale: img.width() as f32 / g.width as f32,
+            physical: p.physical,
+        }).collect();
+        Captured { bitmap, virtual_origin: map.origin(), map, monitors }
     }
 
     #[test]
-    fn stitch_at_1_5x_covers_the_whole_canvas() {
-        let panels = vec![panel(MonitorGeometry::new(0, 0, 40, 30, 1.5), 60, 45, [3, 3, 3, 255])];
-        let (canvas, _) = stitch(&panels).unwrap();
-        assert_eq!((canvas.width(), canvas.height()), (60, 45));
-        assert_eq!(canvas.get_pixel(59, 44), &Rgba([2, 2, 2, 255]));
-        // Nothing left at the fill colour of an empty canvas.
-        assert!(canvas.pixels().all(|p| p.0 != [0, 0, 0, 255]));
+    fn two_monitors_at_1x_sit_side_by_side() {
+        let (canvas, map) = stitch(&[
+            screen((0, 0, 40, 30), 1.0, (40, 30), [10, 0, 0, 255]),
+            screen((40, 0, 20, 30), 1.0, (20, 30), [0, 10, 0, 255]),
+        ]).unwrap();
+        assert_eq!(1.0, map.scale(), "nothing to scale");
+        assert_eq!(canvas.dimensions(), (60, 30));
+        for (x, y, want) in [(0, 0, TOP_LEFT), (39, 29, BOTTOM_RIGHT), (40, 0, TOP_LEFT), (59, 29, BOTTOM_RIGHT)] {
+            assert_eq!(*canvas.get_pixel(x, y), want, "at ({x}, {y})");
+        }
+        assert_eq!(*canvas.get_pixel(5, 5), Rgba([10, 0, 0, 255]));
+        assert_eq!(*canvas.get_pixel(45, 5), Rgba([0, 10, 0, 255]));
     }
 
     #[test]
-    fn stitch_mixed_scales_keeps_the_sharp_monitor_sharp() {
-        // 2x laptop left of a 1x external display.
-        let panels = vec![
-            panel(MonitorGeometry::new(0, 0, 40, 30, 2.0), 80, 60, [5, 0, 0, 255]),
-            panel(MonitorGeometry::new(40, 0, 40, 20, 1.0), 40, 20, [0, 5, 0, 255]),
-        ];
-        let (canvas, map) = stitch(&panels).unwrap();
-        assert_eq!(map.scale(), 2.0);
-        assert_eq!((canvas.width(), canvas.height()), (160, 60));
-        // Laptop: untouched, pixel for pixel.
-        assert_eq!(canvas.get_pixel(0, 0), &Rgba([1, 1, 1, 255]));
-        assert_eq!(canvas.get_pixel(79, 59), &Rgba([2, 2, 2, 255]));
-        // External: stretched into its 80x40 slot, top-left corner intact.
-        assert_eq!(canvas.get_pixel(80, 0), &Rgba([1, 1, 1, 255]));
-        assert_eq!(canvas.get_pixel(81, 1), &Rgba([1, 1, 1, 255]));
-        assert_eq!(canvas.get_pixel(159, 39), &Rgba([2, 2, 2, 255]));
-        assert_eq!(canvas.get_pixel(100, 10), &Rgba([0, 5, 0, 255]));
-        // Below the shorter external display stays canvas black.
-        assert_eq!(canvas.get_pixel(100, 50), &Rgba([0, 0, 0, 255]));
+    fn a_retina_screen_keeps_all_of_its_pixels() {
+        // Points reported, device pixels captured: the canvas has to be the
+        // device size, not the point size.
+        let (canvas, map) = stitch(&[screen((0, 0, 40, 30), 2.0, (80, 60), [7, 7, 7, 255])]).unwrap();
+        assert_eq!(2.0, map.scale(), "stitched at the sharpest scale");
+        assert_eq!(canvas.dimensions(), (80, 60));
+        assert_eq!(*canvas.get_pixel(0, 0), TOP_LEFT);
+        assert_eq!(*canvas.get_pixel(79, 59), BOTTOM_RIGHT);
+        // A logical selection lands on the doubled pixels.
+        assert_eq!(map.logical_rect_to_physical(LogicalRect::new(10.0, 10.0, 20.0, 10.0)),
+                   PhysicalRect::new(20, 20, 40, 20));
     }
 
     #[test]
-    fn stitch_rejects_an_empty_layout() {
+    fn a_one_and_a_half_scale_screen_fills_the_canvas() {
+        let (canvas, _) = stitch(&[screen((0, 0, 40, 30), 1.5, (60, 45), [3, 3, 3, 255])]).unwrap();
+        assert_eq!(canvas.dimensions(), (60, 45));
+        assert_eq!(*canvas.get_pixel(59, 44), BOTTOM_RIGHT);
+        assert!(canvas.pixels().all(|p| *p != BLACK), "no gap left at the background colour");
+    }
+
+    #[test]
+    fn mixed_scales_stretch_only_the_lower_dpi_screen() {
+        // A 2x laptop with a 1x external monitor to its right.
+        let (canvas, map) = stitch(&[
+            screen((0, 0, 40, 30), 2.0, (80, 60), [5, 0, 0, 255]),
+            screen((40, 0, 40, 20), 1.0, (40, 20), [0, 5, 0, 255]),
+        ]).unwrap();
+        assert_eq!(2.0, map.scale(), "stitched at the sharpest scale");
+        assert_eq!(canvas.dimensions(), (160, 60));
+        // The laptop is copied exactly.
+        assert_eq!(*canvas.get_pixel(0, 0), TOP_LEFT);
+        assert_eq!(*canvas.get_pixel(79, 59), BOTTOM_RIGHT);
+        // The external screen is doubled into an 80x40 slot.
+        assert_eq!(*canvas.get_pixel(80, 0), TOP_LEFT);
+        assert_eq!(*canvas.get_pixel(81, 1), TOP_LEFT);
+        assert_eq!(*canvas.get_pixel(159, 39), BOTTOM_RIGHT);
+        assert_eq!(*canvas.get_pixel(100, 10), Rgba([0, 5, 0, 255]));
+        // Under the shorter screen there is nothing but background.
+        assert_eq!(*canvas.get_pixel(100, 50), BLACK);
+    }
+
+    #[test]
+    fn no_monitors_is_an_error() {
         assert!(stitch(&[]).is_err());
     }
 
     #[test]
-    fn blit_copies_one_to_one_without_resampling() {
-        let mut canvas = solid(8, 4, [0, 0, 0, 255]);
-        let mut src = solid(4, 4, [10, 20, 30, 255]);
-        src.put_pixel(0, 0, Rgba([1, 2, 3, 255]));
-        blit(&mut canvas, 8, 4, PhysicalRect::new(4, 0, 4, 4), &src);
-        assert_eq!(canvas.get_pixel(4, 0), &Rgba([1, 2, 3, 255]));
-        assert_eq!(canvas.get_pixel(5, 0), &Rgba([10, 20, 30, 255]));
-        assert_eq!(canvas.get_pixel(7, 3), &Rgba([10, 20, 30, 255]));
-        // Untouched half stays as it was.
-        assert_eq!(canvas.get_pixel(0, 0), &Rgba([0, 0, 0, 255]));
+    fn equal_sizes_copy_without_resampling() {
+        let mut canvas = flat(10, 5, [0, 0, 0, 255]);
+        let mut src = flat(5, 5, [40, 50, 60, 255]);
+        src.put_pixel(0, 0, Rgba([11, 12, 13, 255]));
+        blit(&mut canvas, 10, 5, PhysicalRect::new(5, 0, 5, 5), &src);
+        assert_eq!(*canvas.get_pixel(5, 0), Rgba([11, 12, 13, 255]));
+        assert_eq!(*canvas.get_pixel(6, 0), Rgba([40, 50, 60, 255]));
+        assert_eq!(*canvas.get_pixel(9, 4), Rgba([40, 50, 60, 255]));
+        assert_eq!(*canvas.get_pixel(4, 4), BLACK, "the left half is untouched");
     }
 
     #[test]
-    fn blit_stretches_a_lower_dpi_monitor_into_its_slot() {
-        let mut canvas = solid(8, 8, [0, 0, 0, 255]);
-        let mut src = solid(2, 2, [0, 0, 0, 255]);
-        src.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
-        src.put_pixel(1, 1, Rgba([0, 0, 255, 255]));
+    fn a_small_source_is_stretched_nearest_neighbour() {
+        const RED: Rgba<u8> = Rgba([200, 0, 0, 255]);
+        const BLUE: Rgba<u8> = Rgba([0, 0, 200, 255]);
+        let mut canvas = flat(8, 8, [0, 0, 0, 255]);
+        let mut src = flat(2, 2, [0, 0, 0, 255]);
+        src.put_pixel(0, 0, RED);
+        src.put_pixel(1, 1, BLUE);
         blit(&mut canvas, 8, 8, PhysicalRect::new(0, 0, 8, 8), &src);
-        assert_eq!(canvas.get_pixel(0, 0), &Rgba([255, 0, 0, 255]));
-        assert_eq!(canvas.get_pixel(3, 3), &Rgba([255, 0, 0, 255]));
-        assert_eq!(canvas.get_pixel(4, 4), &Rgba([0, 0, 255, 255]));
-        assert_eq!(canvas.get_pixel(7, 7), &Rgba([0, 0, 255, 255]));
+        // Each source pixel becomes a 4x4 block.
+        for (x, y, want) in [(0, 0, RED), (3, 3, RED), (4, 4, BLUE), (7, 7, BLUE), (4, 0, BLACK)] {
+            assert_eq!(*canvas.get_pixel(x, y), want, "at ({x}, {y})");
+        }
     }
 
     #[test]
-    fn blit_clips_a_slot_that_runs_past_the_canvas() {
-        let mut canvas = solid(4, 4, [0, 0, 0, 255]);
-        let src = solid(4, 4, [9, 9, 9, 255]);
-        blit(&mut canvas, 4, 4, PhysicalRect::new(2, 2, 4, 4), &src);
-        assert_eq!(canvas.get_pixel(3, 3), &Rgba([9, 9, 9, 255]));
-        assert_eq!(canvas.get_pixel(1, 1), &Rgba([0, 0, 0, 255]));
+    fn a_slot_past_the_canvas_edge_is_clipped() {
+        let mut canvas = flat(4, 4, [0, 0, 0, 255]);
+        blit(&mut canvas, 4, 4, PhysicalRect::new(2, 2, 4, 4), &flat(4, 4, [9, 9, 9, 255]));
+        assert_eq!(*canvas.get_pixel(3, 3), Rgba([9, 9, 9, 255]));
+        assert_eq!(*canvas.get_pixel(1, 1), BLACK);
+    }
+
+    #[test]
+    fn a_two_pixel_mismatch_still_copies_straight_across() {
+        // A 1.25x screen can round to a slot a pixel or two off the bitmap.
+        let mut canvas = flat(10, 10, [0, 0, 0, 255]);
+        let mut src = flat(9, 9, [4, 4, 4, 255]);
+        src.put_pixel(8, 0, Rgba([8, 8, 8, 255]));
+        blit(&mut canvas, 10, 10, PhysicalRect::new(0, 0, 10, 10), &src);
+        assert_eq!(*canvas.get_pixel(8, 0), Rgba([8, 8, 8, 255]), "copied, not resampled");
+        assert_eq!(*canvas.get_pixel(9, 0), BLACK, "the extra column stays background");
+    }
+
+    #[test]
+    fn geometry_and_bounds_follow_the_stitched_bitmap() {
+        // A 1x monitor to the left of the primary one.
+        let shot = captured(&[
+            screen((-20, 0, 20, 10), 1.0, (20, 10), [1, 0, 0, 255]),
+            screen((0, 0, 30, 10), 1.0, (30, 10), [0, 1, 0, 255]),
+        ]);
+        let g = shot.geometry();
+        assert_eq!(g.origin(), (-20, 0));
+        assert_eq!(g.size(), (50, 10));
+        assert_eq!(g.monitors().len(), 2);
+        let b = shot.desktop_bounds();
+        assert_eq!((b.x, b.y, b.width, b.height), (-20, 0, 50, 10));
+        assert_eq!(b.scale, 1.0);
     }
 }
