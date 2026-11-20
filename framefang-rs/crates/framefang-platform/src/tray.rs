@@ -5,14 +5,34 @@
 //! The tray runs on the main thread's event loop; drain `try_recv` periodically
 //! from the iced subscription that owns the loop.
 
+use std::cell::{Cell, RefCell};
+
 use crate::{Error, Result};
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon as TrayIconImage, TrayIcon, TrayIconBuilder};
+
+/// Everything the record rows' state depends on, set together so no
+/// setter can undo another's (`set_recording` turning the sound rows back
+/// on during a GIF, say).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RecordRows {
+    pub recording: bool,
+    /// The last recording is still becoming a GIF.
+    pub converting: bool,
+    /// Recordings end as GIF (no sound).
+    pub gif: bool,
+}
 
 pub struct Tray {
     icon: TrayIcon,
     pub capture_id:    tray_icon::menu::MenuId,
     pub capture_full_id: tray_icon::menu::MenuId,
+    pub last_region_id: tray_icon::menu::MenuId,
+    pub text_id:       tray_icon::menu::MenuId,
+    pub qr_id:         tray_icon::menu::MenuId,
+    pub scroll_id:     tray_icon::menu::MenuId,
+    pub gif_id:       tray_icon::menu::MenuId,
+    pub cancel_gif_id: tray_icon::menu::MenuId,
     pub delay3_id:     tray_icon::menu::MenuId,
     pub delay5_id:     tray_icon::menu::MenuId,
     pub delay10_id:    tray_icon::menu::MenuId,
@@ -41,6 +61,15 @@ pub struct Tray {
     rec_region_item:   MenuItem,
     stop_rec_item:     MenuItem,
     cancel_item:       MenuItem,
+    last_region_item:  MenuItem,
+    gif_item:          CheckMenuItem,
+    cancel_gif_item:   MenuItem,
+    rows:              Cell<RecordRows>,
+    /// "Copy recent" and "Edit recent", one item per recent capture
+    /// (newest first), rebuilt by `set_recent`.
+    copy_recent:       Submenu,
+    edit_recent:       Submenu,
+    recent_items:      RefCell<Vec<(MenuItem, MenuItem)>>,
 }
 
 /// Text of the three menu rows that quote a global hotkey.
@@ -76,6 +105,22 @@ pub enum TrayEvent {
     /// Capture the whole desktop and auto-save it immediately — no region
     /// selector, no editor. One click → file on disk, like the other presets.
     CaptureFullScreen,
+    /// Take the last captured rectangle again.
+    CaptureLastRegion,
+    /// Open the picker in TEXT mode: copy the words in a region.
+    CaptureText,
+    /// Open the picker in QR mode: read a QR code.
+    CaptureQr,
+    /// Open the picker in SCROLL mode: capture a scrolling page.
+    CaptureScroll,
+    /// Copy recent capture `n` (0 is the newest).
+    RecentCopy(usize),
+    /// Open recent capture `n` in the editor.
+    RecentEdit(usize),
+    /// Record as GIF (`true`) or MP4.
+    SetGif(bool),
+    /// Stop making the last recording's GIF; its MP4 is kept.
+    CancelGif,
     /// Capture after N seconds. Lets the user dismiss menus, position
     /// windows, etc. before the screenshot fires.
     CaptureDelayed(u32),
@@ -145,6 +190,14 @@ impl Tray {
         // Every label here is one or two readable phrases at most.
         let capture   = MenuItem::new(&labels.capture,      true,  None);
         let capture_full = MenuItem::new(&labels.capture_full, true, None);
+        // Enabled once a region has been captured (`set_last_region`).
+        let last_region = MenuItem::new("Capture last region", false, None);
+        let text      = MenuItem::new("Copy screen text",  true,  None);
+        let qr        = MenuItem::new("Read QR code",      true,  None);
+        // Only where Frame Fang can scroll other windows (Windows for now).
+        let scroll    = MenuItem::new("Scrolling capture", cfg!(windows), None);
+        let gif      = CheckMenuItem::new("Record as GIF",   true,  false, None);
+        let cancel_gif = MenuItem::new("Cancel GIF",          false, None);
         let delay_3s  = MenuItem::new("Capture in 3s",     true,  None);
         let delay_5s  = MenuItem::new("Capture in 5s",     true,  None);
         let delay_10s = MenuItem::new("Capture in 10s",    true,  None);
@@ -167,6 +220,9 @@ impl Tray {
         let stop_rec  = MenuItem::new(stop_label(&labels.record), false, None);
         let annotate_rec = MenuItem::new("Annotate last recording", true, None);
 
+        // Filled by `set_recent`; empty until a capture is kept.
+        let copy_recent = Submenu::new("Copy recent", false);
+        let edit_recent = Submenu::new("Edit recent", false);
         let open_fold = MenuItem::new("Open shots",        true,  None);
         let open_recs = MenuItem::new("Open recordings",   true,  None);
         let convert_img = MenuItem::new("Convert image",   true,  None);
@@ -179,6 +235,12 @@ impl Tray {
 
         let capture_id  = capture.id().clone();
         let capture_full_id = capture_full.id().clone();
+        let last_region_id = last_region.id().clone();
+        let text_id     = text.id().clone();
+        let qr_id       = qr.id().clone();
+        let scroll_id   = scroll.id().clone();
+        let gif_id     = gif.id().clone();
+        let cancel_gif_id = cancel_gif.id().clone();
         let delay3_id   = delay_3s.id().clone();
         let delay5_id   = delay_5s.id().clone();
         let delay10_id  = delay_10s.id().clone();
@@ -201,6 +263,11 @@ impl Tray {
 
         menu.append(&capture).map_err(|e| Error::Tray(e.to_string()))?;
         menu.append(&capture_full).map_err(|e| Error::Tray(e.to_string()))?;
+        menu.append(&last_region).map_err(|e| Error::Tray(e.to_string()))?;
+        menu.append(&text).map_err(|e| Error::Tray(e.to_string()))?;
+        menu.append(&qr).map_err(|e| Error::Tray(e.to_string()))?;
+        #[cfg(windows)]
+        menu.append(&scroll).map_err(|e| Error::Tray(e.to_string()))?;
         menu.append(&delay_3s).map_err(|e| Error::Tray(e.to_string()))?;
         menu.append(&delay_5s).map_err(|e| Error::Tray(e.to_string()))?;
         menu.append(&delay_10s).map_err(|e| Error::Tray(e.to_string()))?;
@@ -216,8 +283,12 @@ impl Tray {
         menu.append(&rec_both).map_err(|e| Error::Tray(e.to_string()))?;
         menu.append(&rec_region).map_err(|e| Error::Tray(e.to_string()))?;
         menu.append(&stop_rec).map_err(|e| Error::Tray(e.to_string()))?;
+        menu.append(&gif).map_err(|e| Error::Tray(e.to_string()))?;
+        menu.append(&cancel_gif).map_err(|e| Error::Tray(e.to_string()))?;
         menu.append(&annotate_rec).map_err(|e| Error::Tray(e.to_string()))?;
         menu.append(&PredefinedMenuItem::separator()).map_err(|e| Error::Tray(e.to_string()))?;
+        menu.append(&copy_recent).map_err(|e| Error::Tray(e.to_string()))?;
+        menu.append(&edit_recent).map_err(|e| Error::Tray(e.to_string()))?;
         menu.append(&open_fold).map_err(|e| Error::Tray(e.to_string()))?;
         menu.append(&open_recs).map_err(|e| Error::Tray(e.to_string()))?;
         menu.append(&PredefinedMenuItem::separator()).map_err(|e| Error::Tray(e.to_string()))?;
@@ -246,6 +317,12 @@ impl Tray {
             icon: tray_icon,
             capture_id,
             capture_full_id,
+            last_region_id,
+            text_id,
+            qr_id,
+            scroll_id,
+            gif_id,
+            cancel_gif_id,
             delay3_id,
             delay5_id,
             delay10_id,
@@ -274,15 +351,36 @@ impl Tray {
             rec_region_item: rec_region,
             stop_rec_item: stop_rec,
             cancel_item:   cancel,
+            last_region_item: last_region,
+            gif_item:      gif,
+            cancel_gif_item: cancel_gif,
+            rows:          Cell::new(RecordRows::default()),
+            copy_recent,
+            edit_recent,
+            recent_items:  RefCell::new(Vec::new()),
         })
     }
 
     /// Drain the next pending menu event into a `TrayEvent`. Returns `None`
     /// when the queue is empty for this tick.
     pub fn try_recv(&self) -> TrayEvent {
-        match MenuEvent::receiver().try_recv() {
+        let ev = MenuEvent::receiver().try_recv();
+        if let Ok(ev) = &ev {
+            let items = self.recent_items.borrow();
+            if let Some(i) = items.iter().position(|(c, _)| c.id() == &ev.id) { return TrayEvent::RecentCopy(i); }
+            if let Some(i) = items.iter().position(|(_, e)| e.id() == &ev.id) { return TrayEvent::RecentEdit(i); }
+        }
+        match ev {
             Ok(ev) if ev.id == self.capture_id   => TrayEvent::Capture,
             Ok(ev) if ev.id == self.capture_full_id => TrayEvent::CaptureFullScreen,
+            Ok(ev) if ev.id == self.last_region_id => TrayEvent::CaptureLastRegion,
+            Ok(ev) if ev.id == self.text_id      => TrayEvent::CaptureText,
+            Ok(ev) if ev.id == self.qr_id        => TrayEvent::CaptureQr,
+            Ok(ev) if ev.id == self.scroll_id    => TrayEvent::CaptureScroll,
+            // The item has already flipped its own check: that is the
+            // answer. `set_record_rows` puts it back if it is refused.
+            Ok(ev) if ev.id == self.gif_id       => TrayEvent::SetGif(self.gif_item.is_checked()),
+            Ok(ev) if ev.id == self.cancel_gif_id => TrayEvent::CancelGif,
             Ok(ev) if ev.id == self.delay3_id    => TrayEvent::CaptureDelayed(3),
             Ok(ev) if ev.id == self.delay5_id    => TrayEvent::CaptureDelayed(5),
             Ok(ev) if ev.id == self.delay10_id   => TrayEvent::CaptureDelayed(10),
@@ -368,13 +466,58 @@ impl Tray {
     /// "Stop Recording" is enabled at a time, mirroring the model of the
     /// `Recorder` shim.
     pub fn set_recording(&self, recording: bool) {
-        let enabled = !recording;
-        self.rec_none_item.set_enabled(enabled);
-        self.rec_mic_item .set_enabled(enabled);
-        self.rec_sys_item .set_enabled(enabled);
-        self.rec_both_item.set_enabled(enabled);
-        self.rec_region_item.set_enabled(enabled);
-        self.stop_rec_item.set_enabled(recording);
+        self.set_record_rows(RecordRows { recording, ..self.rows.get() });
+    }
+
+    /// The last recording is (or no longer is) becoming a GIF.
+    pub fn set_converting(&self, converting: bool) {
+        self.set_record_rows(RecordRows { converting, ..self.rows.get() });
+    }
+
+    /// Recordings end as GIF, or MP4.
+    pub fn set_gif(&self, gif: bool) {
+        self.set_record_rows(RecordRows { gif, ..self.rows.get() });
+    }
+
+    /// The recent captures, newest first, each named by `labels`
+    /// ("11:42  1280 x 720"): one item each under "Copy recent" and "Edit
+    /// recent", both off while there are none.
+    pub fn set_recent(&self, labels: &[String]) {
+        let mut items = self.recent_items.borrow_mut();
+        for (c, e) in items.drain(..) {
+            let _ = self.copy_recent.remove(&c);
+            let _ = self.edit_recent.remove(&e);
+        }
+        for label in labels {
+            let (c, e) = (MenuItem::new(label, true, None), MenuItem::new(label, true, None));
+            let _ = self.copy_recent.append(&c);
+            let _ = self.edit_recent.append(&e);
+            items.push((c, e));
+        }
+        self.copy_recent.set_enabled(!labels.is_empty());
+        self.edit_recent.set_enabled(!labels.is_empty());
+    }
+
+    /// Whether "Capture last region" has a region to take.
+    pub fn set_last_region(&self, available: bool) {
+        self.last_region_item.set_enabled(available);
+    }
+
+    /// Every record row from one state: Record rows only while nothing
+    /// records or converts, the sound rows only for MP4, Stop only while
+    /// recording, Cancel GIF only while converting.
+    pub fn set_record_rows(&self, r: RecordRows) {
+        self.rows.set(r);
+        let idle = !r.recording && !r.converting;
+        self.rec_none_item.set_enabled(idle);
+        self.rec_region_item.set_enabled(idle);
+        for item in [&self.rec_mic_item, &self.rec_sys_item, &self.rec_both_item] {
+            item.set_enabled(idle && !r.gif);
+        }
+        self.stop_rec_item.set_enabled(r.recording);
+        self.gif_item.set_enabled(idle);
+        self.gif_item.set_checked(r.gif);
+        self.cancel_gif_item.set_enabled(r.converting);
     }
 
     /// Pump platform-native event sources that the tray relies on but that

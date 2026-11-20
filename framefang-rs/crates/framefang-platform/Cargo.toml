@@ -66,9 +66,21 @@ windows = { version = "0.62", features = [
     "Win32_UI_Input",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
+    # UI Automation: which part of a window scrolls, for SCROLL mode's
+    # highlight (scroll_parts.rs).
+    "Win32_UI_Accessibility",
+    "Win32_System_Com",
     "Win32_Security",          # SECURITY_ATTRIBUTES in the CreateJobObjectW signature
     "Win32_System_JobObjects",
     "Win32_System_Threading",  # IO_COUNTERS inside JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+    # Windows.Media.Ocr for reading text (ocr.rs): the engine, the bitmap it
+    # reads, the buffer that bitmap is copied from, and the language lists.
+    "Media_Ocr",
+    "Graphics_Imaging",
+    "Storage_Streams",
+    "Foundation",
+    "Foundation_Collections",
+    "Globalization",
 ] }
 
 # macOS system-audio capture. ScreenCaptureKit captures the system audio mix
@@ -77,10 +89,14 @@ windows = { version = "0.62", features = [
 # (see recorder_macos_audio.rs), exactly like the Windows path.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSString", "NSError", "NSArray", "NSObjCRuntime"] }
+objc2-foundation = { version = "0.3", features = ["NSString", "NSError", "NSArray", "NSObjCRuntime", "NSDictionary"] }
+# Reading text (ocr.rs): Vision's recognizer, on a CGImage made from the
+# picture's bytes.
+objc2-vision = { version = "0.3", default-features = false, features = ["std", "VNRequest", "VNRecognizeTextRequest", "VNRequestHandler", "VNObservation", "VNTypes", "objc2-core-graphics", "objc2-core-foundation"] }
+objc2-core-graphics = { version = "0.3", features = ["CGImage", "CGColorSpace", "CGDataProvider"] }
 objc2-screen-capture-kit = { version = "0.3", features = ["SCStream", "SCShareableContent", "SCError"] }
 objc2-core-media = { version = "0.3", features = ["CMSampleBuffer", "CMBlockBuffer", "CMFormatDescription", "objc2-core-audio-types"] }
 objc2-core-audio-types = { version = "0.3", features = ["CoreAudioBaseTypes"] }
-objc2-core-foundation = "0.3"
+objc2-core-foundation = { version = "0.3", features = ["CFData"] }
 block2 = "0.6"
 dispatch2 = "0.3"

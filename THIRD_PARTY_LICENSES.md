@@ -23,6 +23,48 @@ ordinary Cargo dependencies under permissive licenses, compiled into the
 binary; none of them needs a system font stack, so the Text tool behaves the
 same on all three platforms.
 
+## rqrr (QR code reader)
+
+QR mode reads QR codes with the pure-Rust **rqrr** crate, compiled into the
+binary.
+
+- Project: <https://github.com/WanzenBug/rqrr>
+- License: `(MIT OR Apache-2.0) AND ISC`. The ISC part covers the code it is
+  based on, **quirc** by Daniel Beer, whose notice follows.
+
+```text
+quirc -- QR-code recognition library
+Copyright (C) 2010-2012 Daniel Beer <dlbeer@gmail.com>
+
+ISC License
+===========
+
+Permission to use, copy, modify, and/or distribute this software for
+any purpose with or without fee is hereby granted, provided that the
+above copyright notice and this permission notice appear in all
+copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL
+WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE
+AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL
+DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR
+PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+PERFORMANCE OF THIS SOFTWARE.
+```
+
+## Text recognition (TEXT mode)
+
+TEXT mode uses the text recognition the operating system already has. Nothing
+is bundled and nothing leaves the computer.
+
+- **Windows:** `Windows.Media.Ocr`, part of Windows.
+- **macOS:** the Vision framework, part of macOS.
+- **Linux:** **Tesseract** (<https://github.com/tesseract-ocr/tesseract>,
+  Apache-2.0), run as a separate process when the user has installed it. It
+  is not bundled.
+
 ## FFmpeg
 
 Framefang calls **FFmpeg** as a **separate process** (subprocess) for:

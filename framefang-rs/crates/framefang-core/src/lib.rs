@@ -5,18 +5,23 @@
 //! one-for-one so the two implementations stay legible side-by-side.
 
 pub mod annotation;
+pub mod app_state;
 pub mod atomic_file;
+pub mod file_name;
 pub mod color;
 pub mod failure;
 pub mod install_channel;
 pub mod hotkeys;
+pub mod mark;
 pub mod dpi;
 pub mod edit;
 pub mod history;
 pub mod region;
 pub mod settings;
+pub mod settings_store;
 pub mod shortcut;
 pub mod state;
+pub mod step;
 pub mod text;
 pub mod theme;
 pub mod tool;

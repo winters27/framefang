@@ -103,6 +103,17 @@ pub enum OverlayOutcome {
     /// drag, and the picture now goes to its own editor window
     /// (`Overlay::new_for_editor`) while the rest of the screen comes back.
     Chosen(Box<ChosenRegion>),
+    /// TEXT or QR mode: read what is in this picture. The picker stays up,
+    /// frozen, saying it is reading, until the tray has the answer (or Esc
+    /// cancels). The `bool`: the switch key was held as it was let go, so a
+    /// QR link does the other thing (opens instead of copying, or the
+    /// other way round).
+    ReadText(ImageBuffer<Rgba<u8>, Vec<u8>>, crate::read_text::ReadKind, bool),
+    /// SCROLL mode: scroll this area (desktop pixels) to its end and stitch
+    /// it. The frozen screen goes so the real page can move. The `bool`:
+    /// the switch key was held, so the result does the other thing (opens
+    /// the editor on copy only, or the other way round).
+    Scroll((i32, i32, i32, i32), bool),
 }
 
 /// A picked region on its way from the frozen picker to the editor window.
@@ -153,15 +164,128 @@ const PULSE_SECS: f32 = 3.0 / PULSE_HZ;
 /// picture off its spot (it sits near the monitor's right edge), they go on
 /// the left instead: the window leaves no room on the right, so the tool
 /// panel and its flyout flip to the left side on their own.
+/// `picture` (taken from `pic`, in virtual-screen pixels) ready for its own
+/// editor window on the monitor under its center, or `None` when the editor
+/// would not fit there or the picture was cut short (edit it in place
+/// instead).
+pub fn chosen_for(
+    picture: ImageBuffer<Rgba<u8>, Vec<u8>>,
+    pic: (i32, i32, i32, i32),
+    monitors: &[vdesk::MonitorRect],
+) -> Option<ChosenRegion> {
+    let (cx, cy) = (pic.0 + pic.2 / 2, pic.1 + pic.3 / 2);
+    let monitor = *monitors.iter().find(|m| {
+        cx >= m.x && cx < m.x + m.width as i32 && cy >= m.y && cy < m.y + m.height as i32
+    })?;
+    let placement = editor_placement(pic, monitor)?;
+    if (picture.width() as i32, picture.height() as i32) != (pic.2, pic.3) { return None; }
+    Some(ChosenRegion { picture, placement })
+}
+
+/// A picture too tall for the editor window (a scrolling capture) on its
+/// way to the scrolling editor (`Overlay::new_for_tall_editor`).
+pub struct TallChosen {
+    pub picture: ImageBuffer<Rgba<u8>, Vec<u8>>,
+    pub placement: crate::page_map::TallPlacement,
+}
+
+/// `picture`, taken at `pic_x` across, ready for the scrolling editor on the
+/// work area `work` (`left, top, right, bottom`); `None` when even that
+/// window would be too wide for the screen.
+pub fn tall_for(picture: ImageBuffer<Rgba<u8>, Vec<u8>>, pic_x: i32, work: (i32, i32, i32, i32)) -> Option<TallChosen> {
+    let (tp_w, _) = tool_panel_dims(&EDITOR_BUTTONS);
+    let tools = 5 + tp_w + FLYOUT_GAP + FLYOUT_W + EDITOR_EDGE;
+    let placement = crate::page_map::tall_placement(pic_x, picture.width() as i32, work, EDITOR_EDGE, tools)?;
+    Some(TallChosen { picture, placement })
+}
+
+/// A fingerprint of the drawings: how many, and where each one's bounds
+/// are. Changes when one is added, moved, deleted or undone.
+fn ink_signature(annotations: &[Annotation]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    annotations.len().hash(&mut h);
+    for a in annotations {
+        let b = framefang_core::edit::bounds(a);
+        for v in [b.x, b.y, b.w, b.h] { v.to_bits().hash(&mut h); }
+    }
+    h.finish()
+}
+
+/// Below the picture in the scrolling editor's page: room for the action
+/// row, as in the editor window.
+fn tall_bottom() -> i32 {
+    let (_, ap_h) = action_panel_dims(&VIDEO_ACTION_BUTTONS);
+    5 + ap_h + tip_room() + EDITOR_EDGE
+}
+
+/// Room kept under the action row for its buttons' tips, which hang under
+/// them (Brandon 2026-11-20: "underneath it and not overlapping it").
+fn tip_room() -> i32 { TOOLTIP_GAP + tooltip_size("Copy [Ctrl]+[C]").1 }
+
+/// A crop being dragged in the editor window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CropDrag {
+    /// The crop at the press: Esc goes back to it, and the undo step runs
+    /// from it.
+    before: (i32, i32, i32, i32),
+    grab: CropGrab,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CropGrab {
+    /// A new rectangle, from this corner.
+    New((i32, i32)),
+    /// The crop's edge or corner.
+    Edge(Edge),
+}
+
+/// The crop for drag `d` with the pointer at `p`, kept inside the picture
+/// `pic` and at least 1 px each way (a sliver is undone on release).
+fn crop_rect(d: CropDrag, p: (i32, i32), pic: (i32, i32, i32, i32)) -> (i32, i32, i32, i32) {
+    let (px0, py0, px1, py1) = (pic.0, pic.1, pic.0 + pic.2, pic.1 + pic.3);
+    let (x, y) = (p.0.clamp(px0, px1), p.1.clamp(py0, py1));
+    let (mut x0, mut y0, mut x1, mut y1) = (d.before.0, d.before.1, d.before.0 + d.before.2, d.before.1 + d.before.3);
+    match d.grab {
+        CropGrab::New(a) => {
+            let (ax, ay) = (a.0.clamp(px0, px1), a.1.clamp(py0, py1));
+            (x0, x1) = (ax.min(x), ax.max(x));
+            (y0, y1) = (ay.min(y), ay.max(y));
+        }
+        CropGrab::Edge(e) => {
+            const MIN: i32 = 8;
+            if matches!(e, Edge::Left | Edge::TopLeft | Edge::BottomLeft) { x0 = x.min(x1 - MIN); }
+            if matches!(e, Edge::Right | Edge::TopRight | Edge::BottomRight) { x1 = x.max(x0 + MIN); }
+            if matches!(e, Edge::Top | Edge::TopLeft | Edge::TopRight) { y0 = y.min(y1 - MIN); }
+            if matches!(e, Edge::Bottom | Edge::BottomLeft | Edge::BottomRight) { y1 = y.max(y0 + MIN); }
+        }
+    }
+    let (x0, y0) = (x0.clamp(px0, px1), y0.clamp(py0, py1));
+    let (x1, y1) = (x1.clamp(px0, px1), y1.clamp(py0, py1));
+    (x0, y0, (x1 - x0).max(1), (y1 - y0).max(1))
+}
+
+/// Where a toast for a picture at `pic` goes (virtual-screen pixels): under
+/// it, else over its bottom edge, inside `monitor`.
+pub fn toast_spot(pic: (i32, i32, i32, i32), monitor: vdesk::MonitorRect, size: (u32, u32)) -> (i32, i32) {
+    const GAP: i32 = 12;
+    let (bx, by, bw, bh) = (monitor.x, monitor.y, monitor.width as i32, monitor.height as i32);
+    let (w, h) = (size.0 as i32, size.1 as i32);
+    let x = (pic.0 + (pic.2 - w) / 2).clamp(bx + GAP, (bx + bw - w - GAP).max(bx + GAP));
+    let below = pic.1 + pic.3 + GAP;
+    let y = if below + h <= by + bh - GAP { below } else { pic.1 + pic.3 - h - GAP };
+    (x, y.clamp(by + GAP, (by + bh - h - GAP).max(by + GAP)))
+}
+
 pub fn editor_placement(pic: (i32, i32, i32, i32), monitor: vdesk::MonitorRect) -> Option<EditorPlacement> {
-    let (tp_w, tp_h) = tool_panel_dims();
+    let (tp_w, tp_h) = tool_panel_dims(&EDITOR_BUTTONS);
     let (_, ap_h) = action_panel_dims(&VIDEO_ACTION_BUTTONS);
     // The tool column and the flyout that slides out beside it.
     let tools = 5 + tp_w + FLYOUT_GAP + FLYOUT_W + EDITOR_EDGE;
     // The column stands on the picture's bottom edge (`tool_panel_origin`),
     // so a picture shorter than it needs room above for the rest of it.
     let top = EDITOR_EDGE + (tp_h - pic.3).max(0);
-    let bottom = 5 + ap_h + EDITOR_EDGE;
+    let bottom = 5 + ap_h + tip_room() + EDITOR_EDGE;
     let h = top + pic.3 + bottom;
     let (mw, mh) = (monitor.width as i32, monitor.height as i32);
     if pic.2 <= 0 || pic.3 <= 0 || h > mh { return None; }
@@ -273,7 +397,7 @@ const ANIM_FRAME: std::time::Duration = std::time::Duration::from_millis(33);
 
 /// One setting in a tool's flyout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Knob { Thickness, MarkerOpacity, TextSize, PixelSize }
+enum Knob { Thickness, MarkerOpacity, TextSize, PixelSize, Zoom }
 
 impl Knob {
     /// The settings a tool has, in the order its flyout shows them.
@@ -283,7 +407,9 @@ impl Knob {
             Tool::Marker   => &[Knob::Thickness, Knob::MarkerOpacity],
             Tool::Text     => &[Knob::TextSize],
             Tool::Pixelate => &[Knob::PixelSize],
-            Tool::Step     => &[],
+            // The ring's width, and how much it enlarges.
+            Tool::Magnify  => &[Knob::Thickness, Knob::Zoom],
+            Tool::Step | Tool::Spotlight | Tool::Crop | Tool::Highlight => &[],
         }
     }
 
@@ -293,6 +419,7 @@ impl Knob {
             Knob::MarkerOpacity => "Opacity",
             Knob::TextSize      => "Text",
             Knob::PixelSize     => "Blocks",
+            Knob::Zoom          => "Zoom",
         }
     }
 
@@ -304,6 +431,7 @@ impl Knob {
             Knob::MarkerOpacity => (26.0, 255.0),
             Knob::TextSize      => (12.0, 96.0),
             Knob::PixelSize     => (4.0, 40.0),
+            Knob::Zoom          => (2.0, 4.0),
         }
     }
 
@@ -317,13 +445,15 @@ impl Knob {
             Knob::MarkerOpacity => 200.0,
             Knob::TextSize      => 28.0,
             Knob::PixelSize     => 10.0,
+            Knob::Zoom          => 2.0,
         }
     }
 
     fn readout(self, v: f32) -> String {
         match self {
             Knob::MarkerOpacity => format!("{}%", (v * 100.0 / 255.0).round() as i32),
-            _ => format!("{} px", v.round() as i32),
+            Knob::Zoom          => format!("{}x", v.round() as i32),
+            Knob::Thickness | Knob::TextSize | Knob::PixelSize => format!("{} px", v.round() as i32),
         }
     }
 }
@@ -381,24 +511,71 @@ fn flyout_track((rx, ry, rw, rh): (i32, i32, i32, i32)) -> (i32, i32, i32, i32) 
     (tx, ry + (rh - FLYOUT_TRACK_H) / 2, rw - FLYOUT_LABEL_W - FLYOUT_VALUE_W, FLYOUT_TRACK_H)
 }
 
-/// The tool a session opens on: the one the last session ended on.
-fn opening_tool(settings: &AppSettings) -> Tool {
-    Tool::ALL.iter().copied().find(|t| t.name() == settings.last_tool).unwrap_or(Tool::Pen)
+/// The tool a session opens on: the one the last session ended on, if this
+/// session's panel has it and it is one to open with; else the Pen.
+fn opening_tool(settings: &AppSettings, kind: SessionKind) -> Tool {
+    Tool::ALL.iter().copied()
+        .find(|t| t.name() == settings.last_tool && t.can_open_with() && kind.has_tool(*t))
+        .unwrap_or(Tool::Pen)
+}
+
+/// Which capture session an overlay is: each shows its own set of tools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionKind {
+    /// The frozen desktop, edited in place.
+    Picker,
+    /// A picture in its own editor window: every tool, Crop included.
+    Editor,
+    /// A video frame: no Spotlight or Magnify (they would freeze the clip
+    /// where they dim or enlarge), no Crop (the frame is fixed).
+    Video,
+}
+
+impl SessionKind {
+    fn has_tool(self, t: Tool) -> bool {
+        match self {
+            SessionKind::Editor => true,
+            SessionKind::Picker => t != Tool::Crop,
+            // No Highlight either: its words are read once, and a clip moves.
+            SessionKind::Video => !matches!(t, Tool::Spotlight | Tool::Magnify | Tool::Crop | Tool::Highlight),
+        }
+    }
+
+    /// The tool panel's buttons: this session's tools, then Undo and Redo.
+    fn panel_buttons(self) -> &'static [ToolPanelButton] {
+        match self {
+            SessionKind::Editor => &EDITOR_BUTTONS,
+            SessionKind::Picker => &PICKER_BUTTONS,
+            SessionKind::Video => &VIDEO_BUTTONS,
+        }
+    }
 }
 
 /// `t`'s own color and width, as the stroke it draws with. The color can be
 /// off every palette (the spectrum and the eyedropper pick any color); the
 /// flyout then rings the current-color chip instead of a swatch.
 fn stroke_for(settings: &AppSettings, t: Tool) -> Stroke {
-    use framefang_core::color::Rgba;
     let s = settings.tool_style(t);
-    let color = Rgba::from_argb(s.color_argb).with_alpha(0xFF);
+    // Step paints one part of its marker at a time; it opens on the part
+    // that wears the main color.
+    let color = if t == Tool::Step { step_look_for(settings).accent() } else { tool_color(settings, t) };
+    Stroke { color, thickness: Knob::Thickness.clamp(s.thickness) }
+}
+
+/// `t`'s own saved color, opaque.
+fn tool_color(settings: &AppSettings, t: Tool) -> framefang_core::color::Rgba {
+    use framefang_core::color::Rgba;
+    let color = Rgba::from_argb(settings.tool_style(t).color_argb).with_alpha(0xFF);
     // The old pure-red default, saved before there were palettes, opens as
     // the first palette's red, as it always has.
-    let color = if color == Rgba::new_opaque(255, 0, 0) {
-        framefang_core::annotation::Palettes::ALL[0].colors[0]
-    } else { color };
-    Stroke { color, thickness: Knob::Thickness.clamp(s.thickness) }
+    if color == Rgba::new_opaque(255, 0, 0) { framefang_core::annotation::Palettes::ALL[0].colors[0] } else { color }
+}
+
+/// How the next step marker looks: the saved look, or a plain disc in the
+/// Step tool's own color until one is picked.
+fn step_look_for(settings: &AppSettings) -> framefang_core::step::StepLook {
+    use framefang_core::step::{StepLook, StepShape};
+    settings.step_look.unwrap_or_else(|| StepLook::recipe(StepShape::Disc, tool_color(settings, Tool::Step)))
 }
 
 /// Share of the spectrum's width given to hues; the strip after it is grays.
@@ -430,8 +607,12 @@ fn hsl(h: f32, s: f32, l: f32) -> framefang_core::color::Rgba {
     framefang_core::color::Rgba::new_opaque(ch(r), ch(g), ch(b))
 }
 
-/// Every tool but Pixelate has a color (pixelate shows the picture itself).
-fn has_colors(t: Tool) -> bool { t != Tool::Pixelate }
+/// Whether a tool draws in a color: not Pixelate (it shows the picture
+/// itself), Spotlight (it only dims) or Crop (it draws nothing).
+fn has_colors(t: Tool) -> bool { !matches!(t, Tool::Pixelate | Tool::Spotlight | Tool::Crop) }
+
+/// Whether a tool has a flyout at all: one with nothing to set has none.
+fn has_flyout(t: Tool) -> bool { has_colors(t) || !Knob::for_tool(t).is_empty() }
 
 // Color section of the flyout: the palette's name between two arrows, then
 // its 16 colors in two rows of 8.
@@ -459,6 +640,88 @@ struct FlyoutLayout {
     /// Under the swatches: the eyedropper, the tool's current color below
     /// it, and the spectrum beside both.
     custom: Option<CustomColors>,
+    /// Step only: its looks, which part the colors paint, the shadow.
+    step: Option<StepPanel>,
+    /// Highlight only: a tile per look.
+    mark: Option<[Rect4; 6]>,
+}
+
+const MARK_TILE_H: i32 = 44;
+
+fn mark_panel(y: &mut i32) -> [Rect4; 6] {
+    let inner = FLYOUT_W - FLYOUT_PAD * 2;
+    let tile_w = (inner - 2 * STEP_TILE_GAP) / 3;
+    let tiles = std::array::from_fn(|i| {
+        let (c, r) = (i as i32 % 3, i as i32 / 3);
+        (FLYOUT_PAD + c * (tile_w + STEP_TILE_GAP), *y + r * (MARK_TILE_H + STEP_TILE_GAP), tile_w, MARK_TILE_H)
+    });
+    *y += 2 * MARK_TILE_H + STEP_TILE_GAP;
+    tiles
+}
+
+/// A look's tile: a scrap of paper with two lines of make-believe words,
+/// the first highlighted in `look`. Drawn into `s` (`fw` wide) at `r`.
+fn draw_mark_tile(s: &mut [u32], fw: i32, fh: i32, r: Rect4, look: &framefang_core::mark::MarkLook) {
+    use framefang_core::annotation::Rect;
+    const PAPER: u32 = 0x00_F4_F3_EF;
+    const WORD: u32 = 0x00_4A_4A_50;
+    draw_rounded_rect(s, fw as usize, fh as usize, r.0, r.1, r.0 + r.2, r.1 + r.3, 6, PAPER);
+    // Words: (start, width) on each line.
+    let lines: [&[(i32, i32)]; 2] = [&[(0, 14), (17, 9), (29, 16)], &[(0, 10), (13, 18), (34, 8)]];
+    let (lx, mut ly) = (r.0 + (r.2 - 42) / 2, r.1 + 12);
+    let mut first = Vec::new();
+    for (i, words) in lines.iter().enumerate() {
+        for (x, w) in words.iter() {
+            draw_rounded_rect(s, fw as usize, fh as usize, lx + x, ly, lx + x + w, ly + 4, 2, WORD);
+        }
+        if i == 0 {
+            let x1 = words.last().map(|(x, w)| x + w).unwrap_or(0);
+            first.push(Rect { x: lx as f32, y: ly as f32 - 3.0, w: x1 as f32, h: 10.0 });
+        }
+        ly += 15;
+    }
+    let mut surf = crate::painter::U32Surface { buf: s, stride: fw, height: fh };
+    crate::painter::text_mark(&mut surf, &first, look);
+}
+
+/// The top of Step's flyout: a tile per shape showing it, then a chip per
+/// part (Body, Ring, Number; the colors below paint the picked one), then
+/// the shadow switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StepPanel {
+    tiles: [Rect4; 9],
+    parts: [Rect4; 3],
+    shadow: Rect4,
+}
+
+/// How far beside a word a Highlight press still takes it.
+const MARK_REACH: f32 = 14.0;
+
+const STEP_TILE_H: i32 = 52;
+const STEP_TILE_GAP: i32 = 4;
+const STEP_CHIP_H: i32 = 24;
+
+fn step_panel(y: &mut i32) -> StepPanel {
+    let inner = FLYOUT_W - FLYOUT_PAD * 2;
+    let tile_w = (inner - 2 * STEP_TILE_GAP) / 3;
+    let tiles: [Rect4; 9] = std::array::from_fn(|i| {
+        let (c, r) = (i as i32 % 3, i as i32 / 3);
+        (FLYOUT_PAD + c * (tile_w + STEP_TILE_GAP), *y + r * (STEP_TILE_H + STEP_TILE_GAP), tile_w, STEP_TILE_H)
+    });
+    *y += 3 * STEP_TILE_H + 2 * STEP_TILE_GAP + FLYOUT_SECTION_GAP;
+    let parts: [Rect4; 3] = std::array::from_fn(|i| {
+        (FLYOUT_PAD + i as i32 * (tile_w + STEP_TILE_GAP), *y, tile_w, STEP_CHIP_H)
+    });
+    *y += STEP_CHIP_H + STEP_TILE_GAP;
+    let shadow = (FLYOUT_PAD, *y, inner, STEP_CHIP_H);
+    *y += STEP_CHIP_H;
+    StepPanel { tiles, parts, shadow }
+}
+
+/// The shadow switch's ON/OFF pill, at the right of its row.
+fn step_shadow_switch((x, y, w, h): Rect4) -> Rect4 {
+    const SW: i32 = 44;
+    (x + w - SW, y + 3, SW, h - 6)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -471,6 +734,8 @@ struct CustomColors {
 fn flyout_layout(t: Tool) -> FlyoutLayout {
     let inner = FLYOUT_W - FLYOUT_PAD * 2;
     let mut y = FLYOUT_PAD;
+    let step = (t == Tool::Step).then(|| step_panel(&mut y));
+    let mark = (t == Tool::Highlight).then(|| mark_panel(&mut y));
     let mut knobs = Vec::new();
     for (i, k) in Knob::for_tool(t).iter().enumerate() {
         if i > 0 { y += FLYOUT_ROW_GAP; }
@@ -479,7 +744,7 @@ fn flyout_layout(t: Tool) -> FlyoutLayout {
     }
     let mut custom = None;
     let colors = has_colors(t).then(|| {
-        if !knobs.is_empty() { y += FLYOUT_SECTION_GAP; }
+        if !knobs.is_empty() || step.is_some() || mark.is_some() { y += FLYOUT_SECTION_GAP; }
         let arrow = PALETTE_ROW_H;
         let prev = (FLYOUT_PAD, y, arrow, PALETTE_ROW_H);
         let next = (FLYOUT_PAD + inner - arrow, y, arrow, PALETTE_ROW_H);
@@ -505,7 +770,7 @@ fn flyout_layout(t: Tool) -> FlyoutLayout {
         y += SWATCH * 2 + SWATCH_GAP;
         (prev, next, name, swatches)
     });
-    FlyoutLayout { w: FLYOUT_W, h: y + FLYOUT_PAD, knobs, colors, custom }
+    FlyoutLayout { w: FLYOUT_W, h: y + FLYOUT_PAD, knobs, colors, custom, step, mark }
 }
 
 fn offset((x, y, w, h): Rect4, (ox, oy): (i32, i32)) -> Rect4 { (x + ox, y + oy, w, h) }
@@ -537,13 +802,51 @@ fn duration_chip_label(idx: usize) -> &'static str {
     match idx % DURATION_CHOICES.len() { 0 => "End", 1 => "3s", 2 => "5s", _ => "10s" }
 }
 
-/// Tool-panel button identities. The first 9 mirror `Tool::ALL`; the last 2
-/// (`Undo`, `Redo`) are actions. Color and size live in each tool's own
+/// Tool-panel button identities: a session's tools, then the `Undo` and
+/// `Redo` actions below a divider. Color and size live in each tool's own
 /// flyout, so there is no Color or Thickness button any more.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolPanelButton { Tool(Tool), Undo, Redo }
 
-const TOOL_PANEL_BUTTONS: [ToolPanelButton; 11] = [
+/// The editor window's panel: every tool.
+const EDITOR_BUTTONS: [ToolPanelButton; 15] = [
+    ToolPanelButton::Tool(Tool::Pen),
+    ToolPanelButton::Tool(Tool::Line),
+    ToolPanelButton::Tool(Tool::Arrow),
+    ToolPanelButton::Tool(Tool::Rectangle),
+    ToolPanelButton::Tool(Tool::Ellipse),
+    ToolPanelButton::Tool(Tool::Marker),
+    ToolPanelButton::Tool(Tool::Highlight),
+    ToolPanelButton::Tool(Tool::Text),
+    ToolPanelButton::Tool(Tool::Step),
+    ToolPanelButton::Tool(Tool::Pixelate),
+    ToolPanelButton::Tool(Tool::Spotlight),
+    ToolPanelButton::Tool(Tool::Magnify),
+    ToolPanelButton::Tool(Tool::Crop),
+    ToolPanelButton::Undo,
+    ToolPanelButton::Redo,
+];
+
+/// A capture edited in place: no Crop (the selection's own handles crop).
+const PICKER_BUTTONS: [ToolPanelButton; 14] = [
+    ToolPanelButton::Tool(Tool::Pen),
+    ToolPanelButton::Tool(Tool::Line),
+    ToolPanelButton::Tool(Tool::Arrow),
+    ToolPanelButton::Tool(Tool::Rectangle),
+    ToolPanelButton::Tool(Tool::Ellipse),
+    ToolPanelButton::Tool(Tool::Marker),
+    ToolPanelButton::Tool(Tool::Highlight),
+    ToolPanelButton::Tool(Tool::Text),
+    ToolPanelButton::Tool(Tool::Step),
+    ToolPanelButton::Tool(Tool::Pixelate),
+    ToolPanelButton::Tool(Tool::Spotlight),
+    ToolPanelButton::Tool(Tool::Magnify),
+    ToolPanelButton::Undo,
+    ToolPanelButton::Redo,
+];
+
+/// A video frame: the tools that draw on top of the clip.
+const VIDEO_BUTTONS: [ToolPanelButton; 11] = [
     ToolPanelButton::Tool(Tool::Pen),
     ToolPanelButton::Tool(Tool::Line),
     ToolPanelButton::Tool(Tool::Arrow),
@@ -553,10 +856,14 @@ const TOOL_PANEL_BUTTONS: [ToolPanelButton; 11] = [
     ToolPanelButton::Tool(Tool::Text),
     ToolPanelButton::Tool(Tool::Step),
     ToolPanelButton::Tool(Tool::Pixelate),
-    // Visual divider sits between index 8 and 9 — see `tool_panel_dims`.
     ToolPanelButton::Undo,
     ToolPanelButton::Redo,
 ];
+
+/// How many of `buttons` are tools: the divider sits after them.
+fn tool_count(buttons: &[ToolPanelButton]) -> i32 {
+    buttons.iter().filter(|b| matches!(b, ToolPanelButton::Tool(_))).count() as i32
+}
 
 /// Action-panel buttons (horizontal row under the selection). Returning
 /// outcomes routed through `tray_loop`. `Close` mirrors C# OverlayForm
@@ -685,9 +992,17 @@ pub struct Overlay {
     /// Live `AppSettings` snapshot for the editor session. Most fields are
     /// read-only from here except for the tool flyout's values
     /// (`marker_opacity`, `last_thickness`, `last_text_size`,
-    /// `pixelate_block`), which are persisted when a knob drag ends and read
-    /// back by `TrayApp` when the overlay closes.
+    /// `pixelate_block`), which are handed to the tray as a patch
+    /// (`note_settings`, `take_patch`) when a knob drag ends.
     settings: AppSettings,
+    /// `settings` as last handed over or adopted: changes are the
+    /// difference from this.
+    patch_base: AppSettings,
+    /// Changes not yet taken by the tray.
+    pending_patch: framefang_core::settings_store::Patch,
+    /// The rectangle a picker capture took (virtual-screen pixels), until
+    /// the tray takes it (`take_picked_rect`).
+    picked_rect: Option<(i32, i32, i32, i32)>,
     /// When Copy last ran without closing the editor, for the brief
     /// "Copied to clipboard" notice.
     copied_at: Option<std::time::Instant>,
@@ -707,6 +1022,20 @@ pub struct Overlay {
     /// Where in the spectrum the color was last picked (0 to 1 each way),
     /// for its marker. Only drawn while the tool still has that color.
     spectrum_pick: Option<(f32, f32)>,
+    /// How the next step marker looks, and which of its parts the flyout's
+    /// colors paint.
+    step_look: framefang_core::step::StepLook,
+    step_part: framefang_core::step::StepPart,
+    /// Highlight: the words read in the picture (canvas pixels, reading
+    /// order), the bitmap rect they were read from, a reading under way
+    /// (with where its picture sits on the canvas), and why reading failed.
+    words: Option<Vec<framefang_core::mark::Word>>,
+    words_of: Option<(i32, i32, i32, i32)>,
+    words_job: Option<(std::sync::mpsc::Receiver<Result<Vec<framefang_platform::ocr::WordBox>, String>>, (i32, i32))>,
+    words_error: Option<String>,
+    /// The word a highlight drag began on, and the look the next one takes.
+    mark_anchor: Option<usize>,
+    mark_style: framefang_core::mark::MarkStyle,
     /// Text tool em-size in px, its own value rather than riding thickness.
     text_size: f32,
     /// Pixelate block size in px.
@@ -714,6 +1043,31 @@ pub struct Overlay {
     /// This overlay is the editor window for one picked region
     /// (`new_for_editor`), not the frozen full-desktop picker.
     editor_mode: bool,
+    /// Which tools this session offers (`SessionKind::panel_buttons`).
+    kind: SessionKind,
+    /// The editor window's whole picture, fixed at open. The selection is
+    /// the crop inside it; the window keeps the whole picture's shape.
+    picture_rect: Option<Rect4>,
+    /// A crop being dragged: the crop as it was at the press, and where the
+    /// drag started (a new rectangle) or which edge it holds.
+    crop_drag: Option<CropDrag>,
+    /// TEXT or QR mode handed its picture to the tray and waits for the
+    /// answer, since when: only Esc does anything meanwhile.
+    reading: Option<std::time::Instant>,
+    /// The reading look's animation frame last drawn (`read_frame`), so
+    /// `tick` redraws only when it would look different.
+    read_drawn: Option<u32>,
+    /// The switch key was held as the read was let go (QR links do the
+    /// other thing); the tag keeps saying so while it reads.
+    reading_flip: bool,
+    /// Keys this window heard go down and not up, by virtual-key code, for
+    /// a hold key that isn't a modifier. Windows asks the system instead.
+    #[cfg(not(windows))]
+    held_keys: std::collections::HashSet<u32>,
+    /// The capture mode this picker opened in. Tabbing on to TEXT or QR
+    /// passes the other capture modes; none of them is kept for the next
+    /// capture, this one is.
+    opened_mode: crate::pick::PickMode,
     /// The shape last applied to the editor window, so the region is only
     /// rebuilt when what is drawn around the picture changes.
     shape: Vec<crate::window_shape::Rect>,
@@ -807,6 +1161,32 @@ pub struct Overlay {
     /// screen frames and titles (`set_windows`). Empty where the platform
     /// cannot list them; the hover then shows the screen.
     windows: Vec<(Rect4, String)>,
+    /// Their handles, in the same order (0 where unknown).
+    window_handles: Vec<isize>,
+    /// SCROLL mode: asks which part of the window under the pointer
+    /// scrolls (started the first time SCROLL is the mode), what it last
+    /// asked, and the parts found so far (window handle, virtual-screen
+    /// rect), so the highlight shows the page instead of the whole window.
+    scroll_probe: Option<crate::scroll_probe::Probe>,
+    probe_asked: Option<crate::scroll_probe::Ask>,
+    scroll_parts: Vec<(isize, Rect4)>,
+    /// The scrolling editor (`page_map`): a picture taller than the window.
+    /// The page is drawn into `scroll_doc` in page coordinates and the
+    /// slice `scroll_view.y` down is shown; `cursor` is in page
+    /// coordinates there, `cursor_win` in the window's. `None` elsewhere.
+    scroll_view: Option<crate::page_map::View>,
+    scroll_doc: Vec<u32>,
+    cursor_win: (i32, i32),
+    /// The page map: the page drawn small, which side of the picture it is
+    /// on, whether a press on it is being dragged, and whether the pointer
+    /// is over it.
+    map_thumb: Option<ImageBuffer<Rgba<u8>, Vec<u8>>>,
+    map_left: bool,
+    map_drag: bool,
+    map_hover: bool,
+    /// What the drawings were when the map was last drawn (`ink_signature`),
+    /// so it is redrawn with them once they change.
+    map_sig: u64,
     /// What a click takes before a region is dragged (`pick`).
     pick_mode: crate::pick::PickMode,
     /// What a click would take now, in frame pixels, with its label.
@@ -877,6 +1257,7 @@ impl Overlay {
     ) -> Result<Self> {
         let mut me = Self::build(loop_target, screenshot, desktop, settings, false, None, None, None)?;
         me.pick_mode = crate::pick::PickMode::parse(&me.settings.capture_mode);
+        me.opened_mode = me.pick_mode;
         Ok(me)
     }
 
@@ -927,7 +1308,8 @@ impl Overlay {
             force_foreground(hwnd);
         }
         if pressed {
-            let out = self.handle_key(Key::Named(NamedKey::Escape));
+            let out = if self.reading.is_some() { OverlayOutcome::Cancelled }
+                      else { self.handle_key(Key::Named(NamedKey::Escape)) };
             if !matches!(out, OverlayOutcome::Continue) {
                 self.pending_outcome = Some(out);
             }
@@ -944,6 +1326,7 @@ impl Overlay {
     /// The windows that were on screen when it froze (frontmost first, in
     /// virtual-screen pixels), for the hover highlight.
     pub fn set_windows(&mut self, windows: Vec<framefang_platform::windows_list::OnScreenWindow>) {
+        self.window_handles = windows.iter().map(|w| w.hwnd).collect();
         self.windows = windows.into_iter().map(|w| (w.rect, w.title)).collect();
         self.update_target();
     }
@@ -970,6 +1353,7 @@ impl Overlay {
         me.editor_mode = true;
         me.state = State::Selected;
         me.selection = Some((px, py, picture.width() as i32, picture.height() as i32));
+        me.picture_rect = me.selection;
         me.window.set_cursor(CursorIcon::Default);
         // No tool in hand yet: the picture is the window's handle until one
         // is picked, and no flyout covers anything.
@@ -985,14 +1369,191 @@ impl Overlay {
         Ok(me)
     }
 
+    /// Open the scrolling editor for a picture taller than the screen: a
+    /// window as tall as the work area, the page scrolling inside it, the
+    /// page map beside it (`page_map`). Otherwise the editor window, as
+    /// `new_for_editor` opens it.
+    pub fn new_for_tall_editor(
+        loop_target: &ActiveEventLoop,
+        chosen: TallChosen,
+        settings: AppSettings,
+    ) -> Result<Self> {
+        let TallChosen { picture, placement } = chosen;
+        let (w, view_h) = placement.size;
+        let (px, py) = placement.picture_at;
+        let doc_h = (py + picture.height() as i32 + tall_bottom()).max(view_h as i32) as u32;
+        let mut canvas = ImageBuffer::from_pixel(w, doc_h, Rgba(EDITOR_CANVAS));
+        image::imageops::replace(&mut canvas, &picture, px as i64, py as i64);
+        let desktop = DesktopGeometry::bitmap(w, doc_h);
+        let mut me = Self::build(loop_target, canvas, desktop, settings, false, None, None,
+                                 Some((placement.pos, placement.size)))?;
+        me.editor_mode = true;
+        me.state = State::Selected;
+        me.selection = Some((px, py, picture.width() as i32, picture.height() as i32));
+        me.picture_rect = me.selection;
+        me.window.set_cursor(CursorIcon::Default);
+        me.tool_armed = false;
+        me.flyout = None;
+        me.show_palette_of_color();
+        let map = crate::page_map::map_rect(w as i32, view_h as i32, placement.map_left);
+        me.map_thumb = Some(crate::page_map::thumbnail(&picture, map));
+        me.map_left = placement.map_left;
+        me.scroll_view = Some(crate::page_map::View { doc_h: doc_h as i32, view_h: view_h as i32, y: 0 });
+        // The first frame cuts the shape and shows the window, as in
+        // `new_for_editor`.
+        me.redraw();
+        Ok(me)
+    }
+
+    /// A window point as a page point: the slice's offset added in the
+    /// scrolling editor, unchanged elsewhere.
+    fn page_point(&self, p: (i32, i32)) -> (i32, i32) {
+        match self.scroll_view { Some(v) => (p.0, p.1 + v.y), None => p }
+    }
+
+    /// Scroll the scrolling editor's page to `y`. `true` when it moved.
+    fn scroll_page_to(&mut self, y: i32) -> bool {
+        let Some(v) = self.scroll_view.as_mut() else { return false };
+        if !v.set_y(y) { return false; }
+        // The pointer hasn't moved, the page under it has.
+        self.cursor = self.page_point(self.cursor_win);
+        self.window.request_redraw();
+        true
+    }
+
+    /// The whole picture with the drawings on it, uncropped: what the page
+    /// map shows.
+    fn compose_for_map(&self) -> Option<ImageBuffer<Rgba<u8>, Vec<u8>>> {
+        let base = self.picture_rect?;
+        let mut img = crop(&self.screenshot,
+            vdesk::frame_rect_to_bitmap(self.desktop.origin(), self.frame_origin, base));
+        let pristine = img.clone();
+        let (dx, dy) = (-base.0 as f32, -base.1 as f32);
+        let moved: Vec<Annotation> = self.annotations.iter().map(|a| translate_annotation(a, dx, dy)).collect();
+        let bounds = (0, 0, img.width() as i32, img.height() as i32);
+        painter::render_all(&mut ImageSurface(&mut img), moved.iter(),
+            &painter::Pass { source: Some(&pristine), src_offset: (0, 0), bounds });
+        Some(img)
+    }
+
+    /// The scrolling editor's map shows the drawings: redrawn when they
+    /// changed (one added, moved, deleted or undone), not while one is
+    /// still being drawn.
+    fn refresh_map(&mut self) {
+        let Some(v) = self.scroll_view else { return };
+        if matches!(self.state, State::Drawing | State::MovingAnnotation | State::TextInput) { return; }
+        let sig = ink_signature(&self.annotations);
+        if sig == self.map_sig { return; }
+        self.map_sig = sig;
+        if let Some(img) = self.compose_for_map() {
+            let map = crate::page_map::map_rect(self.window.inner_size().width as i32, v.view_h, self.map_left);
+            self.map_thumb = Some(crate::page_map::thumbnail(&img, map));
+        }
+    }
+
+    /// While a stroke, a move or a crop is dragged in the scrolling editor
+    /// with the pointer near the window's top or bottom, scroll the page
+    /// along and carry the drag with it (as if the pointer moved).
+    fn edge_scroll(&mut self) {
+        let Some(v) = self.scroll_view else { return };
+        let dragging = matches!(self.state, State::Drawing | State::MovingAnnotation) || self.crop_drag.is_some();
+        if !dragging || self.map_drag { return; }
+        let dy = crate::page_map::edge_push(self.cursor_win.1, v.view_h);
+        if dy == 0 || !self.scroll_page_to(v.y + dy) { return; }
+        let (x, y) = self.cursor_win;
+        // SAFETY: a placeholder id for a move this window made itself; the
+        // editor never reads which device a move came from.
+        let device_id = winit::event::DeviceId::dummy();
+        let _ = self.handle_event(WindowEvent::CursorMoved {
+            device_id, position: PhysicalPosition::new(x as f64, y as f64),
+        });
+    }
+
+    /// The page map's column and the thumbnail's place in it, in window
+    /// pixels.
+    fn map_rects(&self) -> Option<(Rect4, Rect4)> {
+        let v = self.scroll_view?;
+        let map = crate::page_map::map_rect(self.window.inner_size().width as i32, v.view_h, self.map_left);
+        let thumb = crate::page_map::thumb_rect(map, self.map_thumb.as_ref()?.dimensions());
+        Some((map, thumb))
+    }
+
+    /// The scrolling editor's own input: the wheel scrolls the page, and a
+    /// press or drag on the page map jumps there. `None` passes the event
+    /// on to the editor.
+    fn page_map_event(&mut self, event: &WindowEvent) -> Option<OverlayOutcome> {
+        use winit::event::MouseScrollDelta;
+        let v = self.scroll_view?;
+        let (map, thumb) = self.map_rects()?;
+        let (_, pic_y, _, pic_h) = self.picture_rect?;
+        let jump = |me: &mut Self, py: i32| {
+            let y = crate::page_map::y_for_map_point(v, thumb, pic_y, pic_h, py);
+            me.scroll_page_to(y);
+        };
+        match event {
+            WindowEvent::MouseWheel { delta, .. } => {
+                let dy = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => (-y * crate::page_map::NOTCH_PX as f32).round() as i32,
+                    MouseScrollDelta::PixelDelta(p) => -p.y.round() as i32,
+                };
+                self.scroll_page_to(v.y + dy);
+                Some(OverlayOutcome::Continue)
+            }
+            WindowEvent::CursorMoved { position: PhysicalPosition { x, y }, .. } => {
+                self.cursor_win = (*x as i32, *y as i32);
+                if self.map_drag {
+                    jump(self, self.cursor_win.1);
+                    return Some(OverlayOutcome::Continue);
+                }
+                let over = rect_contains(map, self.cursor_win);
+                if over != self.map_hover { self.map_hover = over; self.window.request_redraw(); }
+                None
+            }
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. }
+                if rect_contains(map, self.cursor_win) => {
+                self.map_drag = true;
+                jump(self, self.cursor_win.1);
+                Some(OverlayOutcome::Continue)
+            }
+            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. }
+                if self.map_drag => {
+                self.map_drag = false;
+                Some(OverlayOutcome::Continue)
+            }
+            _ => None,
+        }
+    }
+
     /// Whether the switch key flips this capture: held when the hotkey fired,
     /// or held now, as the drag is let go.
     fn switch_held(&self) -> bool {
+        self.hold_at_press || self.key_down(self.settings.switch_key())
+    }
+
+    /// Whether QR's own key is down now, flipping what a link does. Only
+    /// now: a key held when the capture key fired was about the capture.
+    fn qr_key_down(&self) -> bool {
+        self.key_down(self.settings.qr_switch_key())
+    }
+
+    fn key_down(&self, key: framefang_core::settings::SwitchKey) -> bool {
         use framefang_core::settings::SwitchKey;
-        self.hold_at_press || match self.settings.switch_key() {
+        match key {
             SwitchKey::Shift => self.mods.shift_key(),
             SwitchKey::Ctrl  => self.mods.control_key(),
             SwitchKey::Alt   => self.mods.alt_key(),
+            // Any other key: Windows says whether it is down even when the
+            // keyboard went elsewhere; other platforms go by the presses
+            // this window heard.
+            SwitchKey::Key(vk) => {
+                #[cfg(windows)]
+                {
+                    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+                    unsafe { (GetAsyncKeyState(vk as i32) as u16 & 0x8000) != 0 }
+                }
+                #[cfg(not(windows))]
+                { self.held_keys.contains(&vk) }
+            }
         }
     }
 
@@ -1009,14 +1570,45 @@ impl Overlay {
     fn hand_off(&self) -> Option<OverlayOutcome> {
         let sel = self.selection?;
         let pic = vdesk::frame_rect_to_virtual(self.frame_origin, sel);
-        let (cx, cy) = (pic.0 + pic.2 / 2, pic.1 + pic.3 / 2);
-        let monitor = *self.desktop.monitors().iter().find(|m| {
-            cx >= m.x && cx < m.x + m.width as i32 && cy >= m.y && cy < m.y + m.height as i32
-        })?;
-        let placement = editor_placement(pic, monitor)?;
         let picture = crop(&self.screenshot, self.selection_in_bitmap()?);
-        if (picture.width() as i32, picture.height() as i32) != (pic.2, pic.3) { return None; }
-        Some(OverlayOutcome::Chosen(Box::new(ChosenRegion { picture, placement })))
+        chosen_for(picture, pic, self.desktop.monitors()).map(|c| OverlayOutcome::Chosen(Box::new(c)))
+    }
+
+    /// The rectangle the picker last took, in virtual-screen pixels, once:
+    /// the tray keeps it for "Capture last region".
+    pub fn take_picked_rect(&mut self) -> Option<(i32, i32, i32, i32)> { self.picked_rect.take() }
+
+    /// The selection of a capture being finished in place (the picker, not
+    /// an editor window or a video), in virtual-screen pixels: what "Capture
+    /// last region" should take again, edits to the selection included.
+    pub fn picker_rect(&self) -> Option<(i32, i32, i32, i32)> {
+        if !self.is_picker() { return None; }
+        Some(vdesk::frame_rect_to_virtual(self.frame_origin, self.selection?))
+    }
+
+    /// Open this picker in TEXT or QR mode, for its own hotkey or tray row.
+    /// Not kept for the next capture, like any reading mode.
+    /// Open this picker in SCROLL mode, for its own hotkey or tray row.
+    pub fn open_scroll(&mut self) {
+        if self.is_picker() { self.set_pick_mode(crate::pick::PickMode::Scroll); }
+    }
+
+    pub fn open_reading(&mut self, kind: crate::read_text::ReadKind) {
+        if !self.is_picker() { return; }
+        self.set_pick_mode(match kind {
+            crate::read_text::ReadKind::Text => crate::pick::PickMode::Text,
+            crate::read_text::ReadKind::Qr => crate::pick::PickMode::Qr,
+        });
+    }
+
+    /// Select `pic` (virtual-screen pixels) as if it had just been dragged,
+    /// for "Capture last region" when the picture has to be edited in place.
+    pub fn preselect(&mut self, pic: (i32, i32, i32, i32)) {
+        let (x, y) = vdesk::virtual_to_frame(self.frame_origin, (pic.0, pic.1));
+        self.selection = Some((x, y, pic.2, pic.3));
+        self.state = State::Selected;
+        self.hover_tip = None;
+        self.window.request_redraw();
     }
 
     /// Open the editor to annotate a video frame instead of a screenshot.
@@ -1074,6 +1666,9 @@ impl Overlay {
         // of the full-desktop overlay (the editor window).
         windowed: Option<((i32, i32), (u32, u32))>,
     ) -> Result<Self> {
+        let kind = if video_mode { SessionKind::Video }
+                   else if windowed.is_some() { SessionKind::Editor }
+                   else { SessionKind::Picker };
         // Plain borderless fullscreen — let the WM manage focus + stacking
         // normally. We tried `override_redirect=true` on X11 to layer above
         // DOCK panels, but it blocked KeyPress delivery to the Text tool on
@@ -1212,9 +1807,18 @@ impl Overlay {
             selection:   if video_mode { Some((0, 0, full_w, full_h)) } else { None },
             // Opens on the tool the last session ended on, in that tool's
             // own color and width.
-            tool:        opening_tool(&settings),
+            tool:        opening_tool(&settings, kind),
+            kind,
+            picture_rect: None,
+            crop_drag: None,
+            reading: None,
+            read_drawn: None,
+            reading_flip: false,
+            #[cfg(not(windows))]
+            held_keys: Default::default(),
+            opened_mode: crate::pick::PickMode::Auto,
             tool_armed:  true,
-            stroke:      stroke_for(&settings, opening_tool(&settings)),
+            stroke:      stroke_for(&settings, opening_tool(&settings, kind)),
             annotations: Vec::new(),
             history:     History::new(),
             current:     None,
@@ -1237,8 +1841,19 @@ impl Overlay {
             picking_color: false,
             dragging_spectrum: false,
             spectrum_pick: None,
+            step_look: step_look_for(&settings),
+            step_part: step_look_for(&settings).shape.accent_part(),
+            words: None,
+            words_of: None,
+            words_job: None,
+            words_error: None,
+            mark_anchor: None,
+            mark_style: settings.highlight_style,
             text_size: Knob::TextSize.clamp(settings.last_text_size),
             pixel_size: Knob::PixelSize.clamp(settings.pixelate_block as f32) as u32,
+            patch_base: settings.clone(),
+            pending_patch: Default::default(),
+            picked_rect: None,
             settings,
             editor_mode: false,
             shape: Vec::new(),
@@ -1269,6 +1884,18 @@ impl Overlay {
             pending_discard: None,
             last_selection: None,
             windows: Vec::new(),
+            window_handles: Vec::new(),
+            scroll_probe: None,
+            probe_asked: None,
+            scroll_parts: Vec::new(),
+            scroll_view: None,
+            scroll_doc: Vec::new(),
+            cursor_win: (0, 0),
+            map_thumb: None,
+            map_left: true,
+            map_drag: false,
+            map_hover: false,
+            map_sig: 0,
             pick_mode: crate::pick::PickMode::Auto,
             target: None,
             glide_from: (0, 0, 0, 0),
@@ -1297,7 +1924,42 @@ impl Overlay {
     /// Read-only view of the editor's live settings — used by `tray_loop`
     /// after the overlay closes to pull back any per-tool slider values
     /// (currently just `marker_opacity`) the user changed mid-session.
-    pub fn settings(&self) -> &AppSettings { &self.settings }
+    /// Remember what changed in `settings` since the last time, for the tray
+    /// to save (`take_patch`). The editor never writes settings.json itself:
+    /// it holds a copy from when it opened, and a whole-copy save undid
+    /// changes made elsewhere since.
+    fn note_settings(&mut self) {
+        let p = framefang_core::settings_store::diff(&self.patch_base, &self.settings);
+        if p.is_empty() { return; }
+        framefang_core::settings_store::merge(&mut self.pending_patch, p);
+        self.patch_base = self.settings.clone();
+    }
+
+    /// What this editor changed at its save points (a knob let go, a tool or
+    /// color picked, a mode chosen) since the tray last asked. A knob being
+    /// dragged is not in it yet: one save when the drag ends, not one per
+    /// mouse move.
+    pub fn take_patch(&mut self) -> Option<framefang_core::settings_store::Patch> {
+        (!self.pending_patch.is_empty()).then(|| std::mem::take(&mut self.pending_patch))
+    }
+
+    /// The settings as saved now: taken as this editor's copy, keeping any
+    /// change of its own not yet handed over. The knob values the editor
+    /// keeps outside `settings` (sizes, the tool's stroke) are read again, so
+    /// its next save can't write the old ones back.
+    pub fn adopt_settings(&mut self, saved: &AppSettings) {
+        use framefang_core::settings_store as store;
+        let unsent = std::mem::take(&mut self.pending_patch);
+        let (mine, _) = store::apply(saved, &unsent);
+        self.settings = mine;
+        self.patch_base = saved.clone();
+        self.pending_patch = unsent;
+        self.text_size = Knob::TextSize.clamp(self.settings.last_text_size);
+        self.pixel_size = Knob::PixelSize.clamp(self.settings.pixelate_block as f32) as u32;
+        self.stroke = stroke_for(&self.settings, self.tool);
+        self.step_look = step_look_for(&self.settings);
+        if self.tool == Tool::Step { self.stroke.color = self.step_look.part(self.step_part); }
+    }
 
     /// Off screen while a Save As dialog is up, and back with its picture
     /// and marks if the user cancels it.
@@ -1319,7 +1981,7 @@ impl Overlay {
     /// selection's monitor.
     pub fn notice_spot(&self, size: (u32, u32)) -> Option<(i32, i32)> {
         const GAP: i32 = 12;
-        let sel = self.selection?;
+        let sel = self.panel_sel()?;
         let (bx, by, bw, bh) = self.panel_bounds(sel);
         let (w, h) = (size.0 as i32, size.1 as i32);
         let x = (sel.0 + (sel.2 - w) / 2).clamp(bx + GAP, (bx + bw - w - GAP).max(bx + GAP));
@@ -1342,6 +2004,8 @@ impl Overlay {
     /// Pick `t` from its button or its key: switch to its own color and
     /// width, and open its flyout, or close it if it is already open.
     fn pick_tool(&mut self, t: Tool) {
+        // A tool this session doesn't show can't be reached by its key either.
+        if !self.kind.has_tool(t) { return; }
         // The editor window's tools are toggles: the armed one, picked again,
         // goes back down and the picture moves the window again.
         if self.editor_mode && self.tool_armed && t == self.tool {
@@ -1349,15 +2013,16 @@ impl Overlay {
             return;
         }
         self.tool_armed = true;
-        let reopen = self.flyout != Some(t);
+        let reopen = self.flyout != Some(t) && has_flyout(t);
         if t != self.tool {
             self.stroke = stroke_for(&self.settings, t);
+            if t == Tool::Step { self.step_part = self.step_look.shape.accent_part(); }
             self.tool = t;
             self.show_palette_of_color();
-            // The next capture opens on this tool.
-            self.settings.last_tool = t.name().to_owned();
-            if let Err(e) = self.settings.save_editor_fields() {
-                eprintln!("framefang: tool choice save failed: {e}");
+            // The next capture opens on this tool (never on Crop).
+            if t.can_open_with() {
+                self.settings.last_tool = t.name().to_owned();
+                self.note_settings();
             }
         }
         self.leave_select_mode();
@@ -1399,12 +2064,13 @@ impl Overlay {
     fn flyout_rect(&self) -> Option<(Rect4, bool, i32)> {
         let tool = self.flyout?;
         if self.record_mode { return None; }
-        let sel = self.selection?;
+        let sel = self.panel_sel()?;
         let lb = self.panel_bounds(sel);
-        let (tp_x, tp_y) = tool_panel_origin(lb, sel);
-        let (tp_w, _) = tool_panel_dims();
-        let idx = TOOL_PANEL_BUTTONS.iter().position(|b| *b == ToolPanelButton::Tool(tool))? as i32;
-        let (_, by0, _, by1) = tool_panel_button_rect((tp_x, tp_y), idx);
+        let buttons = self.kind.panel_buttons();
+        let (tp_x, tp_y) = tool_panel_origin(buttons, lb, sel);
+        let (tp_w, _) = tool_panel_dims(buttons);
+        let idx = buttons.iter().position(|b| *b == ToolPanelButton::Tool(tool))? as i32;
+        let (_, by0, _, by1) = tool_panel_button_rect(buttons, (tp_x, tp_y), idx);
         let layout = flyout_layout(tool);
         let (w, h) = (layout.w, layout.h);
         let on_right = tp_x >= sel.0 + sel.2;
@@ -1461,10 +2127,149 @@ impl Overlay {
         true
     }
 
+    /// The Highlight tool's words: take a reading that finished, and start
+    /// reading the selection's picture when it isn't read (or being read)
+    /// for this rectangle yet. The reading runs on its own thread.
+    fn read_words(&mut self) {
+        if let Some((got, (ox, oy))) = self.words_job.as_ref().map(|(rx, o)| (rx.try_recv(), *o)) {
+            let (ox, oy) = (ox as f32, oy as f32);
+            match got {
+                Ok(Ok(found)) => {
+                    let words = found.into_iter().map(|w| framefang_core::mark::Word {
+                        rect: framefang_core::annotation::Rect { x: ox + w.rect.0, y: oy + w.rect.1, w: w.rect.2, h: w.rect.3 },
+                        line: w.line,
+                    }).collect();
+                    self.words = Some(framefang_core::mark::in_reading_order(words));
+                    self.words_job = None;
+                    self.window.request_redraw();
+                }
+                Ok(Err(e)) => {
+                    self.words_error = Some(e);
+                    self.words = Some(Vec::new());
+                    self.words_job = None;
+                    self.window.request_redraw();
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.words = Some(Vec::new());
+                    self.words_job = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if self.state == State::Selecting || self.video_mode || self.record_mode { return; }
+        let (Some(rect), Some(sel)) = (self.selection_in_bitmap(), self.selection) else { return; };
+        if rect.2 < 4 || rect.3 < 4 || self.words_of == Some(rect) { return; }
+        self.words_of = Some(rect);
+        self.words = None;
+        self.words_error = None;
+        let img = crop(&self.screenshot, rect);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new().name("read words".into()).spawn(move || {
+            let _ = tx.send(framefang_platform::ocr::read_words(&img).map_err(|e| e.to_string()));
+        }).ok();
+        self.words_job = Some((rx, (sel.0, sel.1)));
+        self.window.request_redraw();
+    }
+
+    /// Highlight: a press on a word (or just beside one) starts a
+    /// highlight there.
+    fn press_highlight(&mut self) {
+        use framefang_core::mark::{span, word_at, MarkLook};
+        let p = Point2::new(self.cursor.0 as f32, self.cursor.1 as f32);
+        let Some(words) = self.words.as_ref() else { return; };
+        let Some(i) = word_at(words, p, MARK_REACH) else { return; };
+        // Each highlight wobbles its own way.
+        let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() ^ d.as_secs() as u32).unwrap_or(1);
+        let look = MarkLook { style: self.mark_style, color: self.stroke.color, seed };
+        self.mark_anchor = Some(i);
+        self.current = Some(Annotation {
+            kind: framefang_core::annotation::AnnotationKind::TextMark { rects: span(words, i, i), look },
+            time: None,
+        });
+        self.state = State::Drawing;
+        self.window.request_redraw();
+    }
+
+    /// Highlight, dragging: every word from where it began to the one
+    /// nearest the pointer, in reading order.
+    fn drag_highlight(&mut self) {
+        let (Some(words), Some(a)) = (self.words.as_ref(), self.mark_anchor) else { return; };
+        let p = Point2::new(self.cursor.0 as f32, self.cursor.1 as f32);
+        let Some(b) = framefang_core::mark::word_at(words, p, f32::MAX) else { return; };
+        if let Some(Annotation { kind: framefang_core::annotation::AnnotationKind::TextMark { rects, .. }, .. }) = self.current.as_mut() {
+            *rects = framefang_core::mark::span(words, a, b);
+            self.window.request_redraw();
+        }
+    }
+
+    /// Highlight in hand, not dragging: the word a press would take, for its
+    /// outline, or what to say instead (reading, nothing found, can't read).
+    fn highlight_hint(&self) -> (Option<framefang_core::annotation::Rect>, Option<String>) {
+        if self.tool != Tool::Highlight || !self.tool_armed || self.state == State::Drawing || !self.cursor_in_selection() {
+            return (None, None);
+        }
+        if self.words_job.is_some() { return (None, Some("Reading the text...".into())); }
+        let Some(words) = self.words.as_ref() else { return (None, None); };
+        if let Some(e) = &self.words_error {
+            let first = e.split(". ").next().unwrap_or(e).trim_end_matches('.');
+            return (None, Some(format!("Can't read text: {}", first.chars().take(70).collect::<String>())));
+        }
+        if words.is_empty() { return (None, Some("No text found here".into())); }
+        let p = Point2::new(self.cursor.0 as f32, self.cursor.1 as f32);
+        let r = framefang_core::mark::word_at(words, p, MARK_REACH)
+            .and_then(|i| framefang_core::mark::span(words, i, i).into_iter().next());
+        (r, None)
+    }
+
+    /// A press on Step's own controls: a shape takes that look (in the same
+    /// main color), a part chip points the colors below at that part, the
+    /// switch turns the shadow on or off. `true` when it was one of those.
+    fn press_flyout_step(&mut self) -> bool {
+        use framefang_core::step::{StepPart, StepShape};
+        let Some(((fx, fy, _, _), _, _)) = self.flyout_rect() else { return false; };
+        // Highlight's looks.
+        if let Some(tiles) = self.flyout.and_then(|t| flyout_layout(t).mark) {
+            let hit = |r: Rect4| rect_contains(offset(r, (fx, fy)), self.cursor);
+            if let Some(i) = tiles.iter().position(|r| hit(*r)) {
+                self.mark_style = framefang_core::mark::MarkStyle::ALL[i];
+                self.save_knobs();
+                self.window.request_redraw();
+                return true;
+            }
+            return false;
+        }
+        let Some(panel) = self.flyout.and_then(|t| flyout_layout(t).step) else { return false; };
+        let hit = |r: Rect4| rect_contains(offset(r, (fx, fy)), self.cursor);
+        if let Some(i) = panel.tiles.iter().position(|r| hit(*r)) {
+            let shape = StepShape::ALL[i];
+            if shape != self.step_look.shape { self.step_look = self.step_look.with_shape(shape); }
+            self.step_part = shape.accent_part();
+        } else if let Some(i) = panel.parts.iter().position(|r| hit(*r)) {
+            let part = StepPart::ALL[i];
+            // A disc has no ring to paint.
+            if part == StepPart::Ring && !self.step_look.shape.has_ring() { return true; }
+            self.step_part = part;
+        } else if hit(panel.shadow) {
+            self.step_look.shadow = !self.step_look.shadow;
+        } else {
+            return false;
+        }
+        self.stroke.color = self.step_look.part(self.step_part);
+        self.spectrum_pick = None;
+        self.show_palette_of_color();
+        self.stop_picking();
+        self.save_knobs();
+        self.window.request_redraw();
+        true
+    }
+
     /// The tool draws in `c` from now on, the text being typed included.
     /// Picking any color puts the eyedropper back down.
     fn set_color(&mut self, c: framefang_core::color::Rgba) {
         self.stroke.color = c;
+        // Step: the part being painted.
+        if self.tool == Tool::Step { self.step_look.set_part(self.step_part, c); }
         if let Some(a) = self.current.as_mut() {
             if let framefang_core::annotation::AnnotationKind::Text { color, .. } = &mut a.kind {
                 *color = c;
@@ -1518,6 +2323,7 @@ impl Overlay {
             Knob::MarkerOpacity => self.settings.marker_opacity as f32,
             Knob::TextSize      => self.text_size,
             Knob::PixelSize     => self.pixel_size as f32,
+            Knob::Zoom          => self.settings.magnify_zoom as f32,
         }
     }
 
@@ -1543,6 +2349,9 @@ impl Overlay {
                     = self.current.as_mut() { *font_size = v; }
             }
             Knob::PixelSize     => self.pixel_size = v as u32,
+            // Saved with the other knobs when the drag ends (`save_knobs`
+            // notes every changed field).
+            Knob::Zoom          => self.settings.magnify_zoom = v as u32,
         }
         self.window.request_redraw();
     }
@@ -1551,16 +2360,20 @@ impl Overlay {
     /// disk. Called when a knob drag ends or a color is picked, so the next
     /// capture opens with the same values.
     fn save_knobs(&mut self) {
+        // Step's own color is its body's; the rest of its look is saved whole.
+        let color = if self.tool == Tool::Step {
+            self.settings.step_look = Some(self.step_look);
+            self.step_look.body.with_alpha(0xFF)
+        } else { self.stroke.color };
+        if self.tool == Tool::Highlight { self.settings.highlight_style = self.mark_style; }
         let style = framefang_core::settings::ToolStyle {
-            color_argb: self.stroke.color.to_argb(),
+            color_argb: color.to_argb(),
             thickness: self.stroke.thickness,
         };
         self.settings.set_tool_style(self.tool, style);
         self.settings.last_text_size = self.text_size;
         self.settings.pixelate_block = self.pixel_size;
-        if let Err(e) = self.settings.save_editor_fields() {
-            eprintln!("framefang: tool settings save failed: {e}");
-        }
+        self.note_settings();
     }
 
     /// Snap `scrub_pos` to the cursor's X inside the timeline track,
@@ -1662,6 +2475,8 @@ impl Overlay {
     /// would put them.
     fn chrome_bounds(&self, point: (i32, i32)) -> (i32, i32, i32, i32) {
         let size = self.window.inner_size();
+        // The scrolling editor: the slice that shows, in page pixels.
+        if let Some(v) = self.scroll_view { return (0, v.y, size.width as i32, v.view_h); }
         vdesk::monitor_bounds_in_frame(
             self.desktop.monitors(), self.frame_origin, (size.width, size.height), point)
     }
@@ -1684,6 +2499,30 @@ impl Overlay {
 
     pub fn handle_event(&mut self, event: WindowEvent) -> OverlayOutcome {
         if let Some(out) = self.pending_outcome.take() { return out; }
+        #[cfg(not(windows))]
+        if let WindowEvent::KeyboardInput { event: KeyEvent { physical_key, state, .. }, .. } = &event {
+            if let Some(vk) = crate::settings_form::vk_of(*physical_key) {
+                if *state == ElementState::Pressed { self.held_keys.insert(vk); } else { self.held_keys.remove(&vk); }
+            }
+        }
+        // Reading: the screen stays as it is; only Esc (and closing) count.
+        if self.reading.is_some() {
+            return match event {
+                WindowEvent::CloseRequested => OverlayOutcome::Cancelled,
+                WindowEvent::KeyboardInput {
+                    event: KeyEvent { logical_key: Key::Named(NamedKey::Escape), state: ElementState::Pressed, .. }, ..
+                } => OverlayOutcome::Cancelled,
+                WindowEvent::RedrawRequested | WindowEvent::Resized(_) => {
+                    self.redraw();
+                    OverlayOutcome::Continue
+                }
+                _ => OverlayOutcome::Continue,
+            };
+        }
+        // The scrolling editor's wheel and page map come first.
+        if self.scroll_view.is_some() {
+            if let Some(out) = self.page_map_event(&event) { return out; }
+        }
         match event {
             WindowEvent::CloseRequested => self.request_close(),
 
@@ -1704,7 +2543,8 @@ impl Overlay {
             WindowEvent::Ime(ime) => self.handle_ime(ime),
 
             WindowEvent::CursorMoved { position: PhysicalPosition { x, y }, .. } => {
-                self.cursor = (x as i32, y as i32);
+                self.cursor_win = (x as i32, y as i32);
+                self.cursor = self.page_point(self.cursor_win);
                 // Marker opacity drag takes priority over per-state cursor
                 // updates so the slider tracks the cursor smoothly even
                 // when the user drags well outside the slider's own rect.
@@ -1720,14 +2560,23 @@ impl Overlay {
                     self.set_scrub_from_cursor(false);
                     return OverlayOutcome::Continue;
                 }
+                if let (Some(d), Some(pic)) = (self.crop_drag, self.picture_rect) {
+                    self.selection = Some(crop_rect(d, self.cursor, pic));
+                    self.window.request_redraw();
+                    return OverlayOutcome::Continue;
+                }
                 match self.state {
                     State::Selecting => {
                         self.selection = Some(rect_from(self.anchor, self.cursor));
                         self.window.request_redraw();
                     }
+                    State::Drawing if self.tool == Tool::Highlight => self.drag_highlight(),
                     State::Drawing => {
+                        // The page point: in the scrolling editor the
+                        // window's point is offset by the scroll.
+                        let (px, py) = self.cursor;
                         if let Some(a) = self.current.as_mut() {
-                            a.extend(Point2::new(x as f32, y as f32));
+                            a.extend(Point2::new(px as f32, py as f32));
                             self.window.request_redraw();
                         }
                     }
@@ -1757,8 +2606,10 @@ impl Overlay {
                         // C# MakeButton(tip, …) tooltip text.
                         let prev = self.hover_tip;
                         self.hover_tip = self.compute_hover_tip();
-                        // The eyedropper's magnifier follows the cursor.
-                        if prev != self.hover_tip || self.picking_color { self.window.request_redraw(); }
+                        // The eyedropper's magnifier follows the cursor, and
+                        // so does Highlight's outline of the word under it.
+                        let highlighting = self.tool == Tool::Highlight && self.tool_armed;
+                        if prev != self.hover_tip || self.picking_color || highlighting { self.window.request_redraw(); }
                     }
                     State::Idle => {
                         // Magnifier follows the cursor in Idle so the user
@@ -1935,7 +2786,7 @@ impl Overlay {
             // Tab: the next capture mode, before any region exists.
             Key::Named(NamedKey::Tab) if self.state == State::Idle && self.has_hover() => {
                 self.tab_pressed_at = Some(std::time::Instant::now());
-                let next = self.pick_mode.next(self.screens());
+                let next = self.pick_mode.next(self.screens(), self.is_picker());
                 self.set_pick_mode(next);
                 OverlayOutcome::Continue
             }
@@ -1978,6 +2829,8 @@ impl Overlay {
                         's' if shift => return self.commit_as_save_as(),
                         // Ctrl+S → commit-and-save (same as Enter)
                         's' => return self.commit(),
+                        // Ctrl+Shift+C → copy the words in the picture
+                        'c' if shift => return self.commit_as_text(),
                         // Ctrl+C → commit-and-copy
                         'c' => return self.commit_as_copy(),
                         // Ctrl+P → commit-and-pin (float bitmap on screen)
@@ -2010,6 +2863,12 @@ impl Overlay {
     fn handle_escape(&mut self) -> OverlayOutcome {
         if self.picking_color {
             self.stop_picking();
+            return OverlayOutcome::Continue;
+        }
+        // A crop being dragged goes back to how it was at the press.
+        if let Some(d) = self.crop_drag.take() {
+            self.selection = Some(d.before);
+            self.window.request_redraw();
             return OverlayOutcome::Continue;
         }
         if self.state == State::Drawing {
@@ -2216,7 +3075,10 @@ impl Overlay {
     }
 
     fn undo(&mut self) {
+        // A crop still being dragged is let go first, so it is the step undone.
+        if self.crop_drag.is_some() { self.finish_crop(); }
         let Some(op) = self.history.undo(&mut self.annotations) else { return; };
+        if let EditOp::Crop { before, .. } = op { self.selection = Some(before); }
         self.after_history_op();
         // Undoing the clear that Esc (or a click outside the region) did
         // brings the selection back with the ink, so the user lands exactly
@@ -2234,9 +3096,24 @@ impl Overlay {
     }
 
     fn redo(&mut self) {
-        if self.history.redo(&mut self.annotations).is_some() {
+        if self.crop_drag.is_some() { self.finish_crop(); }
+        if let Some(op) = self.history.redo(&mut self.annotations) {
+            if let EditOp::Crop { after, .. } = op { self.selection = Some(after); }
             self.after_history_op();
         }
+    }
+
+    /// A crop drag let go: a click (no rectangle to speak of) keeps the crop
+    /// as it was; anything else is one undoable step.
+    fn finish_crop(&mut self) {
+        let Some(d) = self.crop_drag.take() else { return };
+        let now = self.selection.unwrap_or(d.before);
+        if now.2 < 4 || now.3 < 4 {
+            self.selection = Some(d.before);
+        } else if now != d.before {
+            self.history.record(EditOp::Crop { before: d.before, after: now });
+        }
+        self.window.request_redraw();
     }
 
     /// Shared bookkeeping after any undo/redo: step numbering follows the
@@ -2304,6 +3181,7 @@ impl Overlay {
             self.set_knob_from_cursor(k);
             return OverlayOutcome::Continue;
         }
+        if self.press_flyout_step() { return OverlayOutcome::Continue; }
         // A color recolors the text being typed too (`set_color`), like the
         // size slider resizes it.
         if self.press_flyout_colors() {
@@ -2337,15 +3215,15 @@ impl Overlay {
         // wins over a draw inside the selection. Mirrors the order in
         // C# OverlayForm.OnMouseDown.
         if self.state == State::Selected {
-            if let Some(sel) = self.selection {
+            if let Some(sel) = self.panel_sel() {
                 let lb = self.panel_bounds(sel);
-                let tp_origin = tool_panel_origin(lb, sel);
+                let tp_origin = tool_panel_origin(self.kind.panel_buttons(), lb, sel);
 
                 // Tool panel — absent in record mode, so it can't take clicks
                 // there either. The flyout and the timeline are already
                 // unreachable in that mode (no tool letter keys, not a video
                 // session).
-                if let Some((_, btn)) = tool_panel_hit(tp_origin, self.cursor)
+                if let Some((_, btn)) = tool_panel_hit(self.kind.panel_buttons(), tp_origin, self.cursor)
                     .filter(|_| !self.record_mode)
                 {
                     match btn {
@@ -2362,6 +3240,7 @@ impl Overlay {
                 if let Some(action) = action_panel_hit(ap_origin, self.cursor, self.action_buttons()) {
                     return match action {
                         ActionButton::Pin    => self.commit_as_pin(),
+                        ActionButton::Copy if self.mods.shift_key() => self.commit_as_text(),
                         ActionButton::Copy   => self.commit_as_copy(),
                         ActionButton::Save if self.mods.shift_key() => self.commit_as_save_as(),
                         ActionButton::Save   => self.commit(),
@@ -2404,8 +3283,9 @@ impl Overlay {
                     return OverlayOutcome::Continue;
                 }
                 self.update_target();
-                // Screen and All screens take a click, never a drag.
-                if self.pick_mode.available(self.screens()) != PickMode::Auto {
+                // Screen and All screens take a click, never a drag; the
+                // reading modes drag like Region.
+                if matches!(self.pick_mode.available(self.screens()), PickMode::Screen | PickMode::AllScreens) {
                     self.pick_pressed = true;
                     return OverlayOutcome::Continue;
                 }
@@ -2451,6 +3331,21 @@ impl Overlay {
                     self.window.request_redraw();
                     return OverlayOutcome::Continue;
                 }
+                // Crop in hand: a press on the picture grabs the crop's edge
+                // or corner under it, or starts a new crop rectangle.
+                if self.editor_mode && self.tool_armed && self.tool == Tool::Crop && !self.select_mode {
+                    if let (Some(pic), Some(sel)) = (self.picture_rect, self.selection) {
+                        if rect_contains(pic, self.cursor) {
+                            let edge = hit_test_edge_scaled(
+                                (sel.0 as f32, sel.1 as f32, sel.2 as f32, sel.3 as f32),
+                                (self.cursor.0 as f32, self.cursor.1 as f32), self.display_scale());
+                            let grab = if edge == Edge::None { CropGrab::New(self.cursor) } else { CropGrab::Edge(edge) };
+                            self.crop_drag = Some(CropDrag { before: sel, grab });
+                            self.window.request_redraw();
+                            return OverlayOutcome::Continue;
+                        }
+                    }
+                }
                 if self.cursor_in_selection() {
                     // Nothing to draw in record mode — a click inside the
                     // rectangle is a no-op rather than a stray annotation the
@@ -2469,7 +3364,7 @@ impl Overlay {
                     // the counter for the next click.
                     if self.tool == Tool::Step {
                         let p = Point2::new(self.cursor.0 as f32, self.cursor.1 as f32);
-                        self.add_annotation(Annotation::step(self.stroke.color, p, self.step_count));
+                        self.add_annotation(Annotation::step_styled(p, self.step_count, self.step_look));
                         self.step_count = self.step_count.saturating_add(1);
                         self.window.request_redraw();
                     } else if self.tool == Tool::Text {
@@ -2489,6 +3384,8 @@ impl Overlay {
                         );
                         eprintln!("framefang: entered TextInput at ({}, {})", p.x, p.y);
                         self.window.request_redraw();
+                    } else if self.tool == Tool::Highlight {
+                        self.press_highlight();
                     } else if let Some(a) = self.start_annotation() {
                         self.current = Some(a);
                         self.state   = State::Drawing;
@@ -2551,6 +3448,10 @@ impl Overlay {
             // the drag ended (mid-drag swaps are throttled).
             self.set_scrub_from_cursor(true);
         }
+        if self.crop_drag.is_some() {
+            self.finish_crop();
+            return OverlayOutcome::Continue;
+        }
         match self.state {
             State::Idle if std::mem::take(&mut self.pick_pressed) => {
                 return self.take_target();
@@ -2572,7 +3473,9 @@ impl Overlay {
                 self.window.request_redraw();
             }
             State::Drawing => {
-                if let Some(a) = self.current.take() {
+                // A click with Spotlight or Magnify in hand made nothing worth
+                // keeping (it would dim everything, or be a dot).
+                if let Some(a) = self.current.take().filter(|a| !a.is_degenerate()) {
                     self.add_annotation(a);
                 }
                 self.state = State::Selected;
@@ -2597,7 +3500,28 @@ impl Overlay {
     /// says the switch key is held), hands it to the editor window, or keeps
     /// editing it in place when the editor would not fit.
     fn finish_selection(&mut self, switch: bool) -> OverlayOutcome {
+        // SCROLL: the area is followed and stitched, by the tray. Its own
+        // key, held as the part is clicked, flips what happens after.
+        if self.pick_mode == crate::pick::PickMode::Scroll && self.is_picker() {
+            if let Some(sel) = self.selection {
+                let flip = self.key_down(self.settings.scroll_switch_key());
+                return OverlayOutcome::Scroll(vdesk::frame_rect_to_virtual(self.frame_origin, sel), flip);
+            }
+        }
+        // TEXT and QR: the picture is read, not kept.
+        if let Some(kind) = self.pick_mode.reads().filter(|_| self.is_picker()) {
+            if let Some(rect) = self.selection_in_bitmap() {
+                let flip = self.qr_key_down();
+                self.reading = Some(std::time::Instant::now());
+                self.reading_flip = flip;
+                self.window.request_redraw();
+                return OverlayOutcome::ReadText(crop(&self.screenshot, rect), kind, flip);
+            }
+        }
         if self.is_picker() {
+            if let Some(sel) = self.selection {
+                self.picked_rect = Some(vdesk::frame_rect_to_virtual(self.frame_origin, sel));
+            }
             if !self.settings.opens_editor(switch) {
                 if let Some(rect) = self.selection_in_bitmap() {
                     return OverlayOutcome::Copied(crop(&self.screenshot, rect));
@@ -2678,7 +3602,33 @@ impl Overlay {
         let next = match self.pick_mode.available(screens) {
             PickMode::AllScreens => Some((whole, "All screens".to_owned())),
             PickMode::Screen => Some((screen, screen_label())),
-            PickMode::Auto => {
+            PickMode::Scroll => {
+                let p = vdesk::frame_to_virtual(self.frame_origin, self.cursor);
+                let label = || SCROLL_HINT.to_owned();
+                let at = self.windows.iter().position(|((x, y, w, h), _)| p.0 >= *x && p.0 < x + w && p.1 >= *y && p.1 < y + h);
+                let mut hit = None;
+                if let Some(i) = at {
+                    let wr = self.windows[i].0;
+                    let hwnd = self.window_handles.get(i).copied().unwrap_or(0);
+                    // The part of it that scrolls, once known; the whole
+                    // window until then (or when nothing does).
+                    let part = self.scroll_parts.iter()
+                        .find(|(h, r)| *h == hwnd && hwnd != 0 && p.0 >= r.0 && p.0 < r.0 + r.2 && p.1 >= r.1 && p.1 < r.1 + r.3)
+                        .and_then(|(_, r)| crate::pick::clip(*r, wr));
+                    if part.is_none() && hwnd != 0 {
+                        let asked = self.probe_asked.is_some_and(|(h, q)| h == hwnd && crate::scroll_probe::near(q, p));
+                        if !asked {
+                            self.scroll_probe.get_or_insert_with(crate::scroll_probe::Probe::start).ask((hwnd, p));
+                            self.probe_asked = Some((hwnd, p));
+                        }
+                    }
+                    let r = part.unwrap_or(wr);
+                    let (fx, fy) = vdesk::virtual_to_frame(self.frame_origin, (r.0, r.1));
+                    hit = crate::pick::clip((fx, fy, r.2, r.3), whole).map(|r| (r, label()));
+                }
+                hit.or_else(|| Some((screen, label())))
+            }
+            PickMode::Auto | PickMode::Text | PickMode::Qr => {
                 let p = vdesk::frame_to_virtual(self.frame_origin, self.cursor);
                 let hit = crate::pick::window_at(&self.windows, p).and_then(|(r, title)| {
                     let (fx, fy) = vdesk::virtual_to_frame(self.frame_origin, (r.0, r.1));
@@ -2713,9 +3663,12 @@ impl Overlay {
         if mode == self.pick_mode { return; }
         self.pick_mode = mode;
         self.decode_at = Some(std::time::Instant::now());
-        self.settings.capture_mode = mode.name().to_owned();
-        if let Err(e) = self.settings.save_editor_fields() {
-            eprintln!("framefang: capture mode save failed: {e}");
+        // A reading mode is for this capture only: reaching one puts back
+        // the mode this capture opened in.
+        let kept = mode.kept(self.opened_mode);
+        if self.settings.capture_mode != kept.name() {
+            self.settings.capture_mode = kept.name().to_owned();
+            self.note_settings();
         }
         self.update_target();
         self.window.request_redraw();
@@ -2723,8 +3676,8 @@ impl Overlay {
 
     /// The capture dock, on the screen under the cursor, above its taskbar.
     fn mode_bar(&self) -> crate::pick::Dock {
-        let modes = crate::pick::PickMode::offered(self.screens());
-        crate::pick::dock_layout(self.usable(self.chrome_bounds(self.cursor)), modes, self.record_mode)
+        let modes = crate::pick::PickMode::offered(self.screens(), self.is_picker());
+        crate::pick::dock_layout(self.usable(self.chrome_bounds(self.cursor)), &modes, self.record_mode)
     }
 
     /// `b`, a screen in frame pixels, less what the taskbar (or another bar
@@ -2765,9 +3718,59 @@ impl Overlay {
         }
     }
 
+    /// TEXT or QR mode handed its picture over and waits for the answer.
+    pub fn is_reading(&self) -> bool { self.reading.is_some() }
+
+    /// What TEXT or QR mode reads, in a picker: drawn in the reading look.
+    fn reading_kind(&self) -> Option<crate::pick::Look> {
+        self.pick_mode.look().filter(|_| self.is_picker())
+    }
+
+    /// The reading look's animation frame now: the scan step while reading,
+    /// else the prompt cursor's blink. `None` outside TEXT and QR.
+    fn read_frame(&self) -> Option<u32> {
+        self.reading_kind()?;
+        let frame = match self.reading {
+            Some(t) => 1_000 + (t.elapsed().as_millis() / READ_STEP.as_millis()) as u32,
+            None => (self.opened_at.elapsed().as_millis() / crate::pick::BLINK.as_millis()) as u32 % 2,
+        };
+        // The switch key going down or up changes the QR tag's flag.
+        Some(frame * 2 + self.links_open() as u32)
+    }
+
+    /// QR: whether a link in the code will open rather than be copied:
+    /// the setting, flipped while the switch key is held (or was, as the
+    /// read was let go).
+    fn links_open(&self) -> bool {
+        let held = if self.reading.is_some() { self.reading_flip } else { self.qr_key_down() };
+        self.settings.open_qr_links != held
+    }
+
     /// Called every tray tick: the dock's sweep, decode, key press and
     /// cursor run on time, not on events, so redraw when its frame changed.
     pub fn tick(&mut self) {
+        // The scrolling editor: a drag near the top or bottom scrolls on.
+        self.edge_scroll();
+        // Highlight in hand: the picture's words, read once, in the
+        // background.
+        if self.tool == Tool::Highlight && self.tool_armed { self.read_words(); }
+        // SCROLL mode: a part that scrolls was found; the highlight moves
+        // onto it.
+        let answers = self.scroll_probe.as_ref().map(|p| p.answers()).unwrap_or_default();
+        if !answers.is_empty() {
+            for ((hwnd, _), part) in answers {
+                if let Some(r) = part {
+                    if !self.scroll_parts.contains(&(hwnd, r)) { self.scroll_parts.push((hwnd, r)); }
+                }
+            }
+            self.update_target();
+            self.window.request_redraw();
+        }
+        // The reading look's cursor and scan line animate.
+        if self.read_frame() != self.read_drawn {
+            self.window.request_redraw();
+            return;
+        }
         if self.state == State::Idle && self.has_hover() && self.dock_frame() != self.dock_drawn {
             self.window.request_redraw();
         }
@@ -2813,12 +3816,13 @@ impl Overlay {
     }
 
     fn compute_hover_tip(&self) -> Option<(&'static str, i32, i32)> {
-        let sel = self.selection?;
+        let sel = self.panel_sel()?;
         let lb  = self.panel_bounds(sel);
         // Tool panel — never drawn in record mode, so never hoverable either.
-        let tp = tool_panel_origin(lb, sel);
-        if let Some((idx, btn)) = tool_panel_hit(tp, self.cursor).filter(|_| !self.record_mode) {
-            let (_, _, x1, y1) = tool_panel_button_rect(tp, idx as i32);
+        let buttons = self.kind.panel_buttons();
+        let tp = tool_panel_origin(buttons, lb, sel);
+        if let Some((idx, btn)) = tool_panel_hit(buttons, tp, self.cursor).filter(|_| !self.record_mode) {
+            let (x0, y0, x1, y1) = tool_panel_button_rect(buttons, tp, idx as i32);
             let label = match btn {
                 // `[Key]` is drawn as a key (`keycap`).
                 ToolPanelButton::Tool(Tool::Pen)        => "Pen [P]",
@@ -2827,9 +3831,13 @@ impl Overlay {
                 ToolPanelButton::Tool(Tool::Rectangle)  => "Rectangle [R]",
                 ToolPanelButton::Tool(Tool::Ellipse)    => "Ellipse [E]",
                 ToolPanelButton::Tool(Tool::Marker)     => "Marker [M]",
+                ToolPanelButton::Tool(Tool::Highlight)  => "Highlight text [H]",
                 ToolPanelButton::Tool(Tool::Text)       => "Text [T]",
                 ToolPanelButton::Tool(Tool::Step)       => "Step [N]",
                 ToolPanelButton::Tool(Tool::Pixelate)   => "Pixelate [B]",
+                ToolPanelButton::Tool(Tool::Spotlight)  => "Spotlight [F]",
+                ToolPanelButton::Tool(Tool::Magnify)    => "Magnify [Z]",
+                ToolPanelButton::Tool(Tool::Crop)       => "Crop [C]",
                 ToolPanelButton::Undo                   => "Undo [Ctrl]+[Z]",
                 ToolPanelButton::Redo                   => "Redo [Ctrl]+[Y]",
             };
@@ -2838,20 +3846,30 @@ impl Overlay {
             if matches!(btn, ToolPanelButton::Tool(t) if self.flyout == Some(t)) {
                 return None;
             }
-            return Some((label, x1 + 6, y1 - 14));
+            let (pw, ph) = tool_panel_dims(buttons);
+            let button = (x0, y0, x1 - x0, y1 - y0);
+            let (x, y) = tool_tip_spot(button, (tp.0, tp.1, pw, ph), label, self.chrome_bounds(self.cursor));
+            return Some((label, x, y));
         }
         // Action panel.
         let ap = action_panel_origin(lb, sel, self.action_buttons());
         if let Some(btn) = action_panel_hit(ap, self.cursor, self.action_buttons()) {
             let label = match btn {
                 ActionButton::Pin    => "Pin to screen",
-                ActionButton::Copy   => "Copy [Ctrl]+[C]",
+                ActionButton::Copy   => "Copy [Ctrl]+[C]  // hold [Shift] to copy its text",
                 ActionButton::Save if self.video_mode => "Save [Ctrl]+[S]",
                 ActionButton::Save   => "Save [Ctrl]+[S]  // hold [Shift] to Save as",
                 ActionButton::Record => if self.record_mode { "Record [Enter]" } else { "Record this region" },
                 ActionButton::Close  => "Close [Esc]",
             };
-            return Some((label, self.cursor.0 + 14, self.cursor.1 + 14));
+            let buttons = self.action_buttons();
+            let idx = buttons.iter().position(|b| *b == btn).unwrap_or(0) as i32;
+            let (pw, ph) = action_panel_dims(buttons);
+            // The button's rect comes as corners; the tip wants x, y, w, h.
+            let (x0, y0, x1, y1) = action_panel_button_rect(ap, idx);
+            let (x, y) = action_tip_spot((x0, y0, x1 - x0, y1 - y0), (ap.0, ap.1, pw, ph), label,
+                                         self.chrome_bounds(self.cursor));
+            return Some((label, x, y));
         }
         // The flyout labels its own rows; no tooltip over it, but for the
         // eyedropper, which is only an icon.
@@ -2883,9 +3901,10 @@ impl Overlay {
     /// edges), the crosshair where a drag draws. `None` leaves it to select
     /// mode's own cursor.
     fn editor_cursor(&self) -> Option<CursorIcon> {
-        let sel = self.selection?;
+        let sel = self.panel_sel()?;
         let lb = self.panel_bounds(sel);
-        let on_tool = tool_panel_hit(tool_panel_origin(lb, sel), self.cursor).is_some();
+        let buttons = self.kind.panel_buttons();
+        let on_tool = tool_panel_hit(buttons, tool_panel_origin(buttons, lb, sel), self.cursor).is_some();
         let actions = self.action_buttons();
         let on_action = action_panel_hit(action_panel_origin(lb, sel, actions), self.cursor, actions).is_some();
         if on_tool || on_action {
@@ -2895,6 +3914,24 @@ impl Overlay {
             return Some(CursorIcon::Default);
         }
         if self.select_mode { return None; }
+        // Crop in hand: the crop's edges resize, the rest of the picture
+        // draws a new crop.
+        if self.tool_armed && self.tool == Tool::Crop {
+            if let (Some(pic), Some(crop)) = (self.picture_rect, self.selection) {
+                if rect_contains(pic, self.cursor) {
+                    let edge = hit_test_edge_scaled(
+                        (crop.0 as f32, crop.1 as f32, crop.2 as f32, crop.3 as f32),
+                        (self.cursor.0 as f32, self.cursor.1 as f32), self.display_scale());
+                    return Some(match edge {
+                        Edge::Left | Edge::Right              => CursorIcon::EwResize,
+                        Edge::Top  | Edge::Bottom             => CursorIcon::NsResize,
+                        Edge::TopLeft | Edge::BottomRight     => CursorIcon::NwseResize,
+                        Edge::TopRight | Edge::BottomLeft     => CursorIcon::NeswResize,
+                        Edge::None                            => CursorIcon::Crosshair,
+                    });
+                }
+            }
+        }
         Some(if self.tool_armed && self.cursor_in_selection() { CursorIcon::Crosshair } else { CursorIcon::Move })
     }
 
@@ -2971,11 +4008,17 @@ impl Overlay {
                 }
                 a
             }
+            Tool::Spotlight => Annotation::spotlight(p),
+            Tool::Magnify   => Annotation::magnify(self.stroke, p, self.settings.magnify_zoom),
             // Step is handled inline at click site (no `Drawing` state).
             Tool::Step      => return None,
             // Text enters its own `TextInput` state instead of `Drawing` —
             // also handled inline.
             Tool::Text      => return None,
+            // Highlight snaps to the words read (`press_highlight`).
+            Tool::Highlight => return None,
+            // Crop changes the picture, not the ink (`State::Cropping`).
+            Tool::Crop      => return None,
         })
     }
 
@@ -3014,6 +4057,15 @@ impl Overlay {
                 self.window.request_redraw();
                 OverlayOutcome::CopiedOpen(img)
             }
+            None => OverlayOutcome::Continue,
+        }
+    }
+
+    /// Copy the words in the picture, as it looks now (a blurred name stays
+    /// unread). The editor stays open; the tray says what was copied.
+    fn commit_as_text(&mut self) -> OverlayOutcome {
+        match self.compose_final() {
+            Some(img) => OverlayOutcome::ReadText(img, crate::read_text::ReadKind::Text, false),
             None => OverlayOutcome::Continue,
         }
     }
@@ -3075,28 +4127,54 @@ impl Overlay {
     fn compose_final(&self) -> Option<ImageBuffer<Rgba<u8>, Vec<u8>>> {
         if self.state != State::Selected { return None; }
         let rect = self.selection?;
+        // Drawn on the whole picture (in the editor window, past a crop) and
+        // cut to the selection last, so a lens or a pixelate near the crop's
+        // edge reads the same pixels as on screen.
+        let base = self.picture_bounds().unwrap_or(rect);
         // The selection is in frame space; the capture is in bitmap space.
         // On a multi-monitor desktop those differ by the virtual-desktop
         // origin, which is what used to make a region picked on a monitor
         // left of / above the primary one crop the wrong pixels.
-        let mut img = crop(&self.screenshot, self.selection_in_bitmap()?);
+        let mut img = crop(&self.screenshot,
+            vdesk::frame_rect_to_bitmap(self.desktop.origin(), self.frame_origin, base));
         // Snapshot the un-annotated crop FIRST so pixelate's source-sampling
         // stays idempotent under draw-order: pixelate must always sample the
         // original screenshot, never something we already painted on.
         // Mirrors C# `PixelateAnnotation`.
         let pristine = img.clone();
-        let dx = -rect.0 as f32;
-        let dy = -rect.1 as f32;
-        let mut surf = ImageSurface(&mut img);
-        for a in &self.annotations {
-            // Video-mode Copy/Pin produce a still of exactly what is on
-            // screen: only ink visible at the scrub position is burned.
-            // Screenshot mode carries no windows so this never skips.
-            if self.video_mode && !annotation_visible_at(a, self.scrub_pos) { continue; }
-            let translated = translate_annotation(a, dx, dy);
-            painter::render_annotation(&mut surf, &translated, Some(&pristine));
+        let (dx, dy) = (-base.0 as f32, -base.1 as f32);
+        // Video-mode Copy/Pin produce a still of exactly what is on screen:
+        // only ink visible at the scrub position is burned. Screenshot mode
+        // carries no windows so this never skips.
+        let moved: Vec<Annotation> = self.annotations.iter()
+            .filter(|a| !self.video_mode || annotation_visible_at(a, self.scrub_pos))
+            .map(|a| translate_annotation(a, dx, dy)).collect();
+        let bounds = (0, 0, img.width() as i32, img.height() as i32);
+        painter::render_all(&mut ImageSurface(&mut img), moved.iter(),
+            &painter::Pass { source: Some(&pristine), src_offset: (0, 0), bounds });
+        if base != rect {
+            img = crop(&img, (rect.0 - base.0, rect.1 - base.1, rect.2, rect.3));
         }
         Some(img)
+    }
+
+    /// What the panels stand beside: the whole picture in the editor window,
+    /// so a crop never moves them onto it.
+    /// In the scrolling editor, the part of the picture that shows, less
+    /// the action row's room at the bottom, so the tools and the action row
+    /// stay on screen as the page scrolls.
+    fn panel_sel(&self) -> Option<Rect4> {
+        let pic = self.picture_bounds()?;
+        let Some(v) = self.scroll_view else { return Some(pic) };
+        let top = (v.y + EDITOR_EDGE).max(pic.1);
+        let bottom = (v.y + v.view_h - tall_bottom()).min(pic.1 + pic.3);
+        Some((pic.0, top, pic.2, (bottom - top).max(1)))
+    }
+
+    /// The picture's rectangle in the window: in the editor window the whole
+    /// picture (a crop dims part of it but keeps it), elsewhere the selection.
+    fn picture_bounds(&self) -> Option<Rect4> {
+        if self.editor_mode { self.picture_rect.or(self.selection) } else { self.selection }
     }
 
     /// Force keyboard focus + grab to our window via raw X11 calls. Retries
@@ -3142,6 +4220,7 @@ impl Overlay {
         // Where the window actually landed decides every coordinate mapping
         // below, so re-read it before anything is drawn or sampled.
         self.sync_frame_origin();
+        self.refresh_map();
         #[cfg(target_os = "linux")]
         {
             self.push_x11_focus();
@@ -3172,9 +4251,20 @@ impl Overlay {
                 open: ease_out(t),
                 picking: self.picking_color,
                 spectrum_pick: self.spectrum_pick,
+                step: (self.flyout == Some(Tool::Step)).then_some((self.step_look, self.step_part)),
+                mark: (self.flyout == Some(Tool::Highlight)).then_some(framefang_core::mark::MarkLook {
+                    style: self.mark_style, color: self.stroke.color, seed: 11,
+                }),
             })
         });
+        // Highlight in hand: the word under the pointer, or what to say.
+        let (mark_hover, mark_note) = self.highlight_hint();
+        let mark_ink = self.stroke.color;
+        let mark_note_at = (self.cursor.0 + 16, self.cursor.1 + 18);
         let locked = self.locked();
+        // Crop in hand in the editor window: the crop's handles show, since
+        // they can be dragged now.
+        let crop_in_hand = self.editor_mode && self.tool_armed && self.tool == Tool::Crop && !self.select_mode;
         // Where the eyedropper would take a color from.
         let picking_here = self.picking_color
             && !flyout_draw.as_ref().is_some_and(|f| rect_contains(f.rect, self.cursor))
@@ -3201,19 +4291,38 @@ impl Overlay {
                 cursor_on: self.dock_drawn.cursor_on,
             }
         });
+        // TEXT and QR draw their own look, read now so `tick` knows this
+        // frame is drawn.
+        self.read_drawn = self.read_frame();
+        let read_look = self.reading_kind().map(|kind| ReadLook {
+            kind,
+            // `read_frame` is the blink step (0 is on) times two, plus the flag.
+            cursor_on: self.read_drawn.is_some_and(|f| f / 2 == 0),
+            reading: self.reading.map(|t| t.elapsed()),
+            links: (self.links_open(), self.settings.open_qr_links),
+        });
         // Offset of framebuffer (0, 0) inside the capture: zero whenever the
         // overlay covers the virtual desktop as asked.
         let shot_off      = self.bitmap_offset();
+        // Read before the surface is borrowed below.
+        let pic_bounds    = self.picture_bounds();
+        let panel_sel     = self.panel_sel();
         if let Err(e) = self.surface.resize(w, h) {
             eprintln!("overlay: surface.resize: {e}"); return;
         }
-        let mut buf = match self.surface.buffer_mut() {
+        let mut out = match self.surface.buffer_mut() {
             Ok(b) => b,
             Err(e) => { eprintln!("overlay: buffer_mut: {e}"); return; }
         };
-
+        // The scrolling editor draws the whole page into a page-sized
+        // buffer, in page pixels like any picture, and shows a slice of it
+        // at the end (`page_map`). Everywhere else this is the window.
+        let view = self.scroll_view;
+        let mut doc = std::mem::take(&mut self.scroll_doc);
         let win_w  = w.get() as usize;
-        let win_h  = h.get() as usize;
+        let win_h  = view.map_or(h.get() as usize, |v| v.doc_h as usize);
+        if view.is_some() { doc.resize(win_w * win_h, 0); }
+        let mut buf: &mut [u32] = if view.is_some() { &mut doc } else { &mut out };
         let shot_w = self.screenshot.width()  as usize;
         let shot_h = self.screenshot.height() as usize;
         let shot   = self.screenshot.as_raw();
@@ -3239,14 +4348,16 @@ impl Overlay {
         // the per-pixel level inside the painter so we don't have to manage
         // a scissor here, but we still skip when there's no selection.
         let mut surf = U32Surface { buf: &mut buf, stride: win_w as i32, height: win_h as i32 };
-        for a in &self.annotations {
+        {
             // Timeline preview: only ink whose window contains the scrub
             // position is visible. Screenshot mode carries no windows.
-            if self.video_mode && !annotation_visible_at(a, self.scrub_pos) { continue; }
-            painter::render_annotation_offset(&mut surf, a, Some(&self.screenshot), shot_off);
-        }
-        if let Some(a) = self.current.as_ref() {
-            painter::render_annotation_offset(&mut surf, a, Some(&self.screenshot), shot_off);
+            let (video, scrub) = (self.video_mode, self.scrub_pos);
+            let anns = self.annotations.iter()
+                .filter(move |a| !video || annotation_visible_at(a, scrub))
+                .chain(self.current.iter());
+            let bounds = pic_bounds.unwrap_or((0, 0, win_w as i32, win_h as i32));
+            painter::render_all(&mut surf, anns,
+                &painter::Pass { source: Some(&self.screenshot), src_offset: shot_off, bounds });
         }
 
         // While typing — show a subtle dashed rectangle around the text
@@ -3299,6 +4410,18 @@ impl Overlay {
             }
         }
 
+        // Highlight in hand: the word a press would take, outlined in the
+        // highlight's color, or a word on what the reading found.
+        if let Some(r) = mark_hover {
+            let c = ((mark_ink.r as u32) << 16) | ((mark_ink.g as u32) << 8) | mark_ink.b as u32;
+            let (x0, y0) = (r.x.floor() as i32 - 3, r.y.floor() as i32 - 2);
+            let (x1, y1) = ((r.x + r.w).ceil() as i32 + 3, (r.y + r.h).ceil() as i32 + 2);
+            draw_dashed_border(&mut buf, win_w, win_h, x0, y0, x1, y1, c);
+        }
+        if let Some(note) = &mark_note {
+            draw_tooltip(&mut buf, win_w, win_h, cursor_bounds, note, mark_note_at.0, mark_note_at.1);
+        }
+
         // Pass 2.5: select-mode highlight — a dashed laser-green box around
         // the picked annotation's painted bounds, with solid corner ticks so
         // it reads as "grabbed" rather than as another region rectangle.
@@ -3321,8 +4444,10 @@ impl Overlay {
             }
         }
 
-        // Pass 3: selection border + 8 handles.
-        if let Some((x0, y0, x1, y1)) = sel_rect {
+        // Pass 3: selection border + 8 handles; TEXT and QR's own look.
+        if let (Some((x0, y0, x1, y1)), Some(look)) = (sel_rect, read_look.as_ref()) {
+            draw_reading_frame(&mut buf, win_w, win_h, (x0, y0, x1 - x0, y1 - y0), look, None);
+        } else if let Some((x0, y0, x1, y1)) = sel_rect {
             const BLUE:  u32 = 0x00_64_95_ED;
             const WHITE: u32 = 0x00_FF_FF_FF;
             draw_rect_border(&mut buf, win_w, win_h, x0, y0, x1, y1, BLUE);
@@ -3330,7 +4455,7 @@ impl Overlay {
             let xm = (x0 + x1) / 2;
             let ym = (y0 + y1) / 2;
             // Handles say "drag me"; a locked selection has nothing to drag.
-            let handles: &[(i32, i32)] = if locked { &[] } else { &[
+            let handles: &[(i32, i32)] = if locked && !crop_in_hand { &[] } else { &[
                 (x0, y0), (xm, y0), (x1.saturating_sub(1), y0),
                 (x0, ym),                     (x1.saturating_sub(1), ym),
                 (x0, y1.saturating_sub(1)), (xm, y1.saturating_sub(1)), (x1.saturating_sub(1), y1.saturating_sub(1)),
@@ -3342,7 +4467,10 @@ impl Overlay {
         }
         // Pass 3.5: the hover highlight's frame and label.
         if let Some((r, label, size)) = &hover {
-            draw_target(&mut buf, win_w, win_h, *r, label, *size);
+            match read_look.as_ref() {
+                Some(look) => draw_reading_frame(&mut buf, win_w, win_h, *r, look, Some(label)),
+                None => draw_target(&mut buf, win_w, win_h, *r, label, *size),
+            }
         }
         // Where the window cannot be cut to shape, an edge so it at least
         // reads as a window over the live desktop.
@@ -3353,8 +4481,11 @@ impl Overlay {
         // Pass 4: dimension chip — small dark pill at bottom-right of the
         // selection showing the locked-in width × height. Visible whenever
         // there's a selection (including mid-drag), matches C# OverlayForm.
-        // Not in the editor window: the size was settled in the picker.
-        if let Some((x, y, w, h)) = self.selection.filter(|_| !self.editor_mode) {
+        // Not in the editor window, where the size was settled in the picker,
+        // except while a crop is dragged: people crop to exact sizes.
+        // TEXT and QR show no size: what is read matters, not how big.
+        if let Some((x, y, w, h)) = self.selection
+            .filter(|_| read_look.is_none() && (!self.editor_mode || self.crop_drag.is_some())) {
             if w > 8 && h > 8 {
                 let lb = sel_bounds.unwrap_or((0, 0, win_w as i32, win_h as i32));
                 draw_dimension_chip(&mut buf, win_w, win_h, lb, x + w, y + h, w as u32, h as u32);
@@ -3369,23 +4500,24 @@ impl Overlay {
         }
         self.last_was_selected = is_selected_now;
 
-        if matches!(self.state,
+        // TEXT and QR read and close: nothing to edit, so no panels.
+        if read_look.is_none() && matches!(self.state,
                     State::Selected | State::Drawing | State::Resizing
                     | State::TextInput | State::MovingAnnotation) {
-            if let Some(sel) = self.selection {
+            if let Some(sel) = panel_sel {
                 let lb = sel_bounds.unwrap_or((0, 0, win_w as i32, win_h as i32));
                 // Record mode is selection-only: no tool column, no glow, no
                 // palette, no per-tool widgets. Just the rectangle and the
                 // two-button action row.
                 if !self.record_mode {
-                    draw_tool_panel(&mut buf, win_w, win_h, lb, sel, self.tool_armed.then_some(self.tool));
+                    draw_tool_panel(&mut buf, win_w, win_h, self.kind.panel_buttons(), lb, sel, self.tool_armed.then_some(self.tool));
                     // Sequential orange-neon halo cycles through every button
                     // (top→bottom, 1 per slot). Mirrors the website's tool-palette
                     // demo so the in-app palette feels alive even when the user
                     // is just hovering. Painted after the panel so the halo sits
                     // on top of the button background but under the icon glyph.
                     let elapsed = self.opened_at.elapsed().as_secs_f32();
-                    draw_tool_panel_glow(&mut buf, win_w, win_h, lb, sel, elapsed);
+                    draw_tool_panel_glow(&mut buf, win_w, win_h, self.kind.panel_buttons(), lb, sel, elapsed);
                 }
                 draw_action_panel(&mut buf, win_w, win_h, lb, sel, actions);
                 // Attention pulse on the action panel when it appears (three
@@ -3493,17 +4625,37 @@ impl Overlay {
         }
 
         let t_chrome = t_start.elapsed();
+        // The scrolling editor: the slice of the page that shows, then the
+        // page map over it, in window pixels.
+        let shown_h = h.get() as usize;
+        let scroll_y = view.map_or(0, |v| v.y);
+        if let Some(v) = view {
+            let start = (v.y as usize * win_w).min(doc.len());
+            let n = (shown_h * win_w).min(doc.len() - start).min(out.len());
+            out[..n].copy_from_slice(&doc[start..start + n]);
+            if let (Some(thumb), Some((_, pic_y, _, pic_h))) = (self.map_thumb.as_ref(), self.picture_rect) {
+                let map = crate::page_map::map_rect(win_w as i32, v.view_h, self.map_left);
+                crate::page_map::draw(&mut out, win_w, shown_h, map, thumb, v, pic_y, pic_h,
+                                      crate::palette::LASER(), self.map_hover || self.map_drag);
+            }
+        }
         // Editor window: cut away every pixel that is still bare canvas.
         if self.editor_mode && crate::window_shape::supported() {
-            let rects = crate::window_shape::drawn_rects(&buf, win_w, win_h, sel_rect, EDITOR_CLEAR);
+            // The whole picture is kept, the cropped-off part too: its dimmed
+            // pixels can match the canvas color and would be cut into holes.
+            let keep = self.picture_rect.map(|(x, y, w, h)| {
+                (x, (y - scroll_y).max(0), x + w, (y + h - scroll_y).min(shown_h as i32))
+            }).or(sel_rect);
+            let rects = crate::window_shape::drawn_rects(&out, win_w, shown_h, keep, EDITOR_CLEAR);
             if rects != self.shape {
                 crate::window_shape::apply(&self.window, &rects);
                 self.shape = rects;
             }
         }
-        if let Err(e) = buf.present() {
+        if let Err(e) = out.present() {
             eprintln!("overlay: buf.present: {e}");
         }
+        self.scroll_doc = doc;
         if !self.shown {
             self.shown = true;
             if crate::reveal::SUPPORTED {
@@ -3553,13 +4705,12 @@ impl Overlay {
 
 // ── tool/action panel layout (mirrors C# OverlayForm.PositionToolbars) ─────
 
-/// Outer width × height of the vertical tool panel (13 buttons + 1 divider).
-fn tool_panel_dims() -> (i32, i32) {
-    let n   = TOOL_PANEL_BUTTONS.len() as i32;
+/// Outer width × height of the vertical tool panel (`buttons` + 1 divider).
+fn tool_panel_dims(buttons: &[ToolPanelButton]) -> (i32, i32) {
+    let n   = buttons.len() as i32;
     let h_buttons = n * PANEL_BTN + (n - 1) * PANEL_GAP;
-    // A 1-px divider sits between the 9 tool buttons and the 4 utility
-    // buttons (color / thickness / undo / redo). Two extra group-gaps add
-    // breathing room above and below the divider line.
+    // A 1-px divider sits between the tools and Undo / Redo. Two extra
+    // group-gaps add breathing room above and below the divider line.
     let extra = PANEL_GROUP_GAP * 2 + 1;
     let w = PANEL_BTN + PANEL_PAD * 2;
     let h = h_buttons + extra + PANEL_PAD * 2;
@@ -3581,10 +4732,10 @@ fn action_panel_dims(buttons: &[ActionButton]) -> (i32, i32) {
 /// not the whole framebuffer — on a multi-monitor overlay clamping against
 /// the framebuffer would let the panel drift onto the monitor next door
 /// instead of flipping to the other side of the selection.
-fn tool_panel_origin(bounds: (i32, i32, i32, i32), sel: (i32, i32, i32, i32)) -> (i32, i32) {
+fn tool_panel_origin(buttons: &[ToolPanelButton], bounds: (i32, i32, i32, i32), sel: (i32, i32, i32, i32)) -> (i32, i32) {
     let (bx, by, bw, bh) = bounds;
     let (sx, sy, sw, sh) = sel;
-    let (pw, ph) = tool_panel_dims();
+    let (pw, ph) = tool_panel_dims(buttons);
     let mut tx = sx + sw + 5;
     // Bottom-aligned with the selection, beside the action row: on a short
     // capture the column grows upward past it rather than hanging far
@@ -3774,12 +4925,12 @@ fn action_panel_origin(
 
 /// Rectangle for the i-th tool-panel button. Index above the divider
 /// position skips one slot to leave room for the line.
-fn tool_panel_button_rect(panel_origin: (i32, i32), idx: i32) -> (i32, i32, i32, i32) {
+fn tool_panel_button_rect(buttons: &[ToolPanelButton], panel_origin: (i32, i32), idx: i32) -> (i32, i32, i32, i32) {
     let (ox, oy) = panel_origin;
     let x = ox + PANEL_PAD;
-    // Indices 0..9 are the 9 tools. Index 9..13 are utility buttons that
-    // sit *below* the divider (extra group gap + 1px line + group gap).
-    let above_divider = idx < 9;
+    // The tools come first; Undo and Redo sit *below* the divider (extra
+    // group gap + 1px line + group gap).
+    let above_divider = idx < tool_count(buttons);
     let extra = if above_divider { 0 } else { PANEL_GROUP_GAP * 2 + 1 };
     let y = oy + PANEL_PAD + idx * (PANEL_BTN + PANEL_GAP) + extra;
     (x, y, x + PANEL_BTN, y + PANEL_BTN)
@@ -3792,9 +4943,9 @@ fn action_panel_button_rect(panel_origin: (i32, i32), idx: i32) -> (i32, i32, i3
     (x, y, x + PANEL_BTN, y + PANEL_BTN)
 }
 
-fn tool_panel_hit(panel_origin: (i32, i32), (cx, cy): (i32, i32)) -> Option<(usize, ToolPanelButton)> {
-    for (i, b) in TOOL_PANEL_BUTTONS.iter().enumerate() {
-        let (x0, y0, x1, y1) = tool_panel_button_rect(panel_origin, i as i32);
+fn tool_panel_hit(buttons: &[ToolPanelButton], panel_origin: (i32, i32), (cx, cy): (i32, i32)) -> Option<(usize, ToolPanelButton)> {
+    for (i, b) in buttons.iter().enumerate() {
+        let (x0, y0, x1, y1) = tool_panel_button_rect(buttons, panel_origin, i as i32);
         if cx >= x0 && cx < x1 && cy >= y0 && cy < y1 {
             return Some((i, *b));
         }
@@ -3822,6 +4973,7 @@ fn draw_tool_panel(
     buf:        &mut [u32],
     win_w:      usize,
     win_h:      usize,
+    buttons:    &[ToolPanelButton],
     bounds:     (i32, i32, i32, i32),
     sel:        (i32, i32, i32, i32),
     // The tool in hand, if any: no button is lit while none is.
@@ -3833,16 +4985,16 @@ fn draw_tool_panel(
     const TEXT:       u32 = 0x00_E8_E8_EC;
     const DIVIDER:    u32 = 0x00_44_44_48;
 
-    let (ox, oy) = tool_panel_origin(bounds, sel);
-    let (pw, ph) = tool_panel_dims();
+    let (ox, oy) = tool_panel_origin(buttons, bounds, sel);
+    let (pw, ph) = tool_panel_dims(buttons);
     draw_rounded_rect(buf, win_w, win_h, ox, oy, ox + pw, oy + ph, PANEL_RADIUS, BG);
 
-    // Divider sits between buttons 8 (Pixelate) and 9 (Undo).
-    let div_y = oy + PANEL_PAD + 9 * (PANEL_BTN + PANEL_GAP) + PANEL_GROUP_GAP;
+    // Divider sits between the last tool and Undo.
+    let div_y = oy + PANEL_PAD + tool_count(buttons) * (PANEL_BTN + PANEL_GAP) + PANEL_GROUP_GAP;
     draw_filled_rect(buf, win_w, win_h, ox + 6, div_y, ox + pw - 6, div_y + 1, DIVIDER);
 
-    for (i, b) in TOOL_PANEL_BUTTONS.iter().enumerate() {
-        let (x0, y0, x1, y1) = tool_panel_button_rect((ox, oy), i as i32);
+    for (i, b) in buttons.iter().enumerate() {
+        let (x0, y0, x1, y1) = tool_panel_button_rect(buttons, (ox, oy), i as i32);
         let highlight = match b {
             ToolPanelButton::Tool(t) => active == Some(*t),
             _ => false,
@@ -3869,11 +5021,12 @@ fn draw_tool_panel_glow(
     buf:     &mut [u32],
     win_w:   usize,
     win_h:   usize,
+    buttons: &[ToolPanelButton],
     bounds:  (i32, i32, i32, i32),
     sel:     (i32, i32, i32, i32),
     elapsed: f32,
 ) {
-    let n = TOOL_PANEL_BUTTONS.len() as f32;       // 13
+    let n = buttons.len() as f32;
     let slot = 1.0_f32;                            // 1 second per button
     let cycle = n * slot;                          // 13 s total
     let t = elapsed.rem_euclid(cycle);
@@ -3889,8 +5042,8 @@ fn draw_tool_panel_glow(
               else if phase < 0.55 { 1.0 }
               else { ((0.85 - phase) / 0.30).max(0.0) };
 
-    let panel_origin = tool_panel_origin(bounds, sel);
-    let (x0, y0, x1, y1) = tool_panel_button_rect(panel_origin, active_idx);
+    let panel_origin = tool_panel_origin(buttons, bounds, sel);
+    let (x0, y0, x1, y1) = tool_panel_button_rect(buttons, panel_origin, active_idx);
 
     // Orange-neon palette. Outer rings are progressively fainter so the halo
     // reads as a soft glow rather than a hard frame around the button.
@@ -4067,6 +5220,16 @@ struct FlyoutFrame {
     picking: bool,
     /// Where the color was last picked in the spectrum, for its marker.
     spectrum_pick: Option<(f32, f32)>,
+    /// Step: its look and the part the colors paint.
+    step: Option<(framefang_core::step::StepLook, framefang_core::step::StepPart)>,
+    /// Highlight: the look its next highlight takes.
+    mark: Option<framefang_core::mark::MarkLook>,
+}
+
+/// The tile's number in Step's panel: its place, but a pill shows two
+/// digits, since one makes it a plain round.
+fn step_tile_number(i: usize) -> u32 {
+    if framefang_core::step::StepShape::ALL[i] == framefang_core::step::StepShape::Pill { 12 } else { i as u32 + 1 }
 }
 
 fn draw_flyout(buf: &mut [u32], win_w: usize, win_h: usize, f: &FlyoutFrame) {
@@ -4097,6 +5260,70 @@ fn draw_flyout(buf: &mut [u32], win_w: usize, win_h: usize, f: &FlyoutFrame) {
         crate::painter::draw_unicode_text(&mut surf, x, y, FLYOUT_TEXT_PX, words, text(c));
     };
     let width = |words: &str| framefang_core::text::layout(words, FLYOUT_TEXT_PX).width();
+
+    if let (Some(tiles), Some(look)) = (&f.layout.mark, f.mark) {
+        for (i, r) in tiles.iter().enumerate() {
+            let style = framefang_core::mark::MarkStyle::ALL[i];
+            if style == look.style {
+                draw_rounded_rect(&mut s, sw, sh, r.0 - 2, r.1 - 2, r.0 + r.2 + 2, r.1 + r.3 + 2, 8, VALUE);
+                draw_rounded_rect(&mut s, sw, sh, r.0, r.1, r.0 + r.2, r.1 + r.3, 6, BG);
+            }
+            let inset = if style == look.style { 1 } else { 0 };
+            let tile = (r.0 + inset, r.1 + inset, r.2 - 2 * inset, r.3 - 2 * inset);
+            draw_mark_tile(&mut s, fw, fh, tile, &framefang_core::mark::MarkLook { style, seed: 3 + i as u32, ..look });
+        }
+    }
+
+    if let (Some(panel), Some((look, part))) = (&f.layout.step, f.step) {
+        use framefang_core::step::{StepPart, StepShape};
+        const TILE: u32 = 0x00_1A_1A_1D;
+        // The shapes, each drawn as it would come out; the picked one as it
+        // is, ringed like a picked swatch.
+        for (i, r) in panel.tiles.iter().enumerate() {
+            let shape = StepShape::ALL[i];
+            let picked = shape == look.shape;
+            if picked {
+                draw_rounded_rect(&mut s, sw, sh, r.0 - 2, r.1 - 2, r.0 + r.2 + 2, r.1 + r.3 + 2, 8, VALUE);
+                draw_rounded_rect(&mut s, sw, sh, r.0, r.1, r.0 + r.2, r.1 + r.3, 6, BG);
+                draw_rounded_rect(&mut s, sw, sh, r.0 + 1, r.1 + 1, r.0 + r.2 - 1, r.1 + r.3 - 1, 5, TILE);
+            } else {
+                draw_rounded_rect(&mut s, sw, sh, r.0, r.1, r.0 + r.2, r.1 + r.3, 6, TILE);
+            }
+            let shown = if picked { look } else { look.with_shape(shape) };
+            let n = step_tile_number(i);
+            let (l, t, rr, b) = framefang_core::step::extent(n, &shown);
+            let cx = r.0 as f32 + r.2 as f32 / 2.0 - (l + rr) / 2.0;
+            let cy = r.1 as f32 + r.3 as f32 / 2.0 - (t + b) / 2.0;
+            let mut surf = crate::painter::U32Surface { buf: &mut s, stride: fw, height: fh };
+            crate::painter::step_marker(&mut surf, framefang_core::annotation::Point2::new(cx.round(), cy.round()), n, &shown);
+        }
+        // Which part the colors below paint: each with a dot of its color.
+        for (i, r) in panel.parts.iter().enumerate() {
+            let p = StepPart::ALL[i];
+            let usable = p != StepPart::Ring || look.shape.has_ring();
+            let on = p == part && usable;
+            draw_rounded_rect(&mut s, sw, sh, r.0, r.1, r.0 + r.2, r.1 + r.3, 5, if on { BTN_ARMED } else { BTN });
+            let label_w = width(p.label());
+            let dot = 10;
+            let total = dot + 6 + label_w.round() as i32;
+            let x = r.0 + (r.2 - total) / 2;
+            if usable {
+                let dy = r.1 + (r.3 - dot) / 2;
+                draw_rounded_rect(&mut s, sw, sh, x - 1, dy - 1, x + dot + 1, dy + dot + 1, 6, EDGE);
+                draw_rounded_rect(&mut s, sw, sh, x, dy, x + dot, dy + dot, 5, rgb(look.part(p)));
+            }
+            let words = if usable { VALUE } else { REST };
+            write(&mut s, *r, (x + dot + 6) as f32, p.label(), words);
+        }
+        // The shadow switch.
+        let r = panel.shadow;
+        write(&mut s, r, (r.0 + 2) as f32, "Shadow", LABEL);
+        let (kx, ky, kw, kh) = step_shadow_switch(r);
+        draw_rounded_rect(&mut s, sw, sh, kx, ky, kx + kw, ky + kh, kh / 2, if look.shadow { BTN_ARMED } else { GROOVE });
+        let knob = kh - 6;
+        let nx = if look.shadow { kx + kw - 3 - knob } else { kx + 3 };
+        draw_rounded_rect(&mut s, sw, sh, nx, ky + 3, nx + knob, ky + 3 + knob, knob / 2, if look.shadow { VALUE } else { REST });
+    }
 
     if let Some((prev, next, name, swatches)) = &f.layout.colors {
         for (r, left) in [(prev, true), (next, false)] {
@@ -4370,14 +5597,9 @@ fn draw_tooltip(
     y:      i32,
 ) {
     use crate::palette::*;
-    let scale = 2;
-    let text_w = crate::keycap::line_width(label, scale);
-    let text_h = crate::keycap::line_height(label, scale);
-    const BAR_W: i32 = 3;
-    let pad_x  = 10;
-    let pad_y  = 6;
-    let chip_w = BAR_W + text_w + pad_x * 2;
-    let chip_h = text_h + pad_y * 2;
+    let scale = TOOLTIP_SCALE;
+    let (chip_w, chip_h) = tooltip_size(label);
+    let (pad_x, bar_w) = (TOOLTIP_PAD_X, TOOLTIP_BAR_W);
     // Auto-flip so the chip stays on the monitor it belongs to.
     let (bx, by, bw, bh) = bounds;
     let mut x0 = x;
@@ -4390,9 +5612,49 @@ fn draw_tooltip(
     let y1 = y0 + chip_h;
     draw_filled_rect(buf, win_w, win_h, x0, y0, x1, y1, 0x00_00_00_00);
     draw_rect_border(buf, win_w, win_h, x0, y0, x1, y1, LASER_DIM());
-    draw_filled_rect(buf, win_w, win_h, x0, y0, x0 + BAR_W, y1, LASER());
+    draw_filled_rect(buf, win_w, win_h, x0, y0, x0 + bar_w, y1, LASER());
     let text_y = y0 + (chip_h - crate::bitmap_font::GLYPH_H * scale) / 2;
-    crate::keycap::draw_line(buf, win_w, win_h, x0 + BAR_W + pad_x, text_y, label, scale, TEXT_BRIGHT);
+    crate::keycap::draw_line(buf, win_w, win_h, x0 + bar_w + pad_x, text_y, label, scale, TEXT_BRIGHT);
+}
+
+const TOOLTIP_SCALE: i32 = 2;
+const TOOLTIP_BAR_W: i32 = 3;
+const TOOLTIP_PAD_X: i32 = 10;
+const TOOLTIP_PAD_Y: i32 = 6;
+/// Between a tooltip and the button it names.
+const TOOLTIP_GAP: i32 = 4;
+
+/// Where the tip for a tool-panel button goes: level with the button, clear
+/// of the whole panel, on its right, or its left when the right has no room.
+fn tool_tip_spot(button: Rect4, panel: Rect4, label: &str, bounds: Rect4) -> (i32, i32) {
+    let (w, h) = tooltip_size(label);
+    let (bx, by, bw, bh) = bounds;
+    let y = (button.1 + button.3 / 2 - h / 2).clamp(by + 4, (by + bh - h - 4).max(by + 4));
+    let right = panel.0 + panel.2 + TOOLTIP_GAP;
+    let left = panel.0 - TOOLTIP_GAP - w;
+    let x = if right + w <= bx + bw - 4 { right } else if left >= bx + 4 { left } else { right };
+    (x, y)
+}
+
+/// How big a tooltip chip is for `label`.
+fn tooltip_size(label: &str) -> (i32, i32) {
+    let text_w = crate::keycap::line_width(label, TOOLTIP_SCALE);
+    let text_h = crate::keycap::line_height(label, TOOLTIP_SCALE);
+    (TOOLTIP_BAR_W + text_w + TOOLTIP_PAD_X * 2, text_h + TOOLTIP_PAD_Y * 2)
+}
+
+/// Where the tip for an action-panel button goes: centered on the button,
+/// just under the whole panel, or just over it when the screen ends below
+/// (Brandon 2026-11-20: tips at the pointer overlapped the buttons; then
+/// "underneath it and not overlapping it").
+fn action_tip_spot(button: Rect4, panel: Rect4, label: &str, bounds: Rect4) -> (i32, i32) {
+    let (w, h) = tooltip_size(label);
+    let (bx, by, bw, bh) = bounds;
+    let x = (button.0 + button.2 / 2 - w / 2).clamp(bx + 4, (bx + bw - w - 4).max(bx + 4));
+    let below = panel.1 + panel.3 + TOOLTIP_GAP;
+    let above = panel.1 - TOOLTIP_GAP - h;
+    let y = if below + h <= by + bh { below } else if above >= by { above } else { below.min(by + bh - h) };
+    (x, y)
 }
 
 /// The capture dock's animation frame, as far as how it looks goes: the
@@ -4548,6 +5810,151 @@ fn draw_target(buf: &mut [u32], win_w: usize, win_h: usize, r: Rect4, label: &st
                                       framefang_core::color::Rgba::new_opaque(0xFF, 0xFF, 0xFF));
     crate::painter::draw_unicode_text(&mut surf, tx + (name_w + 12) as f32, ty, FLYOUT_TEXT_PX, &dims,
                                       framefang_core::color::Rgba::new_opaque(0xD8, 0xE3, 0xFA));
+}
+
+/// How often the reading look's scan line steps, and one pass of it down
+/// the box.
+const READ_STEP: std::time::Duration = std::time::Duration::from_millis(40);
+const READ_SCAN: std::time::Duration = std::time::Duration::from_millis(900);
+
+/// What the reading look draws this frame.
+#[derive(Debug, Clone, Copy)]
+struct ReadLook {
+    kind: crate::pick::Look,
+    /// The prompt's cursor is on.
+    cursor_on: bool,
+    /// How long the picture has been read, once it is.
+    reading: Option<std::time::Duration>,
+    /// QR: what a link will do, `(opens, the setting opens)`, so the tag
+    /// can say when letting go now does something other than copy.
+    links: (bool, bool),
+}
+
+/// The prompt that names a reading mode. QR adds a flag, like a command
+/// line, when its links will not just be copied: `--open` while they open,
+/// `--copy` while the switch key makes an Open setting copy.
+/// SCROLL mode's word beside the highlight: what a click does there (the
+/// part that scrolls lights up, or the whole window when nothing does).
+const SCROLL_HINT: &str = "click, then scroll it yourself";
+
+fn read_prompt(kind: crate::pick::Look, (opens, setting_opens): (bool, bool)) -> &'static str {
+    use crate::pick::Look;
+    match kind {
+        Look::Text => "> OCR",
+        Look::Qr if opens => "> QR --open",
+        Look::Qr if setting_opens => "> QR --copy",
+        Look::Qr => "> QR",
+        Look::Scroll => "> SCROLL",
+    }
+}
+
+/// A black tag in the HUD look: `prompt` in the accent at the bitmap
+/// font's size, a block cursor after it when `cursor`, then `name` a step
+/// quieter. Its top left at `(x, y)`, kept on the window. Returns its size.
+fn draw_prompt_tag(
+    buf: &mut [u32], win_w: usize, win_h: usize,
+    x: i32, y: i32, prompt: &str, cursor: bool, name: Option<&str>,
+) -> (i32, i32) {
+    use crate::palette::*;
+    const SCALE: i32 = 2;
+    const PAD_X: i32 = 8;
+    const PAD_Y: i32 = 6;
+    let th = crate::bitmap_font::GLYPH_H * SCALE;
+    let cursor_w = crate::bitmap_font::GLYPH_W * SCALE;
+    let prompt_w = crate::bitmap_font::measure(prompt, SCALE);
+    let name = name.filter(|n| !n.is_empty());
+    let name_w = name.map_or(0, |n| framefang_core::text::layout(n, FLYOUT_TEXT_PX).width().ceil() as i32);
+    // The dock's gap before its cursor, so it reads as a cursor and not as
+    // part of the last letter.
+    const CURSOR_GAP: i32 = 8;
+    let w = PAD_X * 2 + prompt_w + CURSOR_GAP + cursor_w + name.map_or(0, |_| 12 + name_w);
+    let h = th + PAD_Y * 2;
+    let x = x.clamp(0, (win_w as i32 - w).max(0));
+    let y = y.clamp(0, (win_h as i32 - h).max(0));
+    draw_filled_rect(buf, win_w, win_h, x, y, x + w, y + h, 0x00_00_00_00);
+    draw_rect_border(buf, win_w, win_h, x, y, x + w, y + h, LASER_DIM());
+    let (tx, ty) = (x + PAD_X, y + PAD_Y);
+    {
+        let mut surf = crate::painter::U32Surface { buf: &mut *buf, stride: win_w as i32, height: win_h as i32 };
+        crate::painter::draw_text(&mut surf, tx, ty, SCALE, prompt, rgba(LASER()));
+    }
+    let cx = tx + prompt_w + CURSOR_GAP;
+    if cursor {
+        draw_filled_rect(buf, win_w, win_h, cx, ty, cx + cursor_w, ty + th, LASER());
+    }
+    if let Some(n) = name {
+        let ny = y as f32 + (h as f32 - framefang_core::text::line_height(FLYOUT_TEXT_PX)) / 2.0;
+        let mut surf = crate::painter::U32Surface { buf, stride: win_w as i32, height: win_h as i32 };
+        crate::painter::draw_unicode_text(&mut surf, (cx + cursor_w + 12) as f32, ny, FLYOUT_TEXT_PX, n, rgba(TEXT_MUTED()));
+    }
+    (w, h)
+}
+
+/// TEXT and QR's look, for the selection and the hover highlight: a dashed
+/// accent outline with solid corner brackets, a terminal prompt naming the
+/// mode above its top left ("> OCR" and a blinking cursor, then the
+/// window's name for a highlight), a small reticle in the middle for QR,
+/// and while the picture is read a scan line passing down it and
+/// "reading..." under it.
+fn draw_reading_frame(
+    buf: &mut [u32], win_w: usize, win_h: usize, r: Rect4, look: &ReadLook, name: Option<&str>,
+) {
+    use crate::palette::*;
+    if r.2 <= 0 || r.3 <= 0 { return; }
+    let (x0, y0, x1, y1) = (r.0, r.1, r.0 + r.2, r.1 + r.3);
+    let accent = LASER();
+    // The scan line, a soft tail above it, under the outline.
+    if let Some(t) = look.reading {
+        let k = (t.as_millis() % READ_SCAN.as_millis()) as f32 / READ_SCAN.as_millis() as f32;
+        let line_y = y0 + (k * r.3 as f32) as i32;
+        const TAIL: i32 = 22;
+        let ya = (line_y - TAIL).max(y0).max(0);
+        let yb = line_y.min(y1 - 1).min(win_h as i32 - 1);
+        for py in ya..=yb {
+            let a = 0.5 * (1.0 - (line_y - py) as f32 / TAIL as f32).powi(2);
+            let a = if py == line_y { 0.85 } else { a };
+            for px in x0.max(0)..x1.min(win_w as i32) {
+                let i = py as usize * win_w + px as usize;
+                buf[i] = mix_rgb(buf[i], accent, a);
+            }
+        }
+    }
+    draw_dashed_border(buf, win_w, win_h, x0, y0, x1, y1, accent);
+    // Corner brackets: where the box ends reads at a glance on any picture.
+    let arm = 12.min(r.2 / 2).min(r.3 / 2);
+    for (cx, cy, dx, dy) in [(x0, y0, 1, 1), (x1 - 1, y0, -1, 1), (x0, y1 - 1, 1, -1), (x1 - 1, y1 - 1, -1, -1)] {
+        let (hx0, hx1) = if dx > 0 { (cx, cx + arm) } else { (cx - arm + 1, cx + 1) };
+        let (vy0, vy1) = if dy > 0 { (cy, cy + arm) } else { (cy - arm + 1, cy + 1) };
+        let (ty0, ty1) = if dy > 0 { (cy, cy + 2) } else { (cy - 1, cy + 1) };
+        let (lx0, lx1) = if dx > 0 { (cx, cx + 2) } else { (cx - 1, cx + 1) };
+        draw_filled_rect(buf, win_w, win_h, hx0, ty0, hx1, ty1, accent);
+        draw_filled_rect(buf, win_w, win_h, lx0, vy0, lx1, vy1, accent);
+    }
+    // QR: a reticle in the middle, gapped so it never hides the code's center.
+    if look.kind == crate::pick::Look::Qr && r.2 > 60 && r.3 > 60 {
+        let (mx, my) = (x0 + r.2 / 2, y0 + r.3 / 2);
+        let dim = LASER_DIM();
+        draw_filled_rect(buf, win_w, win_h, mx - 16, my, mx - 5, my + 1, dim);
+        draw_filled_rect(buf, win_w, win_h, mx + 5, my, mx + 16, my + 1, dim);
+        draw_filled_rect(buf, win_w, win_h, mx, my - 16, mx + 1, my - 5, dim);
+        draw_filled_rect(buf, win_w, win_h, mx, my + 5, mx + 1, my + 16, dim);
+    }
+    // The prompt sits on the box's top edge, outside it; a box at the top
+    // of the screen has no room above, so it hangs just inside.
+    let tag_h = crate::bitmap_font::GLYPH_H * 2 + 12;
+    let tag_y = if y0 - tag_h - 4 >= 0 { y0 - tag_h - 4 } else { y0 + 4 };
+    let tag_x = if y0 - tag_h - 4 >= 0 { x0 } else { x0 + 4 };
+    draw_prompt_tag(buf, win_w, win_h, tag_x, tag_y, read_prompt(look.kind, look.links),
+                    look.cursor_on && look.reading.is_none(), name);
+    // Under the box while it is read: "reading", its dots counting.
+    if let Some(t) = look.reading {
+        let dots = (t.as_millis() / 300) as usize % 4;
+        // Padded, so the tag keeps one width as the dots count.
+        let line = format!("reading{}{}", ".".repeat(dots), " ".repeat(3 - dots));
+        let below = y1 + 4 + tag_h <= win_h as i32;
+        let (sx, sy) = if below { (x0, y1 + 4) } else { (x0 + 4, y1 - tag_h - 4) };
+        draw_prompt_tag(buf, win_w, win_h, sx, sy, &line, false, None);
+    }
 }
 
 /// Bare modifier presses — winit delivers these as ordinary key events, and
@@ -4837,7 +6244,7 @@ fn rect_from(a: (i32, i32), b: (i32, i32)) -> (i32, i32, i32, i32) {
     (x, y, w, h)
 }
 
-fn crop(
+pub(crate) fn crop(
     src: &ImageBuffer<Rgba<u8>, Vec<u8>>,
     (x, y, w, h): (i32, i32, i32, i32),
 ) -> ImageBuffer<Rgba<u8>, Vec<u8>> {
@@ -5074,7 +6481,7 @@ mod tests {
             }).collect();
             for (i, (record, current, hovered, anim)) in frames.iter().enumerate() {
                 let band = (0, 40 + i as i32 * 120, w as i32, 100 + crate::pick::DOCK_MARGIN);
-                let dock = crate::pick::dock_layout(band, PickMode::offered(2), *record);
+                let dock = crate::pick::dock_layout(band, &PickMode::offered(2, !*record), *record);
                 draw_dock(&mut buf, w, h, &dock, *current, *hovered, anim);
             }
             draw_tooltip(&mut buf, w, h, (0, 0, w as i32, h as i32), "Undo [Ctrl]+[Z]", 40, 4);
@@ -5088,6 +6495,69 @@ mod tests {
             let name = format!("../../target/capture-ui-{}.png", scheme.name().to_lowercase());
             img.save(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(name)).unwrap();
         }
+    }
+
+    /// Writes `target/editor-tools.png`: the editor's tool column with the
+    /// new tools, and a spotlight, a lens and an arrow on a sample picture.
+    #[test]
+    #[ignore]
+    fn render_editor_tools_to_png() {
+        use framefang_core::annotation::{Annotation, Point2, Stroke};
+        let (w, h) = (900usize, 640usize);
+        // A busy picture: text-like stripes and blocks.
+        let mut pic = ImageBuffer::from_fn(w as u32, h as u32, |x, y| {
+            let base = if (x / 120 + y / 90) % 2 == 0 { [235u8, 238, 242, 255] } else { [210, 220, 235, 255] };
+            if y % 22 < 3 && x % 300 < 240 { Rgba([40, 50, 70, 255]) } else { Rgba(base) }
+        });
+        let stroke = Stroke { color: framefang_core::color::Rgba::new_opaque(255, 60, 90), thickness: 4.0 };
+        let mut spot = Annotation::spotlight(Point2::new(80.0, 120.0));
+        spot.extend(Point2::new(420.0, 330.0));
+        let mut lens = Annotation::magnify(stroke, Point2::new(560.0, 200.0), 2);
+        lens.extend(Point2::new(640.0, 200.0));
+        let mut arrow = Annotation::arrow(stroke, Point2::new(520.0, 480.0));
+        arrow.extend(Point2::new(400.0, 330.0));
+        let list = [spot, lens, arrow];
+        let pristine = pic.clone();
+        painter::render_all(&mut painter::ImageSurface(&mut pic), list.iter(),
+            &painter::Pass { source: Some(&pristine), src_offset: (0, 0), bounds: (0, 0, 760, h as i32) });
+        let mut buf: Vec<u32> = pic.pixels().map(|p| ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | p[2] as u32).collect();
+        draw_tool_panel(&mut buf, w, h, &EDITOR_BUTTONS, (0, 0, w as i32, h as i32), (20, 20, 760, 600), Some(Tool::Magnify));
+        let img = image::RgbImage::from_fn(w as u32, h as u32, |x, y| {
+            let p = buf[y as usize * w + x as usize];
+            image::Rgb([(p >> 16) as u8, (p >> 8) as u8, p as u8])
+        });
+        img.save(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/editor-tools.png")).unwrap();
+    }
+
+    /// Writes target/reading-look.png: TEXT and QR's look on a dimmed
+    /// sample screen. A highlight with its window's name, a TEXT box being
+    /// read, a QR box with its reticle, and a box at the screen's top.
+    #[test]
+    #[ignore]
+    fn render_reading_look_to_png() {
+        use crate::pick::Look as ReadKind;
+        use std::time::Duration;
+        let (w, h) = (1100usize, 620usize);
+        let mut buf: Vec<u32> = (0..w * h).map(|i| {
+            let (x, y) = (i % w, i / w);
+            let base = if (x / 140 + y / 100) % 2 == 0 { 0x00_3A_3D_44 } else { 0x00_30_34_3C };
+            if y % 24 < 3 && x % 320 < 250 { 0x00_6A_70_80 } else { base }
+        }).collect();
+        let copy = (false, false);
+        let idle_text = ReadLook { kind: ReadKind::Text, cursor_on: true, reading: None, links: copy };
+        draw_reading_frame(&mut buf, w, h, (40, 70, 300, 180), &idle_text, Some("Notepad"));
+        let reading = ReadLook { kind: ReadKind::Text, cursor_on: false, reading: Some(Duration::from_millis(560)), links: copy };
+        draw_reading_frame(&mut buf, w, h, (400, 70, 320, 200), &reading, None);
+        let qr = ReadLook { kind: ReadKind::Qr, cursor_on: true, reading: None, links: (true, false) };
+        draw_reading_frame(&mut buf, w, h, (780, 70, 220, 220), &qr, None);
+        let qr_read = ReadLook { kind: ReadKind::Qr, cursor_on: false, reading: Some(Duration::from_millis(320)), links: (false, true) };
+        draw_reading_frame(&mut buf, w, h, (40, 360, 260, 200), &qr_read, None);
+        draw_reading_frame(&mut buf, w, h, (420, 0, 400, 140), &idle_text, None);
+        let img = image::RgbImage::from_fn(w as u32, h as u32, |x, y| {
+            let p = buf[y as usize * w + x as usize];
+            image::Rgb([(p >> 16) as u8, (p >> 8) as u8, p as u8])
+        });
+        img.save(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/reading-look.png")).unwrap();
     }
 
     #[test]
@@ -5110,7 +6580,7 @@ mod tests {
         let (bounds, sel) = ((0, 0, w as i32, h as i32), (300, 150, 300, 300));
         let lit = |active: Option<Tool>| {
             let mut buf = vec![0u32; w * h];
-            draw_tool_panel(&mut buf, w, h, bounds, sel, active);
+            draw_tool_panel(&mut buf, w, h, &EDITOR_BUTTONS, bounds, sel, active);
             buf.iter().filter(|&&p| p == 0x00_64_95_ED).count()
         };
         assert_eq!(lit(None), 0);
@@ -5132,13 +6602,19 @@ mod tests {
     #[test]
     fn the_editor_opens_with_the_picture_where_it_was() {
         let m = monitor(0, 0, 2560, 1440);
-        let p = editor_placement((600, 350, 900, 600), m).unwrap();
+        // A picture taller than the tool column.
+        let (tp_w, tp_h) = tool_panel_dims(&EDITOR_BUTTONS);
+        let p = editor_placement((600, 350, 900, tp_h + 80), m).unwrap();
         let on_screen = (p.pos.0 + p.picture_at.0, p.pos.1 + p.picture_at.1);
         assert_eq!(on_screen, (600, 350));
         assert_eq!(p.picture_at, (EDITOR_EDGE, EDITOR_EDGE));
         // Room for the tool column on the right and the action row below.
-        let (tp_w, _) = tool_panel_dims();
         assert!(p.size.0 as i32 >= EDITOR_EDGE + 900 + 5 + tp_w);
+        // A shorter one gets room above it for the rest of the column, and
+        // still opens where it was.
+        let p = editor_placement((600, 800, 900, 200), m).unwrap();
+        assert_eq!((p.pos.0 + p.picture_at.0, p.pos.1 + p.picture_at.1), (600, 800));
+        assert_eq!(p.picture_at.1, EDITOR_EDGE + tp_h - 200);
     }
 
     #[test]
@@ -5151,27 +6627,28 @@ mod tests {
         assert!(p.pos.0 >= -1080 && p.pos.1 >= -801);
         assert!(p.pos.1 + p.size.1 as i32 <= -801 + 1920);
         // A short picture still gets a window tall enough for the tool column.
-        let (_, tp_h) = tool_panel_dims();
+        let (_, tp_h) = tool_panel_dims(&EDITOR_BUTTONS);
         assert!(p.size.1 as i32 >= tp_h + EDITOR_EDGE * 2);
     }
 
     #[test]
     fn the_tools_stand_on_the_pictures_bottom_right_corner() {
-        let (_, tp_h) = tool_panel_dims();
+        let b = &EDITOR_BUTTONS;
+        let (_, tp_h) = tool_panel_dims(b);
         // A short picture: the column ends level with its bottom and the
         // window makes room above for the rest of it.
         let m = monitor(0, 0, 2560, 1440);
         let p = editor_placement((600, 700, 300, 120), m).unwrap();
         assert_eq!((p.pos.0 + p.picture_at.0, p.pos.1 + p.picture_at.1), (600, 700), "the picture stays put");
         let sel = (p.picture_at.0, p.picture_at.1, 300, 120);
-        let (_, ty) = tool_panel_origin((0, 0, p.size.0 as i32, p.size.1 as i32), sel);
+        let (_, ty) = tool_panel_origin(b, (0, 0, p.size.0 as i32, p.size.1 as i32), sel);
         assert_eq!(ty + tp_h, sel.1 + sel.3, "bottom-aligned with the picture");
         assert!(ty >= 0, "inside the window");
         // A tall selection on the frozen desktop: the same, not its top.
-        let (_, ty) = tool_panel_origin((0, 0, 2560, 1440), (100, 100, 900, 1000));
+        let (_, ty) = tool_panel_origin(b, (0, 0, 2560, 1440), (100, 100, 900, 1000));
         assert_eq!(ty + tp_h, 1100);
         // Near the top of the screen the column is held on it and runs down.
-        let (_, ty) = tool_panel_origin((0, 0, 2560, 1440), (100, 10, 400, 80));
+        let (_, ty) = tool_panel_origin(b, (0, 0, 2560, 1440), (100, 10, 400, 80));
         assert_eq!(ty, 0);
     }
 
@@ -5202,7 +6679,9 @@ mod tests {
     #[test]
     fn every_tool_has_a_flyout_with_what_it_uses() {
         use framefang_core::tool::Tool as T;
-        for t in framefang_core::tool::Tool::ALL {
+        // Spotlight and Crop have nothing to set, so they open no flyout at
+        // all (`has_flyout`); every other tool's flyout holds something.
+        for t in framefang_core::tool::Tool::ALL.into_iter().filter(|t| has_flyout(*t)) {
             let l = flyout_layout(t);
             assert!(!l.knobs.is_empty() || l.colors.is_some(), "{t:?} has an empty flyout");
             // Everything sits inside the flyout.
@@ -5245,9 +6724,160 @@ mod tests {
         s.set_tool_style(T::Pen, framefang_core::settings::ToolStyle { color_argb: pure_red.to_argb(), thickness: 3.0 });
         assert_eq!(stroke_for(&s, T::Pen).color, framefang_core::annotation::Palettes::ALL[0].colors[0]);
         s.last_tool = "Marker".into();
-        assert_eq!(opening_tool(&s), T::Marker);
+        assert_eq!(opening_tool(&s, SessionKind::Editor), T::Marker);
         s.last_tool = "Nonsense".into();
-        assert_eq!(opening_tool(&s), T::Pen);
+        assert_eq!(opening_tool(&s, SessionKind::Editor), T::Pen);
+    }
+
+    #[test]
+    fn each_session_shows_its_tools_and_never_opens_on_a_hidden_one() {
+        use framefang_core::tool::Tool as T;
+        let mut s = AppSettings::default();
+        // A video frame has no lens or spotlight: it opens on the Pen.
+        s.last_tool = "Magnify".into();
+        assert_eq!(opening_tool(&s, SessionKind::Video), T::Pen);
+        assert_eq!(opening_tool(&s, SessionKind::Editor), T::Magnify);
+        // Crop is never the opening tool, even in the editor window.
+        s.last_tool = "Crop".into();
+        assert_eq!(opening_tool(&s, SessionKind::Editor), T::Pen);
+        for kind in [SessionKind::Picker, SessionKind::Editor, SessionKind::Video] {
+            let b = kind.panel_buttons();
+            for t in T::ALL {
+                assert_eq!(b.contains(&ToolPanelButton::Tool(t)), kind.has_tool(t), "{kind:?} {t:?}");
+            }
+            // Undo and Redo sit under the divider, after every tool.
+            assert_eq!(b[tool_count(b) as usize], ToolPanelButton::Undo);
+            // Every button's rect hit-tests back to it.
+            for i in 0..b.len() {
+                let (x0, y0, x1, y1) = tool_panel_button_rect(b, (0, 0), i as i32);
+                let mid = ((x0 + x1) / 2, (y0 + y1) / 2);
+                assert_eq!(tool_panel_hit(b, (0, 0), mid).map(|(j, _)| j), Some(i));
+            }
+        }
+        assert!(!SessionKind::Picker.has_tool(T::Crop) && SessionKind::Editor.has_tool(T::Crop));
+        assert!(!SessionKind::Video.has_tool(T::Spotlight));
+    }
+
+    #[test]
+    fn a_crop_stays_inside_the_picture_and_its_edges_move() {
+        let pic = (10, 10, 400, 300);
+        // A new crop from inside to outside the picture stops at its edge.
+        let d = CropDrag { before: pic, grab: CropGrab::New((50, 60)) };
+        assert_eq!(crop_rect(d, (900, 900), pic), (50, 60, 360, 250));
+        assert_eq!(crop_rect(d, (20, 20), pic), (20, 20, 30, 40), "dragged up-left of the start");
+        // The right edge follows the pointer, the left stays.
+        let d = CropDrag { before: (50, 60, 200, 100), grab: CropGrab::Edge(Edge::Right) };
+        assert_eq!(crop_rect(d, (150, 999), pic), (50, 60, 100, 100));
+        // An edge can't pass the opposite one.
+        assert_eq!(crop_rect(d, (0, 0), pic).2, 8);
+        // A corner moves both its edges.
+        let d = CropDrag { before: (50, 60, 200, 100), grab: CropGrab::Edge(Edge::TopLeft) };
+        assert_eq!(crop_rect(d, (30, 40), pic), (30, 40, 220, 120));
+    }
+
+    #[test]
+    fn tooltips_sit_clear_of_their_panel_wherever_it_is() {
+        let overlaps = |a: Rect4, b: Rect4| a.0 < b.0 + b.2 && b.0 < a.0 + a.2 && a.1 < b.1 + b.3 && b.1 < a.1 + a.3;
+        let screen = (0, 0, 1920, 1080);
+        let label = "Copy [Ctrl]+[C]  // hold [Shift] to copy its text";
+        let (w, h) = tooltip_size(label);
+        // Under the action panel, close; over it only where the screen ends.
+        let ph = PANEL_BTN + 2 * PANEL_PAD;
+        for panel_y in [900, 2, 1080 - ph] {
+            let panel = (800, panel_y, 5 * PANEL_BTN + 4 * PANEL_GAP + 2 * PANEL_PAD, ph);
+            for i in 0..5 {
+                // Corners, as the panel gives them.
+                let (bx0, by0, bx1, by1) = action_panel_button_rect((panel.0, panel.1), i);
+                let button = (bx0, by0, bx1 - bx0, by1 - by0);
+                let (x, y) = action_tip_spot(button, panel, label, screen);
+                // Its middle is the button's middle, measured from the corners.
+                assert!((x + w / 2 - (bx0 + bx1) / 2).abs() <= 1 || x == 4 || x + w == 1920 - 4,
+                        "button {i}: tip centered at {} for a button centered at {}", x + w / 2, (bx0 + bx1) / 2);
+                assert!(!overlaps((x, y, w, h), panel), "panel at {panel_y}, button {i}");
+                if panel_y + ph + TOOLTIP_GAP + h <= 1080 {
+                    assert_eq!(y, panel_y + ph + TOOLTIP_GAP, "right under the panel");
+                } else {
+                    assert_eq!(y + h + TOOLTIP_GAP, panel_y, "right over it at the screen's foot");
+                }
+                assert!(y >= 0 && y + h <= 1080 && x >= 0 && x + w <= 1920);
+                // Centered on its button unless the screen's edge pushes it.
+                assert!((x + w / 2 - (button.0 + button.2 / 2)).abs() <= 1);
+            }
+        }
+        // Near the right edge, the tool panel's tip goes to its left.
+        let label = "Rectangle [R]";
+        let (w, h) = tooltip_size(label);
+        for panel_x in [100, 1920 - 46] {
+            let panel = (panel_x, 300, 46, 500);
+            let button = (panel_x + 5, 400, PANEL_BTN, PANEL_BTN);
+            let (x, y) = tool_tip_spot(button, panel, label, screen);
+            assert!(!overlaps((x, y, w, h), panel), "tool panel at {panel_x}");
+            assert_eq!(y + h / 2, 400 + PANEL_BTN / 2, "level with its button");
+        }
+    }
+
+    #[test]
+    fn step_has_its_looks_parts_and_shadow_above_its_colors() {
+        let l = flyout_layout(Tool::Step);
+        let p = l.step.expect("Step has its own panel");
+        let inside = |(x, y, w, h): Rect4| x >= FLYOUT_PAD && x + w <= l.w - FLYOUT_PAD && y >= FLYOUT_PAD && y + h <= l.h - FLYOUT_PAD;
+        for r in p.tiles.iter().chain(&p.parts).chain([&p.shadow]) { assert!(inside(*r), "{r:?}"); }
+        // Tiles don't touch, and the biggest marker fits its tile.
+        for (i, a) in p.tiles.iter().enumerate() {
+            for b in &p.tiles[i + 1..] {
+                assert!(a.0 + a.2 <= b.0 || b.0 + b.2 <= a.0 || a.1 + a.3 <= b.1 || b.1 + b.3 <= a.1);
+            }
+            let look = framefang_core::step::StepLook::recipe(framefang_core::step::StepShape::ALL[i], framefang_core::color::Rgba::RED);
+            let (x0, y0, x1, y1) = framefang_core::step::extent(step_tile_number(i), &look);
+            assert!((x1 - x0) as i32 + 4 <= a.2 && (y1 - y0) as i32 + 4 <= a.3, "{:?} fits", look.shape);
+        }
+        let (Some((prev, ..)), Some(_)) = (l.colors, l.custom) else { panic!("and its colors") };
+        assert!(p.shadow.1 + p.shadow.3 < prev.1, "the colors come after");
+        assert!(l.h <= 520, "short enough for a small screen: {}", l.h);
+        // Each part's dot and word fit its chip.
+        for (i, r) in p.parts.iter().enumerate() {
+            let words = framefang_core::text::layout(framefang_core::step::StepPart::ALL[i].label(), FLYOUT_TEXT_PX).width();
+            assert!(10 + 6 + words.round() as i32 + 8 <= r.2, "{} spills", framefang_core::step::StepPart::ALL[i].label());
+        }
+        // Only Step has one.
+        assert!(flyout_layout(Tool::Pen).step.is_none());
+    }
+
+    /// Writes target/step-flyout.png: Step's flyout as drawn.
+    #[test]
+    #[ignore]
+    fn render_step_flyout_to_png() {
+        use framefang_core::step::{StepLook, StepPart, StepShape};
+        let tool = if std::env::var("FF_TOOL").as_deref() == Ok("Highlight") { Tool::Highlight } else { Tool::Step };
+        let layout = flyout_layout(tool);
+        let (w, h) = (layout.w + 20, layout.h + 20);
+        let mut buf = vec![0x00_30_30_34u32; (w * h) as usize];
+        let shape = std::env::var("FF_STEP").ok().and_then(|n| StepShape::ALL.into_iter().find(|s| s.label() == n))
+            .unwrap_or(StepShape::Disc);
+        let look = StepLook::recipe(shape, framefang_core::annotation::Palettes::ALL[0].colors[0]);
+        let f = FlyoutFrame {
+            rect: (10, 10, layout.w, layout.h), on_right: true, pointer_y: 40, layout, values: vec![],
+            color: look.accent(), palette: 0, open: 1.0, picking: false, spectrum_pick: None,
+            step: (tool == Tool::Step).then_some((look, StepPart::Body)),
+            mark: (tool == Tool::Highlight).then_some(framefang_core::mark::MarkLook::default()),
+        };
+        draw_flyout(&mut buf, w as usize, h as usize, &f);
+        let img = image::RgbImage::from_fn(w as u32, h as u32, |x, y| {
+            let p = buf[(y * w as u32 + x) as usize];
+            image::Rgb([(p >> 16) as u8, (p >> 8) as u8, p as u8])
+        });
+        let big = image::imageops::resize(&img, w as u32 * 2, h as u32 * 2, image::imageops::FilterType::Nearest);
+        let name = if tool == Tool::Highlight { "highlight-flyout.png" } else { "step-flyout.png" };
+        big.save(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target").join(name)).unwrap();
+    }
+
+    #[test]
+    fn tools_with_nothing_to_set_have_no_flyout() {
+        use framefang_core::tool::Tool as T;
+        assert!(!has_flyout(T::Spotlight) && !has_flyout(T::Crop));
+        assert!(has_flyout(T::Magnify) && has_flyout(T::Pen) && has_flyout(T::Pixelate));
+        assert_eq!(Knob::Zoom.readout(3.0), "3x");
+        assert_eq!(Knob::Zoom.clamp(9.0), 2.0);
     }
 
     #[test]

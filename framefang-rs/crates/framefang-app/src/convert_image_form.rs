@@ -32,12 +32,16 @@ use crate::painter;
 use crate::palette::*;
 
 const WIN_W: u32 = 720;
-const WIN_H: u32 = 620;
+const WIN_H: u32 = 571;
 const PAD:   i32 = 24;
 const ROW_H: i32 = 36;
 const LABEL_W: i32 = 150;
 const BTN_H: i32 = 34;
-const HEADER_H: i32 = 88;
+/// The first row's top, right under the title bar (which holds the
+/// heading); its section header sits above it.
+const BODY_Y: i32 = 44;
+/// Convert now, in the bar along the bottom with the status beside it.
+const CONVERT_W: i32 = 140;
 /// Tall label-only format pill (no LABEL_W indent).
 const FMT_PILL_H: i32 = 46;
 
@@ -84,7 +88,6 @@ enum WidgetKind {
     Resize50,
     Resize25,
     Convert,
-    Close,
 }
 
 struct Row {
@@ -208,8 +211,6 @@ impl ConvertImageView {
                 }
                 if let Some(i) = self.hit_test(self.cursor.0, self.cursor.1) {
                     self.activate(i);
-                } else {
-                    crate::chrome::press_off_controls(&self.window, self.cursor.1, HEADER_H);
                 }
             }
             WindowEvent::MouseInput {
@@ -273,10 +274,6 @@ impl ConvertImageView {
             WidgetKind::Resize25     => { self.resize = ImgResize::P25;    }
             WidgetKind::Convert => {
                 self.run_conversion();
-            }
-            WidgetKind::Close => {
-                self.outcome = Some(ConvertImageOutcome::Closed);
-                return;
             }
         }
         self.window.request_redraw();
@@ -373,19 +370,13 @@ impl ConvertImageView {
         let mut rows = Vec::new();
         let row_w = WIN_W as i32 - PAD * 2;
 
-        // Header action bar — Close on the right; Convert primary just left
-        // of it so the user's commit lives in the header alongside the
-        // other themed dialogs.
-        let header_btn_y = (HEADER_H - BTN_H) / 2 + 4;
-        let close_w   = 110;
-        let convert_w = 140;
-        let close_x   = WIN_W as i32 - PAD - close_w;
-        let convert_x = close_x - 10 - convert_w;
-        rows.push(Row { kind: WidgetKind::Close,   label: "Close",       rect: (close_x,   header_btn_y, close_w,   BTN_H) });
-        rows.push(Row { kind: WidgetKind::Convert, label: "Convert now", rect: (convert_x, header_btn_y, convert_w, BTN_H) });
+        // Convert now at the bottom right, where a dialog's commit goes; the
+        // title bar's own button closes the window.
+        rows.push(Row { kind: WidgetKind::Convert, label: "Convert now",
+                        rect: (WIN_W as i32 - PAD - CONVERT_W, WIN_H as i32 - PAD - BTN_H, CONVERT_W, BTN_H) });
 
         // Section: SOURCE
-        let mut y = HEADER_H + 14 + 18;
+        let mut y = BODY_Y;
         rows.push(Row { kind: WidgetKind::Source, label: "Source image", rect: (PAD, y, row_w, ROW_H) });
         y += ROW_H + 22;
 
@@ -439,15 +430,11 @@ impl ConvertImageView {
         // The dialog draws into its own buffer, placed below the title strip.
         let win_h = (h.get() as usize).saturating_sub(crate::chrome::TITLE_H as usize);
         let mut buf = vec![0u32; win_w * win_h];
-        crate::hud::backdrop(&mut buf, win_w, win_h, HEADER_H);
-        let _ = PANEL_BORDER();
+        // The title bar holds the heading; the glowing rule runs along the
+        // body's top.
+        crate::hud::backdrop(&mut buf, win_w, win_h, 0);
 
         let mut surf = BufferSurface { buf: &mut buf, w: win_w as i32, h: win_h as i32 };
-
-        // Title.
-        crate::hud::heading(surf.buf, win_w, win_h, PAD, 22, "FRAME FANG // CONVERT IMAGE");
-        draw_text(&mut surf, PAD, 50, 1, "Re-encode PNG / JPG / WEBP / BMP without leaving the tray.",
-                  argb_to_framefang(TEXT_MUTED()));
 
         // Section headers, numbered in the order shown.
         let mut sec = 0;
@@ -476,20 +463,21 @@ impl ConvertImageView {
             render_row(&mut surf, row, hovered, &self.source, self.format, self.quality, self.resize);
         }
 
-        // Status footer at the bottom.
-        let footer_y = WIN_H as i32 - PAD - bitmap_font::GLYPH_H;
+        // Status in the bottom bar, level with Convert now and clear of it.
+        let footer_y = WIN_H as i32 - PAD - (BTN_H + bitmap_font::GLYPH_H) / 2;
+        let footer_w = WIN_W as i32 - PAD - CONVERT_W - 16 - PAD;
         match &self.status {
             Status::Idle => {}
             Status::Ok(path) => {
                 let msg = format!("Saved: {}", path.display());
-                draw_text(&mut surf, PAD, footer_y, 1, &msg, argb_to_framefang(OK_TINT));
+                draw_text(&mut surf, PAD, footer_y, 1, &truncate_for(&msg, footer_w), argb_to_framefang(OK_TINT));
             }
             Status::Err(e) => {
-                draw_text(&mut surf, PAD, footer_y, 1, e, argb_to_framefang(DANGER()));
+                draw_text(&mut surf, PAD, footer_y, 1, &truncate_for(e, footer_w), argb_to_framefang(DANGER()));
             }
         }
 
-        self.title_bar.draw(&mut frame, win_w, &buf, "Convert image", BG_TOP());
+        self.title_bar.draw(&mut frame, win_w, &buf, "// CONVERT IMAGE", BG_TOP());
         if let Err(e) = frame.present() { eprintln!("convert-image: buf.present: {e}"); }
     }
 }
@@ -512,8 +500,8 @@ fn render_row<S: painter::Surface>(
     let (rx, ry, rw, rh) = row.rect;
 
     // Action-bar buttons.
-    if matches!(row.kind, WidgetKind::Convert | WidgetKind::Close) {
-        let is_primary = row.kind == WidgetKind::Convert;
+    if row.kind == WidgetKind::Convert {
+        let is_primary = true;
         let border = if is_primary { LASER() } else if hovered { LASER_DIM() } else { PANEL_BORDER() };
         let fill   = if is_primary && hovered { PRIMARY_FILL() } else if hovered { HOVER_FILL() } else { 0x0000_0000 };
         if fill != 0 { fill_rect(surf, rx, ry, rw, rh, argb_to_framefang(fill)); }

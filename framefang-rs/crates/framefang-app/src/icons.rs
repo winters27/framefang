@@ -1,12 +1,14 @@
 //! Anti-aliased icon glyphs for the overlay toolbar / action panel.
 //!
-//! Replaces the previous 2-px Bresenham approach which read as pixelated.
-//! Renders each icon into a `tiny_skia::Pixmap` with round caps + round
-//! joins at 2.2-px stroke width, then alpha-blends into the softbuffer
-//! u32 framebuffer. tiny-skia is already a workspace dep.
+//! One set, drawn alike (Brandon 2026-11-20, "refined line"): every icon is
+//! laid out on a 36-unit grid, the size of a panel button, in a single 2 unit
+//! line with round ends and joins, its outline kept inside the same 18 unit
+//! square so they all read the same size. The grid is scaled to whatever box
+//! the icon is given. Rendered with tiny-skia, then blended into the
+//! softbuffer frame.
 
 use framefang_core::tool::Tool;
-use tiny_skia::{FillRule, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Rect, Stroke, Transform};
+use tiny_skia::{FillRule, LineCap, LineJoin, Paint, Path, PathBuilder, Pixmap, Stroke, Transform};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IconKind {
@@ -25,8 +27,14 @@ pub enum IconKind {
     Eyedropper,
 }
 
-/// Color override for the Color/Thickness/etc. icons. `accent_rgba` is used
-/// for the Color disc fill and the Thickness stroke width hint.
+/// The set's line, in grid units.
+const LINE: f32 = 2.0;
+/// Bezier handle length for a quarter circle.
+const KAPPA: f32 = 0.552_284_8;
+
+/// Draw `icon` into the box `x0..x1`, `y0..y1` of the frame, in `fg_rgba`.
+/// `accent_rgba` colors Record's dot.
+#[allow(clippy::too_many_arguments)]
 pub fn render_icon(
     buf: &mut [u32], stride: usize, height: usize,
     x0: i32, y0: i32, x1: i32, y1: i32,
@@ -37,408 +45,272 @@ pub fn render_icon(
     let w = (x1 - x0).max(1) as u32;
     let h = (y1 - y0).max(1) as u32;
     let Some(mut pixmap) = Pixmap::new(w, h) else { return; };
-
-    let mut paint = Paint::default();
-    paint.set_color_rgba8(fg_rgba[0], fg_rgba[1], fg_rgba[2], fg_rgba[3]);
-    paint.anti_alias = true;
-
-    let stroke = Stroke {
-        width:     2.2,
-        line_cap:  LineCap::Round,
-        line_join: LineJoin::Round,
-        ..Default::default()
-    };
-
-    let cw  = w as f32;
-    let ch  = h as f32;
-    let pad = 8.0;
-    let ix0 = pad;
-    let iy0 = pad;
-    let ix1 = cw - pad;
-    let iy1 = ch - pad;
-    let cx  = cw / 2.0;
-    let cy  = ch / 2.0;
+    let paint = paint_of(fg_rgba, 255);
+    let (cw, ch) = (w as f32, h as f32);
+    // The grid, centered in the box. The eyedropper's box is a swatch, a
+    // little over half a button: its own 21 unit grid.
+    let units = if icon == IconKind::Eyedropper { 21.0 } else { 36.0 };
+    let k = cw.min(ch) / units;
+    let ts = Transform::from_row(k, 0.0, 0.0, k, cw / 2.0 - units / 2.0 * k, ch / 2.0 - units / 2.0 * k);
+    let mut g = Glyph { pm: &mut pixmap, ts };
+    let line = stroke_of(LINE);
 
     match icon {
         IconKind::Tool(Tool::Pen) => {
-            // Outlined pen barrel + filled nib triangle at the lower-left.
-            // Single stroke weight matches Rectangle / Ellipse / Copy so the
-            // whole tool row reads as a family rather than mixed weights.
-            let mut barrel = PathBuilder::new();
-            barrel.move_to(ix0 + 3.0,  iy1 - 2.0);
-            barrel.line_to(ix0 + 6.0,  iy1 + 1.0);
-            barrel.line_to(ix1 + 1.0,  iy0 + 6.0);
-            barrel.line_to(ix1 - 2.0,  iy0 + 3.0);
-            barrel.close();
-            if let Some(p) = barrel.finish() {
-                pixmap.stroke_path(&p, &paint, &stroke, Transform::identity(), None);
+            // A pen leaning right, with the squiggle it has just drawn
+            // running into its tip (Brandon 2026-11-20, option A).
+            let tip = (14.5, 21.5);
+            if let Some((barrel, nib)) = pen(tip, 45.0, 11.5, 3.1, 4.8) {
+                g.stroke(&barrel, &paint, &line);
+                g.fill(&nib, &paint);
             }
-            // Nib — small filled triangle at the lower-left tip of the barrel.
-            let mut nib = PathBuilder::new();
-            nib.move_to(ix0 - 1.0,  iy1 + 2.0);
-            nib.line_to(ix0 + 3.0,  iy1 - 2.0);
-            nib.line_to(ix0 + 6.0,  iy1 + 1.0);
-            nib.close();
-            if let Some(p) = nib.finish() {
-                pixmap.fill_path(&p, &paint, FillRule::Winding, Transform::identity(), None);
-            }
+            g.stroke_opt(pen_band(tip, 45.0, 3.1, 13.0), &paint, &stroke_of(1.6));
+            g.stroke_opt(curve(&[(6.0, 27.5), (8.5, 24.0), (11.0, 28.0), (13.5, 23.5)]), &paint, &line);
         }
         IconKind::Tool(Tool::Line) => {
-            let mut pb = PathBuilder::new();
-            pb.move_to(ix0, iy1);
-            pb.line_to(ix1, iy0);
-            if let Some(p) = pb.finish() {
-                pixmap.stroke_path(&p, &paint, &stroke, Transform::identity(), None);
-            }
+            g.stroke_opt(poly(&[(10.0, 26.0), (26.0, 10.0)], false), &paint, &line);
         }
         IconKind::Tool(Tool::Arrow) => {
-            let mut pb = PathBuilder::new();
-            pb.move_to(ix0, iy1);
-            pb.line_to(ix1, iy0);
-            // Arrowhead — two short strokes back from tip
-            pb.move_to(ix1, iy0);
-            pb.line_to(ix1 - 7.0, iy0);
-            pb.move_to(ix1, iy0);
-            pb.line_to(ix1, iy0 + 7.0);
-            if let Some(p) = pb.finish() {
-                pixmap.stroke_path(&p, &paint, &stroke, Transform::identity(), None);
-            }
+            g.stroke_opt(poly(&[(10.0, 26.0), (26.0, 10.0)], false), &paint, &line);
+            g.stroke_opt(poly(&[(17.5, 10.0), (26.0, 10.0), (26.0, 18.5)], false), &paint, &line);
         }
         IconKind::Tool(Tool::Rectangle) => {
-            if let Some(r) = Rect::from_xywh(ix0, iy0, ix1 - ix0, iy1 - iy0) {
-                let mut pb = PathBuilder::new();
-                pb.push_rect(r);
-                if let Some(p) = pb.finish() {
-                    pixmap.stroke_path(&p, &paint, &stroke, Transform::identity(), None);
-                }
-            }
+            g.stroke_opt(round_rect(9.0, 10.5, 18.0, 15.0, 2.5), &paint, &line);
         }
         IconKind::Tool(Tool::Ellipse) => {
-            if let Some(r) = Rect::from_xywh(ix0, iy0, ix1 - ix0, iy1 - iy0) {
-                let mut pb = PathBuilder::new();
-                pb.push_oval(r);
-                if let Some(p) = pb.finish() {
-                    pixmap.stroke_path(&p, &paint, &stroke, Transform::identity(), None);
-                }
-            }
+            g.stroke_opt(oval(18.0, 18.0, 9.5, 8.0), &paint, &line);
         }
         IconKind::Tool(Tool::Marker) => {
-            // Highlighter body — filled rounded rect with a slanted tip on top.
-            if let Some(body) = Rect::from_xywh(ix0 + 2.0, iy0 + 6.0, ix1 - ix0 - 4.0, iy1 - iy0 - 6.0) {
-                let mut pb = PathBuilder::new();
-                pb.push_rect(body);
-                if let Some(p) = pb.finish() {
-                    pixmap.fill_path(&p, &paint, FillRule::Winding, Transform::identity(), None);
-                }
+            // A chisel highlighter, wider than the pen, over the broad wash
+            // it leaves.
+            let tip = (12.5, 21.0);
+            if let Some((barrel, nib)) = pen(tip, 45.0, 11.0, 4.3, 4.0) {
+                g.stroke(&barrel, &paint, &line);
+                g.fill(&nib, &paint);
             }
-            if let Some(tip) = Rect::from_xywh(ix0 + 4.0, iy0, ix1 - ix0 - 8.0, 6.0) {
-                let mut pb = PathBuilder::new();
-                pb.push_rect(tip);
-                if let Some(p) = pb.finish() {
-                    pixmap.fill_path(&p, &paint, FillRule::Winding, Transform::identity(), None);
-                }
-            }
+            g.stroke_opt(poly(&[(8.5, 27.0), (27.5, 27.0)], false), &paint_of(fg_rgba, 110), &stroke_of(4.0));
+        }
+        IconKind::Tool(Tool::Highlight) => {
+            // Three lines of text, the middle one highlighted.
+            g.fill_opt(round_rect(8.0, 14.0, 20.0, 8.0, 2.0), &paint_of(fg_rgba, 105));
+            g.stroke_opt(poly(&[(10.0, 10.0), (24.0, 10.0)], false), &paint, &line);
+            g.stroke_opt(poly(&[(11.0, 18.0), (25.0, 18.0)], false), &paint, &line);
+            g.stroke_opt(poly(&[(10.0, 26.0), (20.0, 26.0)], false), &paint, &line);
         }
         IconKind::Tool(Tool::Text) => {
-            // Bold "T" — top bar + vertical stem.
-            let bold = Stroke { width: 3.0, line_cap: LineCap::Round, line_join: LineJoin::Round, ..Default::default() };
-            let mut pb = PathBuilder::new();
-            pb.move_to(ix0, iy0 + 1.0);
-            pb.line_to(ix1, iy0 + 1.0);
-            pb.move_to(cx, iy0 + 1.0);
-            pb.line_to(cx, iy1);
-            if let Some(p) = pb.finish() {
-                pixmap.stroke_path(&p, &paint, &bold, Transform::identity(), None);
-            }
+            g.stroke_opt(poly(&[(10.5, 11.0), (25.5, 11.0)], false), &paint, &line);
+            g.stroke_opt(poly(&[(18.0, 11.0), (18.0, 26.0)], false), &paint, &line);
+            g.stroke_opt(poly(&[(15.0, 26.0), (21.0, 26.0)], false), &paint, &line);
         }
         IconKind::Tool(Tool::Step) => {
-            // Outlined circle (matches Ellipse / Rectangle) with a stroked
-            // "1" inside, so it reads as a numbered step rather than a Color
-            // swatch (which is a filled disc).
-            let r = (ix1 - ix0).min(iy1 - iy0) / 2.0 - 1.0;
-            let mut circle = PathBuilder::new();
-            circle.push_circle(cx, cy, r);
-            if let Some(p) = circle.finish() {
-                pixmap.stroke_path(&p, &paint, &stroke, Transform::identity(), None);
-            }
-            let mut one = PathBuilder::new();
-            one.move_to(cx - 2.2, cy - r * 0.30);
-            one.line_to(cx + 0.4, cy - r * 0.62);
-            one.line_to(cx + 0.4, cy + r * 0.55);
-            if let Some(p) = one.finish() {
-                pixmap.stroke_path(&p, &paint, &stroke, Transform::identity(), None);
-            }
+            g.stroke_opt(oval(18.0, 18.0, 9.5, 9.5), &paint, &line);
+            g.stroke_opt(poly(&[(15.8, 15.6), (18.6, 13.4), (18.6, 22.8)], false), &paint, &line);
         }
         IconKind::Tool(Tool::Pixelate) => {
-            // 3×3 mosaic with varying opacity — reads as "low-res / pixelated"
-            // rather than a chessboard. Corner cells are dim, edges medium,
-            // center solid.
-            let cw_step = (ix1 - ix0) / 3.0;
-            let ch_step = (iy1 - iy0) / 3.0;
-            // (col, row) → alpha multiplier
-            let alphas: [[u8; 3]; 3] = [
-                [110, 170, 110],
-                [170, 255, 170],
-                [110, 170, 110],
-            ];
-            for gy in 0..3 {
-                for gx in 0..3 {
-                    let mut cell_paint = Paint::default();
-                    let a = alphas[gy][gx];
-                    cell_paint.set_color_rgba8(fg_rgba[0], fg_rgba[1], fg_rgba[2],
-                                                ((fg_rgba[3] as u16 * a as u16) / 255) as u8);
-                    cell_paint.anti_alias = true;
-                    if let Some(r) = Rect::from_xywh(
-                        ix0 + gx as f32 * cw_step + 0.5,
-                        iy0 + gy as f32 * ch_step + 0.5,
-                        cw_step - 1.0, ch_step - 1.0,
-                    ) {
-                        let mut pb = PathBuilder::new();
-                        pb.push_rect(r);
-                        if let Some(p) = pb.finish() {
-                            pixmap.fill_path(&p, &cell_paint, FillRule::Winding, Transform::identity(), None);
-                        }
-                    }
-                }
-            }
+            // A square cut in thirds, two of its cells filled: low-res.
+            g.stroke_opt(round_rect(9.0, 9.0, 18.0, 18.0, 2.5), &paint, &line);
+            g.stroke_opt(poly(&[(15.0, 9.0), (15.0, 27.0)], false), &paint_of(fg_rgba, 150), &stroke_of(1.4));
+            g.stroke_opt(poly(&[(21.0, 9.0), (21.0, 27.0)], false), &paint_of(fg_rgba, 150), &stroke_of(1.4));
+            g.stroke_opt(poly(&[(9.0, 15.0), (27.0, 15.0)], false), &paint_of(fg_rgba, 150), &stroke_of(1.4));
+            g.stroke_opt(poly(&[(9.0, 21.0), (27.0, 21.0)], false), &paint_of(fg_rgba, 150), &stroke_of(1.4));
+            g.fill_opt(rect(15.0, 9.0, 6.0, 6.0), &paint_of(fg_rgba, 200));
+            g.fill_opt(rect(9.0, 15.0, 6.0, 6.0), &paint_of(fg_rgba, 120));
+            g.fill_opt(rect(21.0, 21.0, 6.0, 6.0), &paint_of(fg_rgba, 200));
         }
-        IconKind::Undo => {
-            // Rounded counter-clockwise arc through the top, ending at the
-            // lower-left with an arrowhead pointing down — clearly "go back."
-            use std::f32::consts::PI;
-            let r = ((ix1 - ix0).min(iy1 - iy0) / 2.0 - 1.5).max(4.0);
-            let start_a =  PI / 4.0;             // 4-5 o'clock
-            let end_a   = -PI * 5.0 / 4.0;       // sweeps CCW through top to 8 o'clock
-            let segments = 28;
-            let mut pb = PathBuilder::new();
-            let mut last = (0.0f32, 0.0f32);
-            for i in 0..=segments {
-                let t = i as f32 / segments as f32;
-                let a = start_a + (end_a - start_a) * t;
-                let x = cx + r * a.cos();
-                let y = cy + r * a.sin();
-                if i == 0 { pb.move_to(x, y); } else { pb.line_to(x, y); }
-                last = (x, y);
-            }
-            // Arrowhead at the lower-left endpoint, pointing back along the
-            // arc's tangent (down-and-into-arc).
-            let tan_a  = end_a - PI / 2.0;
-            let back_a = tan_a + PI;
-            let ah = 4.5f32;
-            pb.move_to(last.0, last.1);
-            pb.line_to(last.0 + ah * (back_a + 0.55).cos(),
-                       last.1 + ah * (back_a + 0.55).sin());
-            pb.move_to(last.0, last.1);
-            pb.line_to(last.0 + ah * (back_a - 0.55).cos(),
-                       last.1 + ah * (back_a - 0.55).sin());
-            if let Some(p) = pb.finish() {
-                pixmap.stroke_path(&p, &paint, &stroke, Transform::identity(), None);
-            }
+        IconKind::Tool(Tool::Spotlight) => {
+            // A dimmed field, and the lit part of it bright and framed.
+            g.fill_opt(round_rect(8.0, 9.0, 20.0, 18.0, 3.0), &paint_of(fg_rgba, 70));
+            g.fill_opt(round_rect(13.5, 13.5, 9.0, 9.0, 1.5), &paint);
         }
-        IconKind::Redo => {
-            // Mirror of Undo — clockwise arc through the top, ending at the
-            // lower-right with arrowhead pointing down ("go forward").
-            use std::f32::consts::PI;
-            let r = ((ix1 - ix0).min(iy1 - iy0) / 2.0 - 1.5).max(4.0);
-            let start_a =  PI * 3.0 / 4.0;       // 7-8 o'clock
-            let end_a   = -PI / 4.0 + 2.0 * PI;  // sweeps CW through top to 4 o'clock
-            let segments = 28;
+        IconKind::Tool(Tool::Magnify) => {
+            g.stroke_opt(oval(16.0, 16.0, 6.8, 6.8), &paint, &line);
+            g.stroke_opt(poly(&[(21.0, 21.0), (26.5, 26.5)], false), &paint, &stroke_of(2.6));
+        }
+        IconKind::Tool(Tool::Crop) => {
+            g.stroke_opt(poly(&[(13.0, 8.5), (13.0, 23.0), (27.5, 23.0)], false), &paint, &line);
+            g.stroke_opt(poly(&[(8.5, 13.0), (23.0, 13.0), (23.0, 27.5)], false), &paint, &line);
+        }
+        IconKind::Undo | IconKind::Redo => {
+            // A return arrow: out along the top, round the turn, back along
+            // the bottom; Redo is its mirror.
+            let m = |x: f32| if icon == IconKind::Undo { x } else { 36.0 - x };
             let mut pb = PathBuilder::new();
-            let mut last = (0.0f32, 0.0f32);
-            for i in 0..=segments {
-                let t = i as f32 / segments as f32;
-                let a = start_a + (end_a - start_a) * t;
-                let x = cx + r * a.cos();
-                let y = cy + r * a.sin();
-                if i == 0 { pb.move_to(x, y); } else { pb.line_to(x, y); }
-                last = (x, y);
-            }
-            let tan_a  = end_a + PI / 2.0;
-            let back_a = tan_a + PI;
-            let ah = 4.5f32;
-            pb.move_to(last.0, last.1);
-            pb.line_to(last.0 + ah * (back_a + 0.55).cos(),
-                       last.1 + ah * (back_a + 0.55).sin());
-            pb.move_to(last.0, last.1);
-            pb.line_to(last.0 + ah * (back_a - 0.55).cos(),
-                       last.1 + ah * (back_a - 0.55).sin());
-            if let Some(p) = pb.finish() {
-                pixmap.stroke_path(&p, &paint, &stroke, Transform::identity(), None);
-            }
+            pb.move_to(m(10.0), 14.0);
+            pb.line_to(m(21.0), 14.0);
+            pb.cubic_to(m(21.0 + 5.5 * KAPPA), 14.0, m(26.5), 19.5 - 5.5 * KAPPA, m(26.5), 19.5);
+            pb.cubic_to(m(26.5), 19.5 + 5.5 * KAPPA, m(21.0 + 5.5 * KAPPA), 25.0, m(21.0), 25.0);
+            pb.line_to(m(15.0), 25.0);
+            g.stroke_opt(pb.finish(), &paint, &line);
+            g.stroke_opt(poly(&[(m(14.5), 9.5), (m(10.0), 14.0), (m(14.5), 18.5)], false), &paint, &line);
         }
         IconKind::Pin => {
-            // Google-Maps-style location pin: teardrop body with a hole.
-            // The body is a filled shape — a circle on top tapering to a point
-            // at the bottom. The hole is a small stroked circle at the center
-            // of the round top so the silhouette reads as a marker.
-            let head_r  = 6.0;
-            let head_cy = iy0 + 2.0 + head_r;
-            let tip_y   = iy1;
-            // Teardrop: arc from left-of-head down to tip, then up to right-of-head.
-            let mut body = PathBuilder::new();
-            body.move_to(cx - head_r, head_cy);
-            body.cubic_to(
-                cx - head_r,  head_cy + head_r * 0.6,
-                cx - 2.5,     tip_y - 2.0,
-                cx,           tip_y,
-            );
-            body.cubic_to(
-                cx + 2.5,     tip_y - 2.0,
-                cx + head_r,  head_cy + head_r * 0.6,
-                cx + head_r,  head_cy,
-            );
-            // Close the top with a semicircle.
-            body.cubic_to(
-                cx + head_r,  head_cy - head_r * 1.1,
-                cx - head_r,  head_cy - head_r * 1.1,
-                cx - head_r,  head_cy,
-            );
-            body.close();
-            if let Some(p) = body.finish() {
-                pixmap.fill_path(&p, &paint, FillRule::Winding, Transform::identity(), None);
-            }
-            // Punch the marker hole out of the head with a clear-blend circle.
-            let mut hole_paint = Paint::default();
-            hole_paint.set_color_rgba8(0, 0, 0, 0);
-            hole_paint.anti_alias = true;
-            hole_paint.blend_mode = tiny_skia::BlendMode::Clear;
-            let mut hole = PathBuilder::new();
-            hole.push_circle(cx, head_cy, 2.4);
-            if let Some(p) = hole.finish() {
-                pixmap.fill_path(&p, &hole_paint, FillRule::Winding, Transform::identity(), None);
-            }
+            // A map pin, outlined, its center marked.
+            let mut pb = PathBuilder::new();
+            let (hx, hy, r, tip) = (18.0, 15.5, 6.5, 28.0);
+            pb.move_to(hx, tip);
+            pb.cubic_to(hx - 2.0, tip - 3.5, hx - r, hy + r * 0.9, hx - r, hy);
+            pb.cubic_to(hx - r, hy - r * KAPPA * 1.0, hx - r * KAPPA, hy - r, hx, hy - r);
+            pb.cubic_to(hx + r * KAPPA, hy - r, hx + r, hy - r * KAPPA, hx + r, hy);
+            pb.cubic_to(hx + r, hy + r * 0.9, hx + 2.0, tip - 3.5, hx, tip);
+            pb.close();
+            g.stroke_opt(pb.finish(), &paint, &line);
+            g.fill_opt(oval(hx, hy, 2.2, 2.2), &paint);
         }
         IconKind::Copy => {
-            // Page-with-shadow: two identical stroked rects, the back one
-            // offset down-and-right so it reads as a copy stack rather than
-            // two arbitrary rectangles.
-            let off  = 4.0;
-            let w    = ix1 - ix0 - off;
-            let h    = iy1 - iy0 - off;
-            if let Some(back) = Rect::from_xywh(ix0 + off, iy0 + off, w, h) {
-                let mut pb = PathBuilder::new();
-                pb.push_rect(back);
-                if let Some(p) = pb.finish() {
-                    pixmap.stroke_path(&p, &paint, &stroke, Transform::identity(), None);
-                }
-            }
-            if let Some(front) = Rect::from_xywh(ix0, iy0, w, h) {
-                let mut pb = PathBuilder::new();
-                pb.push_rect(front);
-                if let Some(p) = pb.finish() {
-                    pixmap.stroke_path(&p, &paint, &stroke, Transform::identity(), None);
-                }
-            }
+            // The front sheet whole; of the one behind, only what shows.
+            g.stroke_opt(round_rect(9.0, 9.0, 13.5, 13.5, 2.5), &paint, &line);
+            let mut pb = PathBuilder::new();
+            pb.move_to(22.5, 13.5);
+            pb.line_to(24.5, 13.5);
+            pb.cubic_to(25.9, 13.5, 27.0, 14.6, 27.0, 16.0);
+            pb.line_to(27.0, 24.5);
+            pb.cubic_to(27.0, 25.9, 25.9, 27.0, 24.5, 27.0);
+            pb.line_to(16.0, 27.0);
+            pb.cubic_to(14.6, 27.0, 13.5, 25.9, 13.5, 24.5);
+            pb.line_to(13.5, 22.5);
+            g.stroke_opt(pb.finish(), &paint, &line);
         }
         IconKind::Save => {
-            // 3.5" floppy disk: square body with one chamfered top-right
-            // corner, a metal shutter strip across the top, and a paper-label
-            // rectangle filling the lower half.
-            let chamfer = 4.0;
-            let mut body = PathBuilder::new();
-            body.move_to(ix0,           iy0);
-            body.line_to(ix1 - chamfer, iy0);
-            body.line_to(ix1,           iy0 + chamfer);
-            body.line_to(ix1,           iy1);
-            body.line_to(ix0,           iy1);
-            body.close();
-            if let Some(p) = body.finish() {
-                pixmap.stroke_path(&p, &paint, &stroke, Transform::identity(), None);
-            }
-            // Top shutter strip — filled, with a slot punched on the right.
-            let strip_h = 3.5;
-            let strip_pad = 2.0;
-            if let Some(strip) = Rect::from_xywh(
-                ix0 + strip_pad,
-                iy0 + 1.0,
-                ix1 - ix0 - strip_pad * 2.0 - chamfer * 0.5,
-                strip_h,
-            ) {
-                let mut pb = PathBuilder::new();
-                pb.push_rect(strip);
-                if let Some(p) = pb.finish() {
-                    pixmap.fill_path(&p, &paint, FillRule::Winding, Transform::identity(), None);
-                }
-            }
-            // Paper label — stroked rectangle in the lower portion.
-            if let Some(label) = Rect::from_xywh(
-                ix0 + 2.5,
-                cy + 1.0,
-                ix1 - ix0 - 5.0,
-                iy1 - cy - 3.0,
-            ) {
-                let mut pb = PathBuilder::new();
-                pb.push_rect(label);
-                if let Some(p) = pb.finish() {
-                    pixmap.stroke_path(&p, &paint, &stroke, Transform::identity(), None);
-                }
-            }
+            // A floppy disk: a rounded body with its corner cut, the shutter
+            // at the top and the label at the bottom.
+            let mut pb = PathBuilder::new();
+            pb.move_to(11.5, 9.0);
+            pb.line_to(23.0, 9.0);
+            pb.line_to(27.0, 13.0);
+            pb.line_to(27.0, 24.5);
+            pb.cubic_to(27.0, 25.9, 25.9, 27.0, 24.5, 27.0);
+            pb.line_to(11.5, 27.0);
+            pb.cubic_to(10.1, 27.0, 9.0, 25.9, 9.0, 24.5);
+            pb.line_to(9.0, 11.5);
+            pb.cubic_to(9.0, 10.1, 10.1, 9.0, 11.5, 9.0);
+            pb.close();
+            g.stroke_opt(pb.finish(), &paint, &line);
+            g.stroke_opt(poly(&[(13.0, 9.0), (13.0, 13.5), (21.0, 13.5), (21.0, 9.0)], false), &paint, &line);
+            g.stroke_opt(poly(&[(12.5, 27.0), (12.5, 20.0), (23.5, 20.0), (23.5, 27.0)], false), &paint, &line);
         }
         IconKind::Close => {
-            let mut pb = PathBuilder::new();
-            pb.move_to(ix0, iy0);
-            pb.line_to(ix1, iy1);
-            pb.move_to(ix1, iy0);
-            pb.line_to(ix0, iy1);
-            if let Some(p) = pb.finish() {
-                pixmap.stroke_path(&p, &paint, &stroke, Transform::identity(), None);
-            }
+            g.stroke_opt(poly(&[(11.0, 11.0), (25.0, 25.0)], false), &paint, &line);
+            g.stroke_opt(poly(&[(25.0, 11.0), (11.0, 25.0)], false), &paint, &line);
         }
         IconKind::Record => {
-            // Outer ring in the foreground color, solid dot inside it. The dot
-            // takes `accent_rgba` when the caller supplies one so the record
-            // red can be used without tinting the ring.
-            let outer = ((ix1 - ix0).min(iy1 - iy0) / 2.0 - 1.0).max(3.0);
-            let mut pb = PathBuilder::new();
-            pb.push_circle(cx, cy, outer);
-            if let Some(p) = pb.finish() {
-                pixmap.stroke_path(&p, &paint, &stroke, Transform::identity(), None);
-            }
-            let c = accent_rgba.unwrap_or(fg_rgba);
-            let mut p2 = Paint::default();
-            p2.set_color_rgba8(c[0], c[1], c[2], c[3]);
-            p2.anti_alias = true;
-            let mut pb = PathBuilder::new();
-            pb.push_circle(cx, cy, (outer - 4.0).max(2.0));
-            if let Some(p) = pb.finish() {
-                pixmap.fill_path(&p, &p2, FillRule::Winding, Transform::identity(), None);
-            }
+            g.stroke_opt(oval(18.0, 18.0, 9.5, 9.5), &paint, &line);
+            g.fill_opt(oval(18.0, 18.0, 5.0, 5.0), &paint_of(accent_rgba.unwrap_or(fg_rgba), 255));
         }
         IconKind::Eyedropper => {
-            // In a box this small the panels' 8 px padding would leave no
-            // glyph, so it is laid out on the box itself.
-            let u = cw.min(ch) / 21.0;
-            let at = |x: f32, y: f32| (cx + (x - 10.5) * u, cy + (y - 10.5) * u);
-            // The glass tube, tip at the lower left.
-            let thin = Stroke { width: 1.8 * u, ..stroke.clone() };
-            let mut tube = PathBuilder::new();
-            let (x, y) = at(5.0, 16.0);
-            tube.move_to(x, y);
-            let (x, y) = at(12.5, 8.5);
-            tube.line_to(x, y);
-            if let Some(p) = tube.finish() {
-                pixmap.stroke_path(&p, &paint, &thin, Transform::identity(), None);
-            }
-            // The collar across it.
-            let mut collar = PathBuilder::new();
-            let (x, y) = at(10.0, 7.0);
-            collar.move_to(x, y);
-            let (x, y) = at(14.0, 11.0);
-            collar.line_to(x, y);
-            if let Some(p) = collar.finish() {
-                pixmap.stroke_path(&p, &paint, &thin, Transform::identity(), None);
-            }
-            // The bulb, filled.
-            let mut bulb = PathBuilder::new();
-            let (x, y) = at(14.5, 6.5);
-            bulb.push_circle(x, y, 2.8 * u);
-            if let Some(p) = bulb.finish() {
-                pixmap.fill_path(&p, &paint, FillRule::Winding, Transform::identity(), None);
-            }
+            // On its own 21 unit grid: the glass tube with its tip at the
+            // lower left, the collar across it, the bulb.
+            let thin = stroke_of(1.8);
+            g.stroke_opt(poly(&[(5.0, 16.0), (12.5, 8.5)], false), &paint, &thin);
+            g.stroke_opt(poly(&[(10.0, 7.0), (14.0, 11.0)], false), &paint, &thin);
+            g.fill_opt(oval(14.5, 6.5, 2.8, 2.8), &paint);
         }
     }
 
     blit_pixmap(buf, stride, height, x0, y0, &pixmap);
+}
+
+/// A pixmap and the grid's transform onto it.
+struct Glyph<'a> {
+    pm: &'a mut Pixmap,
+    ts: Transform,
+}
+
+impl Glyph<'_> {
+    fn stroke(&mut self, p: &Path, paint: &Paint, s: &Stroke) { self.pm.stroke_path(p, paint, s, self.ts, None); }
+    fn fill(&mut self, p: &Path, paint: &Paint) { self.pm.fill_path(p, paint, FillRule::Winding, self.ts, None); }
+    fn stroke_opt(&mut self, p: Option<Path>, paint: &Paint, s: &Stroke) { if let Some(p) = p { self.stroke(&p, paint, s); } }
+    fn fill_opt(&mut self, p: Option<Path>, paint: &Paint) { if let Some(p) = p { self.fill(&p, paint); } }
+}
+
+fn paint_of(c: [u8; 4], alpha: u8) -> Paint<'static> {
+    let mut p = Paint::default();
+    p.set_color_rgba8(c[0], c[1], c[2], ((c[3] as u16 * alpha as u16) / 255) as u8);
+    p.anti_alias = true;
+    p
+}
+
+fn stroke_of(width: f32) -> Stroke {
+    Stroke { width, line_cap: LineCap::Round, line_join: LineJoin::Round, ..Default::default() }
+}
+
+/// Straight segments through `pts`, closed back to the first when `closed`.
+fn poly(pts: &[(f32, f32)], closed: bool) -> Option<Path> {
+    let mut pb = PathBuilder::new();
+    let (first, rest) = pts.split_first()?;
+    pb.move_to(first.0, first.1);
+    for p in rest { pb.line_to(p.0, p.1); }
+    if closed { pb.close(); }
+    pb.finish()
+}
+
+fn rect(x: f32, y: f32, w: f32, h: f32) -> Option<Path> {
+    poly(&[(x, y), (x + w, y), (x + w, y + h), (x, y + h)], true)
+}
+
+/// A rectangle with its corners rounded by `r`.
+fn round_rect(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<Path> {
+    let r = r.min(w / 2.0).min(h / 2.0);
+    let c = r * KAPPA;
+    let (x1, y1) = (x + w, y + h);
+    let mut pb = PathBuilder::new();
+    pb.move_to(x + r, y);
+    pb.line_to(x1 - r, y);
+    pb.cubic_to(x1 - r + c, y, x1, y + r - c, x1, y + r);
+    pb.line_to(x1, y1 - r);
+    pb.cubic_to(x1, y1 - r + c, x1 - r + c, y1, x1 - r, y1);
+    pb.line_to(x + r, y1);
+    pb.cubic_to(x + r - c, y1, x, y1 - r + c, x, y1 - r);
+    pb.line_to(x, y + r);
+    pb.cubic_to(x, y + r - c, x + r - c, y, x + r, y);
+    pb.close();
+    pb.finish()
+}
+
+/// An ellipse around (cx, cy).
+fn oval(cx: f32, cy: f32, rx: f32, ry: f32) -> Option<Path> {
+    let (kx, ky) = (rx * KAPPA, ry * KAPPA);
+    let mut pb = PathBuilder::new();
+    pb.move_to(cx + rx, cy);
+    pb.cubic_to(cx + rx, cy + ky, cx + kx, cy + ry, cx, cy + ry);
+    pb.cubic_to(cx - kx, cy + ry, cx - rx, cy + ky, cx - rx, cy);
+    pb.cubic_to(cx - rx, cy - ky, cx - kx, cy - ry, cx, cy - ry);
+    pb.cubic_to(cx + kx, cy - ry, cx + rx, cy - ky, cx + rx, cy);
+    pb.close();
+    pb.finish()
+}
+
+/// A pen leaning `angle` degrees right of upright, its tip at `tip`: the
+/// barrel `len` long and `half` wide each side, the cone `cone` long.
+/// (barrel outline, nib outline).
+fn pen(tip: (f32, f32), angle: f32, len: f32, half: f32, cone: f32) -> Option<(Path, Path)> {
+    let a = angle.to_radians();
+    let (axis, perp) = ((a.sin(), -a.cos()), (a.cos(), a.sin()));
+    let at = |v: f32, u: f32| (tip.0 + v * perp.0 + u * axis.0, tip.1 + v * perp.1 + u * axis.1);
+    let barrel = poly(&[at(-half, cone), at(-half, cone + len), at(half, cone + len), at(half, cone)], true)?;
+    let nib = poly(&[at(-half, cone), tip, at(half, cone)], true)?;
+    Some((barrel, nib))
+}
+
+/// The band across a pen's barrel `u` along it from the tip.
+fn pen_band(tip: (f32, f32), angle: f32, half: f32, u: f32) -> Option<Path> {
+    let a = angle.to_radians();
+    let (ax, ay, px, py) = (a.sin(), -a.cos(), a.cos(), a.sin());
+    poly(&[(tip.0 - half * px + u * ax, tip.1 - half * py + u * ay),
+           (tip.0 + half * px + u * ax, tip.1 + half * py + u * ay)], false)
+}
+
+/// A smooth curve through the points (Catmull-Rom, as cubics).
+fn curve(pts: &[(f32, f32)]) -> Option<Path> {
+    let mut pb = PathBuilder::new();
+    pb.move_to(pts.first()?.0, pts.first()?.1);
+    for i in 0..pts.len() - 1 {
+        let p0 = pts[i.saturating_sub(1)];
+        let (p1, p2) = (pts[i], pts[i + 1]);
+        let p3 = pts[(i + 2).min(pts.len() - 1)];
+        pb.cubic_to(p1.0 + (p2.0 - p0.0) / 6.0, p1.1 + (p2.1 - p0.1) / 6.0,
+                    p2.0 - (p3.0 - p1.0) / 6.0, p2.1 - (p3.1 - p1.1) / 6.0, p2.0, p2.1);
+    }
+    pb.finish()
 }
 
 /// Source-over blit of a tiny-skia premultiplied pixmap into the softbuffer
@@ -470,10 +342,98 @@ fn blit_pixmap(
             let r = (pix.red()   as u32) + (dr * inv + 127) / 255;
             let g = (pix.green() as u32) + (dg * inv + 127) / 255;
             let b = (pix.blue()  as u32) + (db * inv + 127) / 255;
-            let r = r.min(255);
-            let g = g.min(255);
-            let b = b.min(255);
-            buf[dst_idx] = (r << 16) | (g << 8) | b;
+            buf[dst_idx] = (r.min(255) << 16) | (g.min(255) << 8) | b.min(255);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ALL: [IconKind; 21] = [
+        IconKind::Tool(Tool::Pen), IconKind::Tool(Tool::Line), IconKind::Tool(Tool::Arrow),
+        IconKind::Tool(Tool::Rectangle), IconKind::Tool(Tool::Ellipse), IconKind::Tool(Tool::Marker),
+        IconKind::Tool(Tool::Highlight),
+        IconKind::Tool(Tool::Text), IconKind::Tool(Tool::Step), IconKind::Tool(Tool::Pixelate),
+        IconKind::Tool(Tool::Spotlight), IconKind::Tool(Tool::Magnify), IconKind::Tool(Tool::Crop),
+        IconKind::Undo, IconKind::Redo, IconKind::Pin, IconKind::Copy, IconKind::Save,
+        IconKind::Close, IconKind::Record, IconKind::Eyedropper,
+    ];
+
+    /// Every icon drawn in a 36 px box, as (lit pixels, ink box).
+    fn ink(icon: IconKind, side: i32) -> (usize, (i32, i32, i32, i32)) {
+        let mut buf = vec![0u32; (side * side) as usize];
+        render_icon(&mut buf, side as usize, side as usize, 0, 0, side, side, icon, [255, 255, 255, 255], None);
+        let mut lit = 0;
+        let (mut x0, mut y0, mut x1, mut y1) = (side, side, 0, 0);
+        for y in 0..side { for x in 0..side {
+            if buf[(y * side + x) as usize] & 0xFF > 60 {
+                lit += 1;
+                x0 = x0.min(x); y0 = y0.min(y); x1 = x1.max(x); y1 = y1.max(y);
+            }
+        } }
+        (lit, (x0, y0, x1, y1))
+    }
+
+    #[test]
+    fn every_icon_draws_inside_its_box_with_a_margin_and_reads_about_the_same_size() {
+        for icon in ALL {
+            let (lit, (x0, y0, x1, y1)) = ink(icon, 36);
+            assert!(lit > 25, "{icon:?} is drawn");
+            assert!(x0 >= 4 && y0 >= 4 && x1 <= 31 && y1 <= 31, "{icon:?} keeps its margin: {:?}", (x0, y0, x1, y1));
+            if icon == IconKind::Eyedropper { continue; }
+            // The same optical size: none tiny, none filling the button.
+            let (w, h) = (x1 - x0 + 1, y1 - y0 + 1);
+            assert!(w.max(h) >= 14 && w.max(h) <= 24, "{icon:?} is {w}x{h}");
+        }
+        // Scaled with its box: twice the box, about twice the ink across.
+        let (_, (a0, _, a1, _)) = ink(IconKind::Tool(Tool::Rectangle), 36);
+        let (_, (b0, _, b1, _)) = ink(IconKind::Tool(Tool::Rectangle), 72);
+        assert!(((b1 - b0) - 2 * (a1 - a0)).abs() <= 3);
+    }
+
+    #[test]
+    fn undo_and_redo_mirror_each_other() {
+        let side = 36;
+        let draw = |icon| {
+            let mut buf = vec![0u32; (side * side) as usize];
+            render_icon(&mut buf, side as usize, side as usize, 0, 0, side, side, icon, [255, 255, 255, 255], None);
+            buf
+        };
+        let (u, r) = (draw(IconKind::Undo), draw(IconKind::Redo));
+        let mut off = 0;
+        for y in 0..side { for x in 0..side {
+            let a = u[(y * side + x) as usize] & 0xFF;
+            let b = r[(y * side + side - 1 - x) as usize] & 0xFF;
+            if a.abs_diff(b) > 90 { off += 1; }
+        } }
+        assert!(off < 12, "{off} pixels differ from the mirror");
+    }
+
+    /// Writes target/tool-icons.png: every icon, on the tool panel's colors,
+    /// at 3x.
+    #[test]
+    #[ignore]
+    fn render_tool_icons_to_png() {
+        const B: i32 = 36;
+        let cols = 13;
+        let rows = ALL.len().div_ceil(cols) as i32;
+        let (w, h) = (cols as i32 * (B + 6) + 6, rows * (B + 6) + 6);
+        let mut buf = vec![0x00_22_22_24u32; (w * h) as usize];
+        for (i, icon) in ALL.iter().enumerate() {
+            let (x, y) = (6 + (i % cols) as i32 * (B + 6), 6 + (i / cols) as i32 * (B + 6));
+            for yy in y..y + B { for xx in x..x + B { buf[(yy * w + xx) as usize] = 0x00_2E_2E_32; } }
+            let side = if *icon == IconKind::Eyedropper { 21 } else { B };
+            let off = (B - side) / 2;
+            render_icon(&mut buf, w as usize, h as usize, x + off, y + off, x + off + side, y + off + side,
+                        *icon, [0xE8, 0xE8, 0xEC, 0xFF], Some([0xE5, 0x38, 0x3B, 0xFF]));
+        }
+        let img = image::RgbImage::from_fn(w as u32, h as u32, |x, y| {
+            let p = buf[(y * w as u32 + x) as usize];
+            image::Rgb([(p >> 16) as u8, (p >> 8) as u8, p as u8])
+        });
+        let big = image::imageops::resize(&img, w as u32 * 3, h as u32 * 3, image::imageops::FilterType::Nearest);
+        big.save(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tool-icons.png")).unwrap();
     }
 }

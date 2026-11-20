@@ -129,7 +129,10 @@ pub const TITLE_H: i32 = if cfg!(target_os = "macos") { 28 } else { 32 };
 const BTN_W: i32 = 46;
 /// The corner macOS's red / yellow / green buttons occupy.
 const MAC_BUTTONS_W: i32 = 78;
-const TEXT_PX: f32 = 12.5;
+/// The title: the pixel font at this scale, and (Windows / Linux) where it
+/// starts, past the icon.
+const TITLE_SCALE: i32 = 2;
+const TITLE_X: i32 = 36;
 const GLYPH: u32 = crate::palette::TEXT_BRIGHT;
 /// Windows' own close-hover red.
 const CLOSE_HOVER: u32 = 0x00_C4_2B_1C;
@@ -216,19 +219,23 @@ impl TitleBar {
 
         let w = win_w as i32;
         let rgba = |c: u32| framefang_core::color::Rgba::new((c >> 16) as u8, (c >> 8) as u8, c as u8, 255);
+        // The window's name is its heading (Brandon 2026-11-20: the strip
+        // and a big "FRAME FANG // ..." band under it said the same thing):
+        // the pixel font in the accent with its glow, "// SETTINGS".
+        let tw = crate::bitmap_font::measure(title, TITLE_SCALE);
+        let ty = (strip_h - crate::bitmap_font::GLYPH_H * TITLE_SCALE) / 2;
+        let tx = match layout {
+            // Centered, as macOS titles are, clear of the system's buttons.
+            Layout::Mac => ((w - tw) / 2).max(MAC_BUTTONS_W),
+            Layout::Windows => TITLE_X,
+        };
+        crate::hud::glow_text(&mut frame[..strip], win_w, strip_h as usize, tx, ty, TITLE_SCALE, 4, title);
         {
             let mut s = crate::painter::U32Surface { buf: &mut frame[..strip], stride: w, height: strip_h };
-            let ty = (strip_h as f32 - framefang_core::text::line_height(TEXT_PX)) / 2.0;
             match layout {
-                Layout::Mac => {
-                    // Centered name, as macOS titles are; no icon, no buttons.
-                    let tw = framefang_core::text::layout(title, TEXT_PX).width();
-                    let tx = ((w as f32 - tw) / 2.0).max(MAC_BUTTONS_W as f32);
-                    crate::painter::draw_unicode_text(&mut s, tx, ty, TEXT_PX, title, rgba(crate::palette::TEXT_MUTED()));
-                }
+                Layout::Mac => {}
                 Layout::Windows => {
                     icon_16(&mut s, 10, (strip_h - 16) / 2);
-                    crate::painter::draw_unicode_text(&mut s, 34.0, ty, TEXT_PX, title, rgba(crate::palette::TEXT_MUTED()));
                     // Minimize and close, with Windows' hover fills.
                     for (part, x0) in [(TitlePart::Minimize, w - 2 * BTN_W), (TitlePart::Close, w - BTN_W)] {
                         let hovered = self.hover == Some(part);
@@ -332,11 +339,23 @@ mod tests {
         for (layout, strip_h) in [(Layout::Windows, 32), (Layout::Mac, 28)] {
             let mut frame = vec![0u32; w * (strip_h as usize + content_h)];
             let content = vec![0x00AB_CDEF; w * content_h];
-            TitleBar::default().draw_in(layout, strip_h, None, &mut frame, w, &content, "Settings", 0x0008_0C0A);
+            TitleBar::default().draw_in(layout, strip_h, None, &mut frame, w, &content, "// SET", 0x0008_0C0A);
             assert_eq!(frame[strip_h as usize * w], 0x00AB_CDEF);
             assert_eq!(*frame.last().unwrap(), 0x00AB_CDEF);
-            assert_eq!(frame[w * 2 + 50], 0x0008_0C0A, "strip background");
+            assert_eq!(frame[w + 99], 0x0008_0C0A, "strip background");
         }
+    }
+
+    #[test]
+    fn every_dialog_title_fits_its_strip_beside_the_buttons() {
+        // The pixel-font titles: past the icon, clear of minimize, and
+        // inside the strip with their glow.
+        for t in ["// SETTINGS", "// ABOUT", "// UPDATES", "// WELCOME", "// CONVERT IMAGE", "// CONVERT VIDEO"] {
+            let tw = crate::bitmap_font::measure(t, TITLE_SCALE);
+            assert!(TITLE_X + tw + 16 <= 480 - 2 * BTN_W, "{t}");
+            assert!(crate::bitmap_font::GLYPH_H * TITLE_SCALE + 8 <= TITLE_H.min(28), "{t} is too tall");
+        }
+        assert!(TITLE_X >= 10 + 16 + 8, "past the icon");
     }
 
     #[test]

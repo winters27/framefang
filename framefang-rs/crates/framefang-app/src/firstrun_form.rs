@@ -33,9 +33,11 @@ use crate::painter;
 use crate::palette::*;
 
 const WIN_W: u32 = 520;
-const WIN_H: u32 = 310;
+const WIN_H: u32 = 248;
 const PAD:   i32 = 22;
-const HEADER_H: i32 = 84;
+/// The version line's top: the window's first line, right under the title
+/// bar (which holds the heading).
+const BODY_Y: i32 = 22;
 const BTN_W: i32 = 140;
 const BTN_H: i32 = 34;
 /// Left edge of the value column in the HOTKEY / SAVE TO rows.
@@ -150,8 +152,6 @@ impl FirstRunView {
                 }
                 if self.hit_test(self.cursor.0, self.cursor.1) {
                     self.outcome = Some(FirstRunOutcome::Closed);
-                } else {
-                    crate::chrome::press_off_controls(&self.window, self.cursor.1, HEADER_H);
                 }
             }
             WindowEvent::Resized(_) | WindowEvent::RedrawRequested => self.redraw(),
@@ -177,17 +177,17 @@ impl FirstRunView {
         // The dialog draws into its own buffer, placed below the title strip.
         let win_h = (h.get() as usize).saturating_sub(crate::chrome::TITLE_H as usize);
         let mut buf = vec![0u32; win_w * win_h];
-        crate::hud::backdrop(&mut buf, win_w, win_h, HEADER_H);
+        // The title bar holds the heading; the glowing rule runs along the
+        // body's top.
+        crate::hud::backdrop(&mut buf, win_w, win_h, 0);
 
         let mut surf = BufferSurface { buf: &mut buf, w: win_w as i32, h: win_h as i32 };
 
-        // Title strip.
-        crate::hud::heading(surf.buf, win_w, win_h, PAD, 22, "FRAME FANG // WELCOME");
         let version = format!("v{}  //  first run", env!("CARGO_PKG_VERSION"));
-        draw_text(&mut surf, PAD, 50, 1, &version, argb_to_framefang(TEXT_MUTED()));
+        draw_text(&mut surf, PAD, BODY_Y, 1, &version, argb_to_framefang(TEXT_MUTED()));
 
         // The one thing a first-time user needs to know.
-        let mut y = HEADER_H + 26;
+        let mut y = BODY_Y + 26;
         draw_text(&mut surf, PAD, y, 1,
             "Frame Fang is running in your tray / menu bar.", argb_to_framefang(TEXT_BRIGHT));
 
@@ -218,7 +218,7 @@ impl FirstRunView {
         draw_text(&mut surf, bx + (bw - tw) / 2, by + (bh - bitmap_font::GLYPH_H) / 2, 1,
             label, argb_to_framefang(LASER()));
 
-        self.title_bar.draw(&mut frame, win_w, &buf, "Welcome", BG_TOP());
+        self.title_bar.draw(&mut frame, win_w, &buf, "// WELCOME", BG_TOP());
         if let Err(e) = frame.present() { eprintln!("firstrun: buf.present: {e}"); }
     }
 }

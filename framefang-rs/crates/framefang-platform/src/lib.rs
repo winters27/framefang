@@ -20,11 +20,14 @@ pub mod hotkey;
 #[cfg(target_os = "linux")]
 pub mod hotkey_portal;
 pub mod instance;
+/// Reading the text in a picture with the system's own OCR.
+pub mod ocr;
 /// Raw keyboard input: the second path the hotkeys arrive on, for apps that
 /// swallow keys before `RegisterHotKey` sees them.
 #[cfg(target_os = "windows")]
 mod raw_keys;
 pub mod recorder;
+pub mod scroll_parts;
 pub mod session;
 pub mod tray;
 /// The windows on screen at capture time, for the hover highlight.

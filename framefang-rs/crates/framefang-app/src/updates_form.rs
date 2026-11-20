@@ -34,17 +34,19 @@ use crate::painter;
 use crate::palette::*;
 
 const WIN_W: u32 = 560;
-const WIN_H: u32 = 460;
+const WIN_H: u32 = 374;
 const PAD:   i32 = 22;
-const BTN_H: i32 = 30;
-const HEADER_H: i32 = 84;
+/// The first line's top, right under the title bar (which holds the
+/// heading).
+const BODY_Y: i32 = 22;
 const LINE_H:   i32 = bitmap_font::GLYPH_H + 5;
-const NOTES_TOP_OFFSET: i32 = 124;
+/// The release notes' top, under the INSTALLED / LATEST / RELEASED lines.
+const NOTES_TOP: i32 = BODY_Y + 100;
 const NOTES_BOTTOM_GAP: i32 = 70;
 const SCROLLBAR_W: i32 = 6;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum BtnKind { OpenReleases, Download, CopyCommand, Close }
+enum BtnKind { OpenReleases, Download, CopyCommand }
 
 struct Btn {
     kind:  BtnKind,
@@ -167,9 +169,9 @@ impl UpdatesView {
 
         let notes_rect = (
             PAD,
-            HEADER_H + NOTES_TOP_OFFSET,
+            NOTES_TOP,
             WIN_W as i32 - PAD * 2,
-            WIN_H as i32 - HEADER_H - NOTES_TOP_OFFSET - NOTES_BOTTOM_GAP,
+            WIN_H as i32 - NOTES_TOP - NOTES_BOTTOM_GAP,
         );
 
         let (channel, action) = crate::install_source::detected().clone();
@@ -358,10 +360,7 @@ impl UpdatesView {
                                 _ => UpdatesOutcome::OpenReleases,
                             }
                         }
-                        BtnKind::Close => UpdatesOutcome::Closed,
                     });
-                } else {
-                    crate::chrome::press_off_controls(&self.window, self.cursor.1, HEADER_H);
                 }
             }
             WindowEvent::Resized(_) | WindowEvent::RedrawRequested => self.redraw(),
@@ -390,11 +389,8 @@ impl UpdatesView {
     }
 
     fn build_btns(&self) -> Vec<Btn> {
+        // No Close button: the title bar's own closes the window.
         let mut btns = Vec::new();
-        let header_btn_y = (HEADER_H - BTN_H) / 2 + 4;
-        let close_w = 110;
-        let close_x = WIN_W as i32 - PAD - close_w;
-        btns.push(Btn { kind: BtnKind::Close, label: "Close".into(), rect: (close_x, header_btn_y, close_w, BTN_H) });
 
         let bh = 36;
         let by = WIN_H as i32 - PAD - bh;
@@ -465,18 +461,14 @@ impl UpdatesView {
         // The dialog draws into its own buffer, placed below the title strip.
         let win_h = (h.get() as usize).saturating_sub(crate::chrome::TITLE_H as usize);
         let mut buf = vec![0u32; win_w * win_h];
-        crate::hud::backdrop(&mut buf, win_w, win_h, HEADER_H);
-        let _ = PANEL_BORDER();
+        // The title bar holds the heading; the glowing rule runs along the
+        // body's top.
+        crate::hud::backdrop(&mut buf, win_w, win_h, 0);
 
         let mut surf = BufferSurface { buf: &mut buf, w: win_w as i32, h: win_h as i32 };
 
-        // Title strip.
-        crate::hud::heading(surf.buf, win_w, win_h, PAD, 22, "FRAME FANG // UPDATES");
-        draw_text(&mut surf, PAD, 50, 1, "Check for new releases on GitHub.",
-                  argb_to_framefang(TEXT_MUTED()));
-
         // Body — current + latest + date.
-        let mut y = HEADER_H + 24;
+        let mut y = BODY_Y;
         draw_text(&mut surf, PAD, y, 1, "INSTALLED",  argb_to_framefang(SECTION_TINT()));
         let installed = format!("v{}", env!("CARGO_PKG_VERSION"));
         draw_text(&mut surf, PAD + 120, y, 1, &installed, argb_to_framefang(TEXT_BRIGHT));
@@ -571,7 +563,7 @@ impl UpdatesView {
             render_btn(&mut surf, b, hovered);
         }
 
-        self.title_bar.draw(&mut frame, win_w, &buf, "Updates", BG_TOP());
+        self.title_bar.draw(&mut frame, win_w, &buf, "// UPDATES", BG_TOP());
         if let Err(e) = frame.present() { eprintln!("updates: buf.present: {e}"); }
     }
 
@@ -975,7 +967,7 @@ fn wrap_body(text: &str, max_px: i32) -> Vec<String> {
 
 fn render_btn<S: painter::Surface>(surf: &mut S, b: &Btn, hovered: bool) {
     let (x, y, w, h) = b.rect;
-    let is_primary = matches!(b.kind, BtnKind::Close | BtnKind::Download | BtnKind::CopyCommand);
+    let is_primary = matches!(b.kind, BtnKind::Download | BtnKind::CopyCommand);
     let border = if is_primary { LASER() } else if hovered { LASER_DIM() } else { PANEL_BORDER() };
     let fill   = if is_primary && hovered { PRIMARY_FILL() } else if hovered { HOVER_FILL() } else { 0x0000_0000 };
     if fill != 0 { fill_rect(surf, x, y, w, h, argb_to_framefang(fill)); }

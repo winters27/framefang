@@ -5,28 +5,16 @@
 //! dispatches `WindowEvent`s by `WindowId`, and polls `outcome` after each
 //! event to learn when the user saved or cancelled.
 //!
-//! Layout — three grouped sections, all keyboard- and mouse-driven:
-//!
-//!   CAPTURES      Screenshots folder (path display + Browse…)
-//!                 Recordings folder  (path display + Browse…)
-//!                 Copy screenshots automatically (toggle pill)
-//!                   Close the editor after copying (toggle pill, nested)
-//!   HOTKEYS       Capture region     (live binding + REBIND button →
-//!                                      capture next keypress)
-//!                 Capture full screen (same, plus CLEAR — optional)
-//!                 Record screen       (same, plus CLEAR — optional)
-//!                 The system's own screenshot key (button to its page)
-//!   APPEARANCE    Theme   (one chip per color scheme)
-//!                 Start with system (toggle pill)
+//! Layout: four tabs (CAPTURES, FILES, HOTKEYS, GENERAL), each a page of
+//! settings with a hairline between them; see `build_rows`.
 //!
 //! There is no Save button: every change is handed to the tray as it is
-//! made (`SettingsOutcome::Changed`), which applies and saves it. A setting
-//! that differs from its default carries a diamond in the accent left of its
-//! label; clicking it puts the default back.
+//! made (`SettingsOutcome::Changed`), which applies and saves it.
 //!
-//! The header holds the settings file: Edit as JSON opens settings.json in
-//! the user's default editor (a saved edit shows here within a second),
-//! Export... saves a copy where the user picks, Import... loads one.
+//! GENERAL's last row holds the settings file: Edit as JSON opens
+//! settings.json in the user's default editor (a saved edit shows here within
+//! a second), Import... loads a copy, Export... saves one where the user
+//! picks. What the last of them did shows under the heading.
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -54,16 +42,10 @@ use crate::palette::*;
 
 // ── geometry ────────────────────────────────────────────────────────────────
 const WIN_W: u32 = 640;
-// Two extra hotkey rows over the single-binding layout this dialog started
-// with, each ROW_H plus the 8 px inter-row gap. The bottom margin is a
-// padding band rather than the taller footer strip the convert dialogs
-// reserve: the only message this dialog shows inline is the hotkey-conflict
-// one, and that renders under the HOTKEYS block next to the rows it is
-// about. The window doesn't scroll. Its height follows its rows
-// (`content_height`); with the Windows Print Screen card and the
-// After-a-capture row it needs an 808 px screen once the title bar and a
-// 48 px panel are counted (768 until that row). The inter-row gap is 6 px
-// rather than the 8 px the other dialogs use.
+// The window doesn't scroll. Its height follows its tallest page
+// (`window_height`) and fits a 1280 x 720 screen with a 48 px panel (a test
+// pins it). The bottom margin is a padding band: the hotkey-conflict message
+// renders under the HOTKEYS rows it is about.
 const BOTTOM_BAND: i32 = 16;
 /// Windows' Print Screen guide under HOTKEYS, shown only while the capture
 /// key is plain Print Screen (the only key Windows' switch affects): a card a
@@ -81,57 +63,37 @@ const ROW_H: i32 = 34;
 /// The label column. Wide enough for the longest label plus the indent of a
 /// refining row and a clear gap before its control (pinned by a test).
 const LABEL_W: i32 = 224;
-/// The window's heading, drawn at scale 2 left of the header buttons.
-const TITLE: &str = "FRAME FANG // SETTINGS";
-// Header buttons, right-anchored: Export..., Import..., Edit as JSON. There
-// is no Save: every change is saved as it is made.
-const EXPORT_W: i32 = 92;
-const IMPORT_W: i32 = 92;
-const EDIT_W:   i32 = 112;
-/// Section headings: the pixel font at twice its size, with room around them
-/// so the page reads as three clear groups (Brandon 2026-11-19). `ABOVE` is
-/// from the last row of one section to the next heading, `BELOW` from a
-/// heading to its first row, `TOP` from the header band to the first heading.
-const SECTION_SCALE: i32 = 2;
+/// The window's heading, drawn in the title bar (`chrome`).
+const TITLE: &str = "// SETTINGS";
+/// Room under the last hotkey row for the system line or the Windows card.
 const SECTION_ABOVE: i32 = 34;
-const SECTION_BELOW: i32 = 16;
-const SECTION_TOP: i32 = 22;
-/// A heading's whole band: what one costs in height.
-const SECTION_BAND: i32 = bitmap_font::GLYPH_H * SECTION_SCALE + SECTION_BELOW;
-/// Under the heading while nothing else needs saying.
-const SUBTITLE: &str = "Changes save as you make them.  [Esc] closes";
-const HEADER_BTN_GAP: i32 = 8;
 /// Between the Theme row's color chips.
 const THEME_CHIP_GAP: i32 = 8;
-/// The After-a-capture row: "Open the editor" and "Copy only", then the
-/// three switch keys, right-aligned. Chips in a group sit `CHIP_GAP` apart,
-/// the two groups at least `GROUP_GAP` apart, so they read as two choices.
-const MODE_CHIP_W: (i32, i32) = (110, 76);
-const KEY_CHIP_W: i32 = 48;
+/// Between a row's choice chips.
 const CHIP_GAP: i32 = 6;
-const GROUP_GAP: i32 = 16;
-const BTN_H: i32 = 30;
 // Buttons that sit inside a hotkey row, right-anchored: REBIND on the edge,
 // CLEAR to its left on the two optional actions.
 const REBIND_W: i32 = 100;
 const CLEAR_W:  i32 = 76;
-// Header band carries the brand strip on top and the action buttons (Save /
-// Cancel / Edit-as-JSON) anchored to its right side. Bigger than the body
-// padding so the buttons have generous click targets.
-const HEADER_H: i32 = 84;
-// No footer rule anymore — the action buttons moved into the header.
-const FOOTER_H: i32 = 28;
+/// Between the settings file's buttons and the line saying what the last of
+/// them did.
+const STATUS_GAP: i32 = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WidgetKind {
     SaveFolder,
     RecordingsFolder,
-    /// Where FFmpeg was found, or that it isn't installed (a label and a
-    /// read-out; its button is `FfmpegDownload`).
+    /// Which FFmpeg is used: the one picked, or where one was found, or that
+    /// none is installed (a label and a read-out; its buttons follow).
     Ffmpeg,
     /// Download Framefang's FFmpeg. Live only on Windows while none is
-    /// found and no download is running.
+    /// found, none is picked and no download is running.
     FfmpegDownload,
+    /// Pick an FFmpeg to use (always there, at the row's right end).
+    FfmpegBrowse,
+    /// Forget the pick and find FFmpeg by itself again. In Download's place,
+    /// live only while an FFmpeg is picked.
+    FfmpegAuto,
     /// Read-out box for one action's binding.
     HotkeyDisplay(HotkeyAction),
     /// "REBIND" button: arms capture of the next keypress for that action.
@@ -146,83 +108,206 @@ enum WidgetKind {
     /// The After-a-capture row's label and caption. The chips beside it are
     /// the controls.
     AfterCapture,
-    /// Open the editor (`true`) or just copy (`false`) when a drag ends.
-    AfterCaptureChoice(bool),
-    /// The key that, held, makes one capture do the other thing.
-    SwitchKeyChoice(SwitchKey),
-    /// Every screenshot goes to the clipboard as it is taken.
-    AutoCopy,
-    /// The editor's Copy also closes the editor. Shown under AutoCopy.
+    /// Edit, copy and edit, or just copy when a drag ends.
+    AfterCaptureChoice(framefang_core::settings::AfterCapture),
+    /// The same three for a scrolling capture, set apart (its row's label,
+    /// then its chips).
+    ScrollAfter,
+    ScrollAfterChoice(framefang_core::settings::AfterCapture),
+    /// A line under a choice, as a sentence: "Hold [SHIFT] to just copy
+    /// instead". Only words; its key is the control.
+    HoldLine(Hold),
+    /// That line's key: click it, then press any key to bind it.
+    HoldKey(Hold),
+    /// Keep the last 10 captures for the tray's RECENT list.
+    KeepRecent,
+    /// The editor's Copy also closes the editor. Shown on After a capture's
+    /// sub-strip, under its hold line.
     CloseAfterCopy,
     /// Screenshots show the mouse pointer. Laid out only where the platform
     /// can draw it (`framefang_platform::cursor::SUPPORTED`).
     CaptureCursor,
+    /// The Settings file row's label; its three buttons are the controls.
+    SettingsFile,
     OpenJson,
     /// Save a copy of the settings to a file the user picks.
     ExportBtn,
     /// Replace the settings with ones from a file the user picks.
     ImportBtn,
-    /// The changed mark left of a setting: shown, and clickable, only while
-    /// that setting differs from its default; clicking puts the default back.
-    Reset(Setting),
     /// Opens the system's own screenshot-shortcut page. Laid out only where
     /// `system_shortcuts::page()` has one.
     SystemShortcut,
+    /// One tab in the strip under the header.
+    Tab(Tab),
+    /// The File names row's label and caption (the next name); its chips are
+    /// the controls.
+    FileNames,
+    /// A file-name preset by index into `file_name::PRESETS`, or `None` for
+    /// CUSTOM (a pattern set in settings.json).
+    FileNameChoice(Option<usize>),
+    /// The Record as row's label; its chips are the controls.
+    RecordFormat,
+    /// Recordings end as GIF (`true`) or MP4.
+    RecordFormatChoice(bool),
+    /// The Frame row's label; its chips are the controls.
+    Frame,
+    FrameChoice(framefang_core::settings::OutputFrame),
+    /// The QR links row's label; its chips are the controls.
+    QrLinks,
+    /// A web link in a QR code opens (`true`) or is copied.
+    QrLinksChoice(bool),
+    /// A group of settings: a setting and, from the given y down, its
+    /// sub-settings. No surface of its own (Brandon 2026-11-20: boxes looked
+    /// clunky, picked "A: Lines"): a hairline above it when it isn't the
+    /// page's first, and a tree line joining its sub-settings to it.
+    Card(Option<i32>),
+    /// A hold line's REBIND button, at the line's right end: the same as
+    /// clicking its key.
+    HoldRebind(Hold),
+    /// A hairline between two settings in one card.
+    Divider,
 }
 
-/// One setting as the user sees it, for its changed mark. A row of chips
-/// that sets two fields (After a capture: what happens, and the key that
-/// flips it) is one setting.
+/// Room above and below a group's rows, above its sub-settings, and between
+/// two settings (a hairline runs through the middle of that).
+const CARD_IN: i32 = 0;
+const SUB_IN: i32 = 0;
+const CARD_GAP: i32 = 12;
+/// The tree line from a setting down to its sub-settings: its x from the
+/// row's left edge, and where each tick ends (the sub-setting's words start
+/// a few px after, at `SUB_INDENT`).
+const TREE_X: i32 = 10;
+const TREE_TICK: i32 = 18;
+
+/// A card being laid out: where it starts, and where its sub-strip does.
+struct CardBuild { top: i32, sub: Option<i32> }
+
+impl CardBuild {
+    fn open(y: &mut i32) -> CardBuild {
+        let c = CardBuild { top: *y, sub: None };
+        *y += CARD_IN;
+        c
+    }
+
+    /// The rows from here down are this card's sub-settings.
+    fn sub(&mut self, y: &mut i32) {
+        self.sub = Some(*y);
+        *y += SUB_IN;
+    }
+
+    fn close(self, rows: &mut Vec<Row>, y: &mut i32) {
+        *y += if self.sub.is_some() { SUB_IN } else { CARD_IN };
+        rows.push(Row { kind: WidgetKind::Card(self.sub), label: "",
+                        rect: (PAD, self.top, WIN_W as i32 - 2 * PAD, *y - self.top) });
+        *y += CARD_GAP;
+    }
+}
+
+/// Between two settings in one group: the same gap and hairline as between
+/// two groups, so every setting on a page sits the same distance apart.
+fn divider(rows: &mut Vec<Row>, y: &mut i32) {
+    rows.push(Row { kind: WidgetKind::Divider, label: "",
+                    rect: (PAD, *y + CARD_GAP / 2, WIN_W as i32 - 2 * PAD, 1) });
+    *y += CARD_GAP;
+}
+
+/// Which held key a hold line sets: the capture switch key (editor or just
+/// copy), QR's (open a link or copy it), or a scrolling capture's.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Setting {
-    ShotsFolder,
-    RecordingsFolder,
-    AfterCapture,
-    CaptureCursor,
-    AutoCopy,
-    CloseAfterCopy,
-    Hotkey(HotkeyAction),
-    Theme,
-    StartWithOs,
-}
+enum Hold { Capture, Qr, Scroll }
 
-impl Setting {
-    /// Whether `s` holds this setting's default.
-    fn is_default(self, s: &AppSettings) -> bool {
-        let d = AppSettings::default();
+impl Hold {
+    fn key(self, s: &AppSettings) -> SwitchKey {
         match self {
-            Setting::ShotsFolder      => s.save_directory == d.save_directory,
-            Setting::RecordingsFolder => s.recordings_directory == d.recordings_directory,
-            Setting::AfterCapture     => s.open_editor == d.open_editor && s.switch_key() == d.switch_key(),
-            Setting::CaptureCursor    => s.capture_cursor == d.capture_cursor,
-            Setting::AutoCopy         => s.auto_copy == d.auto_copy,
-            Setting::CloseAfterCopy   => s.close_after_copy == d.close_after_copy,
-            Setting::Hotkey(a)        => s.hotkey_for(a) == d.hotkey_for(a),
-            Setting::Theme            => crate::palette::Scheme::parse(&s.theme) == crate::palette::Scheme::parse(&d.theme),
-            Setting::StartWithOs      => s.start_with_windows == d.start_with_windows,
+            Hold::Capture => s.switch_key(),
+            Hold::Qr => s.qr_switch_key(),
+            Hold::Scroll => s.scroll_switch_key(),
         }
     }
 
-    /// Put this setting's default back into `s`.
-    fn reset(self, s: &mut AppSettings) {
-        let d = AppSettings::default();
+    fn set(self, s: &mut AppSettings, k: SwitchKey) {
         match self {
-            Setting::ShotsFolder      => s.save_directory = d.save_directory,
-            Setting::RecordingsFolder => s.recordings_directory = d.recordings_directory,
-            Setting::AfterCapture     => { s.open_editor = d.open_editor; s.switch_key = d.switch_key; }
-            Setting::CaptureCursor    => s.capture_cursor = d.capture_cursor,
-            Setting::AutoCopy         => s.auto_copy = d.auto_copy,
-            Setting::CloseAfterCopy   => s.close_after_copy = d.close_after_copy,
-            Setting::Hotkey(a)        => s.set_hotkey_for(a, d.hotkey_for(a)),
-            Setting::Theme            => s.theme = d.theme,
-            Setting::StartWithOs      => s.start_with_windows = d.start_with_windows,
+            Hold::Capture => s.switch_key = k.name(),
+            Hold::Qr => s.qr_switch_key = k.name(),
+            Hold::Scroll => s.scroll_switch_key = k.name(),
+        }
+    }
+
+    /// The words after the key: what holding it does, the other of the
+    /// two choices above it.
+    fn tail(self, s: &AppSettings) -> &'static str {
+        match self {
+            Hold::Capture if s.open_editor => "to just copy instead",
+            Hold::Capture => "to open the editor instead",
+            Hold::Qr if s.open_qr_links => "to copy links instead",
+            Hold::Qr => "to open links instead",
+            Hold::Scroll if s.scroll_after() == framefang_core::settings::AfterCapture::CopyOnly => "to open the editor instead",
+            Hold::Scroll => "to just copy instead",
         }
     }
 }
 
-/// The changed mark: a diamond in the gutter left of the setting's label.
-const MARK_X: i32 = PAD - 11;
-const MARK_R: i32 = 3;
+/// A hold line: "Hold", the key, then what holding it does. Where its key
+/// sits from the line's value column, and the key's name now.
+const HOLD_WORD: &str = "Hold";
+const HOLD_GAP: i32 = 8;
+/// A hold line is shorter than a row: it belongs to the choice above it.
+const HOLD_ROW_H: i32 = 28;
+/// Its REBIND button: the Hotkeys page's button, a size down to suit the
+/// shorter line.
+const HOLD_BTN_W: i32 = 72;
+const HOLD_BTN_H: i32 = 20;
+/// What the key says while it waits for a press.
+const HOLD_LISTEN: &str = "PRESS A KEY";
+
+fn hold_key_name(hold: Hold, s: &AppSettings, listening: bool) -> String {
+    if listening { HOLD_LISTEN.to_owned() } else { hold.key(s).label().to_uppercase() }
+}
+
+/// The key's face top-left and its width (shadow included), for a line
+/// whose words have their top at `text_y`.
+fn hold_key_rect(line: &Row, name: &str) -> (i32, i32, i32, i32) {
+    let x = line.rect.0 + 6 + SUB_INDENT + bitmap_font::measure(HOLD_WORD, 1) + HOLD_GAP;
+    let text_y = line.rect.1 + (line.rect.3 - bitmap_font::GLYPH_H) / 2;
+    let face_y = text_y - (crate::keycap::face_h(1) - bitmap_font::GLYPH_H) / 2;
+    (x, face_y, crate::keycap::key_w(name, 1), crate::keycap::height(1))
+}
+
+/// Settings' pages, one tab each, in strip order.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Tab { Captures, Files, Hotkeys, General }
+
+impl Tab {
+    const ALL: [Tab; 4] = [Tab::Captures, Tab::Files, Tab::Hotkeys, Tab::General];
+
+    /// The tab's words, numbered like the dialogs' section labels.
+    fn label(self) -> &'static str {
+        match self {
+            Tab::Captures => "01 CAPTURES",
+            Tab::Files => "02 FILES",
+            Tab::Hotkeys => "03 HOTKEYS",
+            Tab::General    => "04 GENERAL",
+        }
+    }
+
+    fn step(self, by: i32) -> Tab {
+        let i = Tab::ALL.iter().position(|t| *t == self).unwrap_or(0) as i32;
+        Tab::ALL[(i + by).rem_euclid(Tab::ALL.len() as i32) as usize]
+    }
+}
+
+/// The tab strip: where it starts under the title bar, how tall a tab is,
+/// and the room on either side of a tab's words.
+const STRIP_Y: i32 = 16;
+const TAB_H: i32 = 28;
+const TAB_PAD: i32 = 14;
+const TAB_GAP: i32 = 4;
+/// A page's first row, under the strip.
+const PAGE_TOP: i32 = STRIP_Y + TAB_H + 22;
+/// The strip's keyboard hint, at its right end.
+const TAB_HINT: &str = "[Ctrl]+[Tab]";
+
+fn tab_w(t: Tab) -> i32 { bitmap_font::measure(t.label(), 1) + 2 * TAB_PAD }
 
 /// The line under HOTKEYS: the system page's button, and whether the system
 /// is taking the capture binding right now.
@@ -235,9 +320,12 @@ struct Row {
 }
 
 pub enum SettingsOutcome {
-    /// A setting changed: the tray applies and saves it now. There is no
-    /// Save button; the window stays open.
-    Changed(AppSettings),
+    /// Settings changed here: only what changed, which the tray applies to
+    /// `settings.json` as it is on disk and saves at once. There is no Save
+    /// button; the window stays open.
+    Patch(framefang_core::settings_store::Patch),
+    /// Import: these settings, all of them, replace the file.
+    Replace(AppSettings),
     /// The window was closed (Esc or its close button). Everything is
     /// already saved; the tray turns the shortcuts back on.
     Closed,
@@ -258,6 +346,10 @@ pub struct SettingsView {
     /// next non-modifier `KeyboardInput::Pressed` event commits its binding;
     /// `Esc` cancels and reverts to `hotkey_before_capture`.
     capturing_hotkey: Option<HotkeyAction>,
+    /// A hold line's key waiting for a press to bind, and why the last press
+    /// was refused, if it was.
+    listening_hold: Option<Hold>,
+    hold_refused: Option<String>,
     /// Snapshot of the binding the captured action had before the user
     /// pressed REBIND, so Esc can roll back the draft without disk
     /// persistence. `None` when that action was unbound.
@@ -298,11 +390,25 @@ pub struct SettingsView {
     /// What the last Export or Import did, shown in the subtitle's place;
     /// `true` for a failure.
     status: Option<(String, bool)>,
-    pub outcome: Option<SettingsOutcome>,
+    /// The settings the tray last gave this window. A change is sent as the
+    /// difference from these, so it carries nothing this window didn't
+    /// change.
+    baseline: AppSettings,
+    /// The draft came from Import, so the next report replaces the file.
+    imported: bool,
+    /// The page shown.
+    tab: Tab,
+    /// Answers for the tray, in order (one click can give two: a change,
+    /// then opening settings.json).
+    outcome: std::collections::VecDeque<SettingsOutcome>,
 }
 
-/// The FFmpeg row's button.
+/// The FFmpeg row's buttons: Download or Auto (one slot), then Browse...
+/// at the right end, as wide as the folder rows' Browse... above it.
 const FFMPEG_BTN_W: i32 = 104;
+const BROWSE_W: i32 = 80;
+/// Auto is a short word: narrower than Download, so a picked path has room.
+const AUTO_W: i32 = 64;
 
 impl SettingsView {
     /// `ffmpeg_attention`: opened because recording or conversion needed
@@ -310,8 +416,10 @@ impl SettingsView {
     pub fn new(loop_target: &ActiveEventLoop, current: AppSettings, ffmpeg_attention: bool) -> Result<Self> {
         let system_page = crate::system_shortcuts::page();
         let guide_shown = shows_windows_guide(system_page, &current);
-        let rows = Self::build_rows(system_page, guide_shown);
-        let win_h = content_height(&rows) + crate::chrome::TITLE_H as u32;
+        // Something needed FFmpeg: open where it is set up.
+        let tab = if ffmpeg_attention { Tab::Files } else { Tab::Captures };
+        let rows = Self::build_rows(system_page, guide_shown, tab);
+        let win_h = window_height(system_page);
         let (cx, cy) = centered_origin(loop_target, WIN_W, win_h);
         let attrs = crate::chrome::frameless(WindowAttributes::default())
             .with_title("Frame Fang: Settings")
@@ -338,12 +446,17 @@ impl SettingsView {
 
         let mut me = SettingsView {
             window, _ctx: ctx, surface,
+            baseline: current.clone(),
+            imported: false,
+            tab,
             draft: current,
             rows,
             guide_shown,
             cursor: (0, 0),
             hover: None,
             capturing_hotkey: None,
+            listening_hold: None,
+            hold_refused: None,
             hotkey_before_capture: None,
             mods_state: ModifiersState::empty(),
             error: None,
@@ -352,34 +465,58 @@ impl SettingsView {
             capture_hint: None,
             switch_name: crate::system_shortcuts::switch_name(),
             switch_page: crate::system_shortcuts::windows_page_path(),
-            ffmpeg_found: crate::convert_video_form::locate_ffmpeg(),
+            ffmpeg_found: None,
             ffmpeg_attention,
             fetch_seen: crate::ffmpeg_fetch::state(),
             title_bar: Default::default(),
             status: None,
-            outcome: None,
+            outcome: Default::default(),
         };
         me.refresh_system_takes();
+        me.ffmpeg_found = me.find_ffmpeg();
         me.redraw();
         Ok(me)
     }
 
+    /// The FFmpeg recording and conversion would use with the draft: its
+    /// pick while that file exists, else the one found by itself.
+    fn find_ffmpeg(&self) -> Option<PathBuf> {
+        framefang_platform::recorder::locate_ffmpeg_with(self.draft.chosen_ffmpeg().as_deref())
+    }
+
     pub fn window_id(&self) -> WindowId { self.window.id() }
 
-    /// The settings changed outside this window (`settings.json` edited by
-    /// hand): show them. A rebind in progress is left listening.
+    /// The settings as the tray now has them (after any save, a hand edit of
+    /// `settings.json`, or a refused change): show them, and send later
+    /// changes as differences from them. A rebind in progress is left
+    /// listening, and Esc there now goes back to this binding.
     pub fn replace_draft(&mut self, s: AppSettings) {
+        self.baseline = s.clone();
+        self.imported = false;
+        if let Some(a) = self.capturing_hotkey { self.hotkey_before_capture = s.hotkey_for(a); }
         if s == self.draft { return; }
         self.draft = s;
+        crate::palette::set(crate::palette::Scheme::parse(&self.draft.theme));
+        self.ffmpeg_found = self.find_ffmpeg();
         self.relayout();
         self.window.request_redraw();
     }
 
-    /// Hand the draft to the tray if `before` differs from it.
+    /// Answers for the tray since the last call, oldest first.
+    pub fn take_outcomes(&mut self) -> Vec<SettingsOutcome> {
+        self.outcome.drain(..).collect()
+    }
+
+    /// Hand the tray what changed, if `before` differs from the draft.
     fn report_change(&mut self, before: &AppSettings) {
-        if self.draft != *before {
-            self.outcome = Some(SettingsOutcome::Changed(self.draft.clone()));
+        if self.draft == *before { self.imported = false; return; }
+        if std::mem::take(&mut self.imported) {
+            self.outcome.push_back(SettingsOutcome::Replace(self.draft.clone()));
+        } else {
+            let patch = framefang_core::settings_store::diff(&self.baseline, &self.draft);
+            if !patch.is_empty() { self.outcome.push_back(SettingsOutcome::Patch(patch)); }
         }
+        self.baseline = self.draft.clone();
     }
 
     /// Called from the tray loop's poll: redraw when the FFmpeg download
@@ -388,7 +525,7 @@ impl SettingsView {
         let now = crate::ffmpeg_fetch::state();
         if now == self.fetch_seen { return; }
         if now == crate::ffmpeg_fetch::Fetch::Done {
-            self.ffmpeg_found = crate::convert_video_form::locate_ffmpeg();
+            self.ffmpeg_found = self.find_ffmpeg();
         }
         self.fetch_seen = now;
         self.window.request_redraw();
@@ -396,8 +533,9 @@ impl SettingsView {
 
     /// Something needed FFmpeg while Settings was already open: light the row.
     pub fn draw_attention_to_ffmpeg(&mut self) {
-        self.ffmpeg_found = crate::convert_video_form::locate_ffmpeg();
+        self.ffmpeg_found = self.find_ffmpeg();
         self.ffmpeg_attention = self.ffmpeg_found.is_none();
+        self.switch_tab(Tab::Files);
         self.window.focus_window();
         self.window.request_redraw();
     }
@@ -406,6 +544,7 @@ impl SettingsView {
     /// downloading.
     fn ffmpeg_actionable(&self) -> bool {
         crate::ffmpeg_fetch::offered() && self.ffmpeg_found.is_none() && !crate::ffmpeg_fetch::busy()
+            && self.draft.chosen_ffmpeg().is_none()
     }
 
     fn refresh_system_takes(&mut self) {
@@ -424,23 +563,40 @@ impl SettingsView {
         let guide = shows_windows_guide(self.system_page, &self.draft);
         if guide == self.guide_shown { return; }
         self.guide_shown = guide;
-        self.rows = Self::build_rows(self.system_page, guide);
+        // The window keeps its size: it was made for the tallest page.
+        self.rows = Self::build_rows(self.system_page, guide, self.tab);
         self.hover = None;
-        let h = content_height(&self.rows) + crate::chrome::TITLE_H as u32;
-        let _ = self.window.request_inner_size(PhysicalSize::new(WIN_W, h));
+        self.window.request_redraw();
+    }
+
+    /// Show page `t`. A rebind still listening on the page left behind is
+    /// cancelled first, as Esc would, so no key binds a row out of sight.
+    fn switch_tab(&mut self, t: Tab) {
+        self.stop_hold_listen();
+        if let Some(action) = self.capturing_hotkey.take() {
+            self.draft.set_hotkey_for(action, self.hotkey_before_capture);
+            self.capture_hint = None;
+            self.error = None;
+            self.relayout();
+        }
+        if t == self.tab { return; }
+        self.tab = t;
+        self.rows = Self::build_rows(self.system_page, self.guide_shown, t);
+        // What is under the pointer now.
+        self.hover = self.hit_test(self.cursor.0, self.cursor.1);
         self.window.request_redraw();
     }
 
     pub fn handle_event(&mut self, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
-                self.outcome = Some(SettingsOutcome::Closed);
+                self.outcome.push_back(SettingsOutcome::Closed);
             }
             // Back from the system page: the setting may have changed.
             WindowEvent::Focused(true) => {
                 self.refresh_system_takes();
                 // FFmpeg may have been installed meanwhile.
-                let found = crate::convert_video_form::locate_ffmpeg();
+                let found = self.find_ffmpeg();
                 if found != self.ffmpeg_found {
                     self.ffmpeg_found = found;
                     self.window.request_redraw();
@@ -477,14 +633,22 @@ impl SettingsView {
                     Some(_) => return,
                     None => {}
                 }
-                if let Some(i) = self.hit_test(self.cursor.0, self.cursor.1) {
+                let hit = self.hit_test(self.cursor.0, self.cursor.1);
+                // A click anywhere but the waiting key stops it waiting.
+                if self.listening_hold.is_some()
+                    && !hit.is_some_and(|i| matches!(self.rows[i].kind, WidgetKind::HoldKey(_))) {
+                    self.stop_hold_listen();
+                }
+                if let Some(i) = hit {
                     self.activate(i);
                 } else {
-                    crate::chrome::press_off_controls(&self.window, self.cursor.1, HEADER_H);
+                    crate::chrome::press_off_controls(&self.window, self.cursor.1, 0);
                 }
             }
             WindowEvent::KeyboardInput { event: key_ev, .. } => {
-                if self.capturing_hotkey.is_some() {
+                if self.listening_hold.is_some() {
+                    self.on_hold_key(key_ev);
+                } else if self.capturing_hotkey.is_some() {
                     self.on_capture_key(key_ev);
                 } else {
                     self.on_key(key_ev);
@@ -503,9 +667,13 @@ impl SettingsView {
 
     fn on_key(&mut self, ev: winit::event::KeyEvent) {
         if ev.state != ElementState::Pressed { return; }
-        // Esc closes; everything is already saved.
-        if ev.logical_key == Key::Named(NamedKey::Escape) {
-            self.outcome = Some(SettingsOutcome::Closed);
+        // Esc doesn't close the window (Brandon 2026-11-19): it closes
+        // from its title bar like any other window.
+        // Ctrl+Tab and Ctrl+Shift+Tab go through the pages (a listening
+        // rebind takes every key before this is reached).
+        if ev.logical_key == Key::Named(NamedKey::Tab) && self.mods_state.control_key() {
+            let by = if self.mods_state.shift_key() { -1 } else { 1 };
+            self.switch_tab(self.tab.step(by));
         }
     }
 
@@ -522,6 +690,38 @@ impl SettingsView {
     ///   Save button (or rolls back on Cancel).
     /// - Unsupported keys ignore the press; the user can hit `Esc` and use
     ///   the "Edit as JSON" escape hatch for exotic keys.
+    /// A hold line's key is waiting: the next press binds it. Esc gives up;
+    /// a key the capture screen or the system already uses is refused, and
+    /// the line says so while it keeps waiting.
+    fn on_hold_key(&mut self, ev: winit::event::KeyEvent) {
+        if ev.state != ElementState::Pressed || ev.repeat { return; }
+        let Some(hold) = self.listening_hold else { return };
+        if ev.logical_key == Key::Named(NamedKey::Escape) {
+            self.stop_hold_listen();
+            return;
+        }
+        let Some(vk) = vk_of(ev.physical_key) else { return };
+        match SwitchKey::from_vk(vk) {
+            Some(key) => {
+                let before = self.draft.clone();
+                hold.set(&mut self.draft, key);
+                self.stop_hold_listen();
+                self.report_change(&before);
+            }
+            None => {
+                let name = framefang_core::settings::vk_label(vk).unwrap_or("That key");
+                self.hold_refused = Some(format!("{name} is in use"));
+                self.window.request_redraw();
+            }
+        }
+    }
+
+    fn stop_hold_listen(&mut self) {
+        if self.listening_hold.take().is_some() || self.hold_refused.take().is_some() {
+            self.window.request_redraw();
+        }
+    }
+
     fn on_capture_key(&mut self, ev: winit::event::KeyEvent) {
         if ev.state != ElementState::Pressed { return; }
         let Some(action) = self.capturing_hotkey else { return; };
@@ -585,13 +785,24 @@ impl SettingsView {
             // A hotkey error takes the system line's place, button included.
             if r.kind == WidgetKind::SystemShortcut && self.error.is_some() { return None; }
             // Only a label; its chips are the controls.
-            if matches!(r.kind, WidgetKind::Theme | WidgetKind::AfterCapture) { return None; }
+            if matches!(r.kind, WidgetKind::Theme | WidgetKind::SettingsFile | WidgetKind::AfterCapture
+                | WidgetKind::ScrollAfter | WidgetKind::FileNames
+                | WidgetKind::RecordFormat | WidgetKind::Frame | WidgetKind::QrLinks
+                | WidgetKind::HoldLine(_) | WidgetKind::Card(_) | WidgetKind::Divider) { return None; }
+            // A hold line's key: the key as drawn, a little room around it.
+            if let WidgetKind::HoldKey(hold) = r.kind {
+                let name = hold_key_name(hold, &self.draft, self.listening_hold == Some(hold));
+                let (kx, ky, kw, kh) = hold_key_rect(r, &name);
+                let hit = x >= kx - 4 && x < kx + kw + 4 && y >= ky - 4 && y < ky + kh + 4;
+                return hit.then_some(i);
+            }
+            // A listening row's CLEAR is hidden, and so can't be pressed.
+            if let WidgetKind::HotkeyClear(a) = r.kind { if self.capturing_hotkey == Some(a) { return None; } }
             // A read-out, and a button that is live only when there is
             // something to download.
             if r.kind == WidgetKind::Ffmpeg { return None; }
             if r.kind == WidgetKind::FfmpegDownload && !self.ffmpeg_actionable() { return None; }
-            // A changed mark is there only while its setting isn't default.
-            if let WidgetKind::Reset(s) = r.kind { if s.is_default(&self.draft) { return None; } }
+            if r.kind == WidgetKind::FfmpegAuto && self.draft.chosen_ffmpeg().is_none() { return None; }
             let (rx, ry, rw, rh) = r.rect;
             if x >= rx && x < rx + rw && y >= ry && y < ry + rh { Some(i) } else { None }
         })
@@ -602,23 +813,29 @@ impl SettingsView {
         // Every control that changes a setting reports it as it happens.
         let before = self.draft.clone();
         match kind {
-            WidgetKind::Reset(setting) => {
-                setting.reset(&mut self.draft);
-                if setting == Setting::Theme {
-                    crate::palette::set(crate::palette::Scheme::parse(&self.draft.theme));
-                }
-                if matches!(setting, Setting::Hotkey(_)) {
-                    self.capturing_hotkey = None;
-                    self.error = None;
-                    self.relayout();
-                }
-            }
             WidgetKind::ExportBtn => self.export(),
             WidgetKind::ImportBtn => self.import(),
             WidgetKind::Ffmpeg => {}
             WidgetKind::FfmpegDownload => {
                 crate::ffmpeg_fetch::start();
                 self.ffmpeg_attention = false;
+            }
+            WidgetKind::FfmpegBrowse => {
+                let start = self.ffmpeg_found.as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                    .unwrap_or_else(std::env::temp_dir);
+                let mut dialog = rfd::FileDialog::new()
+                    .set_title("Frame Fang: FFmpeg to use")
+                    .set_directory(&start);
+                if cfg!(windows) { dialog = dialog.add_filter("FFmpeg", &["exe"]); }
+                if let Some(p) = dialog.pick_file() {
+                    self.draft.ffmpeg_path = p.to_string_lossy().to_string();
+                    self.ffmpeg_found = self.find_ffmpeg();
+                    self.ffmpeg_attention = false;
+                }
+            }
+            WidgetKind::FfmpegAuto => {
+                self.draft.ffmpeg_path.clear();
+                self.ffmpeg_found = self.find_ffmpeg();
             }
             WidgetKind::SaveFolder => {
                 let starting = if self.draft.save_directory.is_empty() {
@@ -652,22 +869,36 @@ impl SettingsView {
                     self.draft.recordings_directory = p.to_string_lossy().to_string();
                 }
             }
-            WidgetKind::Theme => {}
+            WidgetKind::Theme | WidgetKind::SettingsFile => {}
             WidgetKind::ThemeChoice(scheme) => {
                 self.draft.theme = scheme.name().to_owned();
                 // The whole window redraws in it now, so the choice is seen
                 // before it is saved.
                 crate::palette::set(scheme);
             }
-            WidgetKind::AfterCapture => {}
-            WidgetKind::AfterCaptureChoice(editor) => {
-                self.draft.open_editor = editor;
+            WidgetKind::AfterCapture | WidgetKind::ScrollAfter => {}
+            WidgetKind::AfterCaptureChoice(after) => {
+                self.draft.set_after_capture(after);
             }
-            WidgetKind::SwitchKeyChoice(key) => {
-                self.draft.switch_key = key.name().to_owned();
+            WidgetKind::ScrollAfterChoice(after) => {
+                self.draft.set_scroll_after(after);
             }
-            WidgetKind::AutoCopy => {
-                self.draft.auto_copy = !self.draft.auto_copy;
+            WidgetKind::HoldKey(hold) | WidgetKind::HoldRebind(hold) => {
+                // Click again to give up; otherwise wait for a key (a
+                // hotkey rebind that was waiting gives way).
+                if self.listening_hold == Some(hold) {
+                    self.stop_hold_listen();
+                } else {
+                    if let Some(action) = self.capturing_hotkey.take() {
+                        self.draft.set_hotkey_for(action, self.hotkey_before_capture);
+                        self.capture_hint = None;
+                    }
+                    self.listening_hold = Some(hold);
+                    self.hold_refused = None;
+                }
+            }
+            WidgetKind::KeepRecent => {
+                self.draft.keep_recent = !self.draft.keep_recent;
             }
             WidgetKind::CloseAfterCopy => {
                 self.draft.close_after_copy = !self.draft.close_after_copy;
@@ -701,8 +932,55 @@ impl SettingsView {
                 self.error = None;
             }
             WidgetKind::OpenJson => {
-                self.outcome = Some(SettingsOutcome::OpenJson);
+                self.outcome.push_back(SettingsOutcome::OpenJson);
                 return;
+            }
+            WidgetKind::Tab(t) => {
+                self.switch_tab(t);
+                return;
+            }
+            WidgetKind::FileNames | WidgetKind::RecordFormat | WidgetKind::Frame | WidgetKind::QrLinks
+            | WidgetKind::HoldLine(_) | WidgetKind::Card(_) | WidgetKind::Divider => {}
+            WidgetKind::FileNameChoice(choice) => {
+                use framefang_core::file_name::{preset_index, PRESETS};
+                let custom_now = preset_index(&self.draft.file_name_pattern).is_none();
+                match choice {
+                    Some(i) => {
+                        // Leaving a hand-made pattern keeps it for CUSTOM.
+                        if custom_now { self.draft.file_name_custom = self.draft.file_name_pattern.clone(); }
+                        self.draft.file_name_pattern = PRESETS[i].1.to_owned();
+                    }
+                    None => {
+                        if !custom_now {
+                            // Back to the kept pattern, or a copy of this
+                            // preset to start from, so the file has one to edit.
+                            let kept = self.draft.file_name_custom.clone();
+                            self.draft.file_name_pattern =
+                                if kept.trim().is_empty() { self.draft.file_name_pattern.clone() } else { kept };
+                            self.draft.file_name_custom = self.draft.file_name_pattern.clone();
+                        }
+                        // The pattern is edited in settings.json; saved first.
+                        self.report_change(&before);
+                        self.outcome.push_back(SettingsOutcome::OpenJson);
+                        self.window.request_redraw();
+                        return;
+                    }
+                }
+            }
+            WidgetKind::RecordFormatChoice(gif) => {
+                if gif && self.ffmpeg_found.is_none() {
+                    // A GIF needs FFmpeg: point at where it is set up.
+                    self.ffmpeg_attention = true;
+                } else {
+                    self.draft.record_format =
+                        if gif { "GIF" } else { "MP4" }.to_owned();
+                }
+            }
+            WidgetKind::FrameChoice(f) => {
+                self.draft.output_frame = f.name().to_owned();
+            }
+            WidgetKind::QrLinksChoice(open) => {
+                self.draft.open_qr_links = open;
             }
             WidgetKind::SystemShortcut => {
                 if let Some(page) = self.system_page {
@@ -750,7 +1028,9 @@ impl SettingsView {
         match AppSettings::read_from(&path) {
             Ok(s) => {
                 self.draft = s;
+                self.imported = true;
                 crate::palette::set(crate::palette::Scheme::parse(&self.draft.theme));
+                self.ffmpeg_found = self.find_ffmpeg();
                 self.capturing_hotkey = None;
                 self.error = None;
                 self.relayout();
@@ -768,95 +1048,182 @@ impl SettingsView {
     /// right side of the header band at the very top — clicking them is
     /// the user's commit/abort action so they want to be reachable
     /// without scrolling, like a real app's toolbar.
-    fn build_rows(system_page: Option<crate::system_shortcuts::Page>, windows_guide: bool) -> Vec<Row> {
+    fn build_rows(system_page: Option<crate::system_shortcuts::Page>, windows_guide: bool, tab: Tab) -> Vec<Row> {
         let mut rows = Vec::new();
+        // Setting rows span the page, the tab strip's width.
         let x = PAD;
-        let row_w = WIN_W as i32 - PAD * 2;
+        let row_w = WIN_W as i32 - 2 * PAD;
+        let mut tx = PAD;
+        for t in Tab::ALL {
+            rows.push(Row { kind: WidgetKind::Tab(t), label: t.label(), rect: (tx, STRIP_Y, tab_w(t), TAB_H) });
+            tx += tab_w(t) + TAB_GAP;
+        }
 
-        // Header action bar: the settings file's three buttons, right-
-        // anchored. Sized to their words rather than generously, so the
-        // heading on the left has room.
-        let header_btn_y = (HEADER_H - BTN_H) / 2 + 4;
-        let export_x = WIN_W as i32 - PAD - EXPORT_W;
-        let import_x = export_x - HEADER_BTN_GAP - IMPORT_W;
-        let edit_x   = import_x - HEADER_BTN_GAP - EDIT_W;
-        rows.push(Row { kind: WidgetKind::OpenJson,  label: "Edit as JSON", rect: (edit_x,   header_btn_y, EDIT_W,   BTN_H) });
-        rows.push(Row { kind: WidgetKind::ImportBtn, label: "Import...",    rect: (import_x, header_btn_y, IMPORT_W, BTN_H) });
-        rows.push(Row { kind: WidgetKind::ExportBtn, label: "Export...",    rect: (export_x, header_btn_y, EXPORT_W, BTN_H) });
-
-        // A setting's changed mark, in the gutter left of its row.
-        let mark = |rows: &mut Vec<Row>, setting: Setting, y: i32| {
-            rows.push(Row { kind: WidgetKind::Reset(setting), label: "Reset to default",
-                            rect: (MARK_X - 7, y, 15, ROW_H) });
+        // A row of chips on a labelled row, starting at the value column.
+        // Its chips share the value column evenly, out to the right edge the
+        // folder fields and REBIND buttons end at (Brandon 2026-11-19: small
+        // chips left every page empty on its right).
+        let chip_row = |rows: &mut Vec<Row>, y: i32, list: &[(WidgetKind, &'static str)]| {
+            let (left, right) = (x + LABEL_W, x + row_w - 4);
+            let n = list.len() as i32;
+            let w = (right - left - CHIP_GAP * (n - 1)) / n;
+            for (i, &(kind, label)) in list.iter().enumerate() {
+                let cx = left + i as i32 * (w + CHIP_GAP);
+                let cw = if i as i32 == n - 1 { right - cx } else { w };
+                rows.push(Row { kind, label, rect: (cx, y + 4, cw, ROW_H - 8) });
+            }
+        };
+        // A hold line, right under the choice it flips: the sentence, and its
+        // key (laid over it; `hit_test` finds the key as drawn).
+        let hold_line = |rows: &mut Vec<Row>, hold: Hold, y: &mut i32| {
+            rows.push(Row { kind: WidgetKind::HoldLine(hold), label: "", rect: (x, *y, row_w, HOLD_ROW_H) });
+            rows.push(Row { kind: WidgetKind::HoldKey(hold), label: "", rect: (x, *y, row_w, HOLD_ROW_H) });
+            rows.push(Row { kind: WidgetKind::HoldRebind(hold), label: "REBIND",
+                            rect: (x + row_w - 4 - HOLD_BTN_W, *y + (HOLD_ROW_H - HOLD_BTN_H) / 2, HOLD_BTN_W, HOLD_BTN_H) });
+            *y += HOLD_ROW_H;
         };
 
-        // Content rows start below the header band + first section title.
-        let mut y = HEADER_H + SECTION_TOP + SECTION_BAND;
+        // A page's rows start under the tab strip.
+        let mut y = PAGE_TOP;
 
-        // CAPTURES: where they go, and whether they also go to the clipboard.
-        mark(&mut rows, Setting::ShotsFolder, y);
-        rows.push(Row { kind: WidgetKind::SaveFolder,       label: "Screenshots folder", rect: (x, y, row_w, ROW_H) }); y += ROW_H + ROW_GAP;
-        mark(&mut rows, Setting::RecordingsFolder, y);
-        rows.push(Row { kind: WidgetKind::RecordingsFolder, label: "Recordings folder",  rect: (x, y, row_w, ROW_H) }); y += ROW_H + ROW_GAP;
-        // FFmpeg, which recording and video conversion run: where it is, or
-        // a Download button (`render_ffmpeg_row`).
+        if tab == Tab::Files {
+        // FILES: where captures and recordings go, then what they are
+        // called and made as.
+        let c = CardBuild::open(&mut y);
+        rows.push(Row { kind: WidgetKind::SaveFolder,       label: "Screenshots folder", rect: (x, y, row_w, ROW_H) }); y += ROW_H;
+        divider(&mut rows, &mut y);
+        rows.push(Row { kind: WidgetKind::RecordingsFolder, label: "Recordings folder",  rect: (x, y, row_w, ROW_H) }); y += ROW_H;
+        divider(&mut rows, &mut y);
+        // FFmpeg, which recording and video conversion run: which one, then
+        // Download or Auto in one slot, then Browse... (`render_ffmpeg_row`).
         rows.push(Row { kind: WidgetKind::Ffmpeg, label: "FFmpeg", rect: (x, y, row_w, ROW_H) });
+        let browse_x = x + row_w - 4 - BROWSE_W;
+        let slot_x = browse_x - 8 - FFMPEG_BTN_W;
         rows.push(Row { kind: WidgetKind::FfmpegDownload, label: "DOWNLOAD",
-                        rect: (x + row_w - 4 - FFMPEG_BTN_W, y + 4, FFMPEG_BTN_W, ROW_H - 8) });
-        y += ROW_H + ROW_GAP;
-        // After a capture: two choices, then the key that flips one capture
-        // to the other, each a group of chips across the value column.
-        mark(&mut rows, Setting::AfterCapture, y);
+                        rect: (slot_x, y + 4, FFMPEG_BTN_W, ROW_H - 8) });
+        rows.push(Row { kind: WidgetKind::FfmpegAuto, label: "Auto",
+                        rect: (browse_x - 8 - AUTO_W, y + 4, AUTO_W, ROW_H - 8) });
+        rows.push(Row { kind: WidgetKind::FfmpegBrowse, label: "Browse...",
+                        rect: (browse_x, y + 4, BROWSE_W, ROW_H - 8) });
+        y += ROW_H;
+        c.close(&mut rows, &mut y);
+        let c = CardBuild::open(&mut y);
+        // File names: three presets and CUSTOM, with the next name under
+        // the label.
+        rows.push(Row { kind: WidgetKind::FileNames, label: "File names", rect: (x, y, row_w, ROW_H) });
+        let presets = framefang_core::file_name::PRESETS;
+        let mut list: Vec<(WidgetKind, &'static str)> = presets.iter().enumerate()
+            .map(|(i, (word, _))| (WidgetKind::FileNameChoice(Some(i)), *word)).collect();
+        list.push((WidgetKind::FileNameChoice(None), "CUSTOM"));
+        chip_row(&mut rows, y, &list);
+        y += ROW_H;
+        divider(&mut rows, &mut y);
+        rows.push(Row { kind: WidgetKind::RecordFormat, label: "Record as", rect: (x, y, row_w, ROW_H) });
+        chip_row(&mut rows, y, &[(WidgetKind::RecordFormatChoice(false), "MP4"),
+                                 (WidgetKind::RecordFormatChoice(true), "GIF")]);
+        y += ROW_H;
+        divider(&mut rows, &mut y);
+        rows.push(Row { kind: WidgetKind::Frame, label: "Frame", rect: (x, y, row_w, ROW_H) });
+        {
+            use framefang_core::settings::OutputFrame;
+            chip_row(&mut rows, y, &[(WidgetKind::FrameChoice(OutputFrame::None), "NONE"),
+                                     (WidgetKind::FrameChoice(OutputFrame::Border), "BORDER"),
+                                     (WidgetKind::FrameChoice(OutputFrame::Shadow), "SHADOW")]);
+        }
+        y += ROW_H;
+        c.close(&mut rows, &mut y);
+        // What Frame Fang keeps by itself: the tray's RECENT list.
+        let c = CardBuild::open(&mut y);
+        rows.push(Row { kind: WidgetKind::KeepRecent, label: "Keep the last 10 captures", rect: (x, y, row_w, ROW_H) });
+        y += ROW_H;
+        c.close(&mut rows, &mut y);
+        }
+
+        if tab == Tab::Captures {
+        // After a capture: edit, copy and edit, or just copy (auto-copy
+        // folded in, Brandon 2026-11-20). On the card's sub-strip, the key
+        // that flips one capture between the editor and copying (one quiet
+        // sentence, the key a keycap to click and rebind), then what the
+        // editor's Copy does.
+        let mut c = CardBuild::open(&mut y);
         rows.push(Row { kind: WidgetKind::AfterCapture, label: "After a capture", rect: (x, y, row_w, ROW_H) });
-        let (chip_y, chip_h) = (y + 4, ROW_H - 8);
-        let mut cx = x + LABEL_W;
-        for (editor, label, w) in [(true, "Open the editor", MODE_CHIP_W.0), (false, "Copy only", MODE_CHIP_W.1)] {
-            rows.push(Row { kind: WidgetKind::AfterCaptureChoice(editor), label, rect: (cx, chip_y, w, chip_h) });
-            cx += w + CHIP_GAP;
+        {
+            use framefang_core::settings::AfterCapture;
+            let list: Vec<(WidgetKind, &'static str)> = AfterCapture::ALL.into_iter()
+                .map(|a| (WidgetKind::AfterCaptureChoice(a), a.label())).collect();
+            chip_row(&mut rows, y, &list);
         }
-        // The keys end where the fields and buttons above and below end.
-        let keys_w = KEY_CHIP_W * SwitchKey::ALL.len() as i32 + CHIP_GAP * (SwitchKey::ALL.len() as i32 - 1);
-        cx = x + row_w - 4 - keys_w;
-        for key in SwitchKey::ALL {
-            rows.push(Row { kind: WidgetKind::SwitchKeyChoice(key), label: key.label(), rect: (cx, chip_y, KEY_CHIP_W, chip_h) });
-            cx += KEY_CHIP_W + CHIP_GAP;
+        y += ROW_H;
+        c.sub(&mut y);
+        hold_line(&mut rows, Hold::Capture, &mut y);
+        rows.push(Row { kind: WidgetKind::CloseAfterCopy, label: "Close the editor after copying", rect: (x, y, row_w, ROW_H) }); y += ROW_H;
+        c.close(&mut rows, &mut y);
+        // SCROLL mode, right under it: a long page is usually worth a look,
+        // so it has its own choice (Copy + edit unless changed). The switch
+        // key flips it as it does a region.
+        if crate::scroll::supported() {
+            let mut c = CardBuild::open(&mut y);
+            rows.push(Row { kind: WidgetKind::ScrollAfter, label: "After a scrolling capture", rect: (x, y, row_w, ROW_H) });
+            {
+                use framefang_core::settings::AfterCapture;
+                let list: Vec<(WidgetKind, &'static str)> = AfterCapture::ALL.into_iter()
+                    .map(|a| (WidgetKind::ScrollAfterChoice(a), a.label())).collect();
+                chip_row(&mut rows, y, &list);
+            }
+            y += ROW_H;
+            c.sub(&mut y);
+            hold_line(&mut rows, Hold::Scroll, &mut y);
+            c.close(&mut rows, &mut y);
         }
-        y += ROW_H + ROW_GAP;
         // What goes into the picture, before where it goes.
         if framefang_platform::cursor::SUPPORTED {
-            mark(&mut rows, Setting::CaptureCursor, y);
-            rows.push(Row { kind: WidgetKind::CaptureCursor, label: "Include the mouse pointer", rect: (x, y, row_w, ROW_H) }); y += ROW_H + ROW_GAP;
+            let c = CardBuild::open(&mut y);
+            rows.push(Row { kind: WidgetKind::CaptureCursor, label: "Include the mouse pointer", rect: (x, y, row_w, ROW_H) }); y += ROW_H;
+            c.close(&mut rows, &mut y);
         }
-        mark(&mut rows, Setting::AutoCopy, y);
-        rows.push(Row { kind: WidgetKind::AutoCopy,        label: "Copy screenshots automatically", rect: (x, y, row_w, ROW_H) }); y += ROW_H + ROW_GAP;
-        mark(&mut rows, Setting::CloseAfterCopy, y);
-        rows.push(Row { kind: WidgetKind::CloseAfterCopy,   label: "Close the editor after copying", rect: (x, y, row_w, ROW_H) }); y += ROW_H;
+        // QR mode: what a web link in a code does (other codes are copied),
+        // and its own key on the sub-strip.
+        let mut c = CardBuild::open(&mut y);
+        rows.push(Row { kind: WidgetKind::QrLinks, label: "Links in QR codes", rect: (x, y, row_w, ROW_H) });
+        chip_row(&mut rows, y, &[(WidgetKind::QrLinksChoice(false), "Copy"),
+                                 (WidgetKind::QrLinksChoice(true), "Open in browser")]);
+        y += ROW_H;
+        c.sub(&mut y);
+        hold_line(&mut rows, Hold::Qr, &mut y);
+        c.close(&mut rows, &mut y);
+        }
 
+        if tab == Tab::Hotkeys {
         // HOTKEYS — one row per action: a display box filling the left part
         // of the value column, REBIND anchored to the right edge, and CLEAR
-        // just inside it on the two optional actions. The buttons are their
+        // just inside it on the optional actions. The buttons are their
         // own rows laid out over the display row's rect; `hit_test` scans in
         // reverse, so they win the click.
-        y += SECTION_ABOVE + SECTION_BAND;
-        for action in HotkeyAction::ALL {
-            mark(&mut rows, Setting::Hotkey(action), y);
+        let c = CardBuild::open(&mut y);
+        for (i, action) in HotkeyAction::ALL.into_iter().enumerate() {
+            if i > 0 { divider(&mut rows, &mut y); }
             rows.push(Row { kind:  WidgetKind::HotkeyDisplay(action),
                             label: action.label(),
                             rect:  (x, y, row_w, ROW_H) });
-            let rebind_x = x + row_w - REBIND_W;
+            // As tall as the key box and the chips elsewhere, ending where
+            // every other row's controls end.
+            let rebind_x = x + row_w - 4 - REBIND_W;
             rows.push(Row { kind:  WidgetKind::HotkeyRebind(action),
                             label: "REBIND",
-                            rect:  (rebind_x, y, REBIND_W, ROW_H) });
+                            rect:  (rebind_x, y + 4, REBIND_W, ROW_H - 8) });
             if action.is_optional() {
                 rows.push(Row { kind:  WidgetKind::HotkeyClear(action),
                                 label: "CLEAR",
-                                rect:  (rebind_x - 8 - CLEAR_W, y, CLEAR_W, ROW_H) });
+                                rect:  (rebind_x - 8 - CLEAR_W, y + 4, CLEAR_W, ROW_H - 8) });
             }
-            y += ROW_H + ROW_GAP;
+            y += ROW_H;
         }
+        c.close(&mut rows, &mut y);
+        // `close` left a card's gap; the code below adds its own.
+        y -= CARD_GAP - ROW_GAP;
         // Taller than the usual inter-section gap: the system-shortcut line
         // (or, in its place, the hotkey-conflict message) renders in here,
-        // between the last binding row and the APPEARANCE header.
+        // under the last binding row.
         match system_page {
             // Windows, capture key isn't Print Screen: Windows' switch
             // doesn't touch it, so no card; the next heading sits as far
@@ -870,8 +1237,8 @@ impl SettingsView {
                 let top = y;
                 rows.push(Row { kind:  WidgetKind::SystemShortcut,
                                 label: page.button,
-                                rect:  (x + row_w - CARD_PAD - w, top + CARD_PAD, w, CARD_BTN_H) });
-                // The APPEARANCE heading then sits as far below the card as
+                                rect:  (WIN_W as i32 - PAD - CARD_PAD - w, top + CARD_PAD, w, CARD_BTN_H) });
+                // The page then ends as far below the card as
                 // the other headings sit below their rows.
                 y = top + CARD_H + SECTION_ABOVE;
             }
@@ -880,16 +1247,20 @@ impl SettingsView {
                 rows.push(Row { kind:  WidgetKind::SystemShortcut,
                                 label: page.button,
                                 rect:  (x + row_w - w, y, w, SYSTEM_BTN_H) });
-                // Enough that the APPEARANCE heading clears the system line's
-                // button by about what the other sections get.
                 y += SYSTEM_BTN_H + SECTION_ABOVE;
             }
             None => y += SECTION_ABOVE - ROW_GAP,
         }
+        }
 
-        // APPEARANCE
-        y += SECTION_BAND;
-        mark(&mut rows, Setting::Theme, y);
+        if tab == Tab::General {
+        // How the app behaves, how it looks, then its settings file
+        // (Brandon 2026-11-20: the file's buttons left the header, and Start
+        // with system left a page named for looks).
+        let c = CardBuild::open(&mut y);
+        rows.push(Row { kind: WidgetKind::StartWithOs, label: "Start with system", rect: (x, y, row_w, ROW_H) }); y += ROW_H;
+        c.close(&mut rows, &mut y);
+        let c = CardBuild::open(&mut y);
         rows.push(Row { kind: WidgetKind::Theme, label: "Theme", rect: (x, y, row_w, ROW_H) });
         // One chip per scheme across the value column, a swatch and a word.
         let chips = crate::palette::Scheme::ALL;
@@ -899,9 +1270,16 @@ impl SettingsView {
             rows.push(Row { kind: WidgetKind::ThemeChoice(scheme), label: scheme.name(),
                             rect: (cx, y + 4, chip_w, ROW_H - 8) });
         }
-        y += ROW_H + ROW_GAP;
-        mark(&mut rows, Setting::StartWithOs, y);
-        rows.push(Row { kind: WidgetKind::StartWithOs, label: "Start with system", rect: (x, y, row_w, ROW_H) }); y += ROW_H;
+        y += ROW_H;
+        c.close(&mut rows, &mut y);
+        let c = CardBuild::open(&mut y);
+        rows.push(Row { kind: WidgetKind::SettingsFile, label: "Settings file", rect: (x, y, row_w, ROW_H) });
+        chip_row(&mut rows, y, &[(WidgetKind::OpenJson, "Edit as JSON"),
+                                 (WidgetKind::ImportBtn, "Import..."),
+                                 (WidgetKind::ExportBtn, "Export...")]);
+        y += ROW_H;
+        c.close(&mut rows, &mut y);
+        }
 
         let _ = y;
         rows
@@ -925,50 +1303,62 @@ impl SettingsView {
         let win_h = (h.get() as usize).saturating_sub(crate::chrome::TITLE_H as usize);
         let mut buf = vec![0u32; win_w * win_h];
 
-        // Header band, pure black body, the glowing rule under the header
-        // (`hud`).
-        crate::hud::backdrop(&mut buf, win_w, win_h, HEADER_H);
-        let _ = FOOTER_H;
+        // Pure black body under the title bar (which holds the heading),
+        // the glowing rule along its top (`hud`).
+        crate::hud::backdrop(&mut buf, win_w, win_h, 0);
 
         let mut surf = BufferSurface { buf: &mut buf, w: win_w as i32, h: win_h as i32 };
 
-        // The heading, glowing.
-        crate::hud::heading(surf.buf, win_w, win_h, PAD, 18, TITLE);
-        // Heading and subtitle must both end before the right-anchored
-        // action bar; `the_heading_and_labels_clear_their_controls` checks.
-        // What the last Export or Import did takes the subtitle's place.
-        let (line, color) = match &self.status {
-            Some((msg, true))  => (msg.as_str(), DANGER()),
-            Some((msg, false)) => (msg.as_str(), OK_TINT),
-            None               => (SUBTITLE, TEXT_MUTED()),
-        };
-        let line_w = self.rows.iter().find(|r| r.kind == WidgetKind::OpenJson)
-            .map_or(300, |r| r.rect.0 - PAD - 12);
-        if self.status.is_none() {
-            // Names a key, drawn as a key (`keycap`).
-            crate::keycap::draw_line(surf.buf, win_w, win_h, PAD, 44, line, 1, color);
-        } else {
-            draw_text(&mut surf, PAD, 44, 1, &truncate_for(line, line_w), argb_to_framefang(color));
+        // What the settings file's last Export or Import did, under its
+        // buttons on GENERAL.
+        if let (Some((msg, failed)), Some(r)) = (&self.status, self.rows.iter().find(|r| r.kind == WidgetKind::SettingsFile)) {
+            let color = if *failed { DANGER() } else { OK_TINT };
+            let x = r.rect.0 + LABEL_W;
+            let line_w = r.rect.0 + r.rect.2 - 4 - x;
+            draw_text(&mut surf, x, r.rect.1 + r.rect.3 + STATUS_GAP, 1,
+                      &truncate_for(msg, line_w), argb_to_framefang(color));
         }
 
-        // Section labels, numbered like a terminal's, anchored to their
-        // first row.
+        // The tab strip: the page shown is a raised tab joined to the page,
+        // the others sit back on the strip's line.
         let right = WIN_W as i32 - PAD;
-        let firsts = [
-            self.rows.iter().find(|r| r.kind == WidgetKind::SaveFolder).map(|r| (r.rect.1, "CAPTURES")),
-            self.rows.iter().find(|r| matches!(r.kind, WidgetKind::HotkeyDisplay(_))).map(|r| (r.rect.1, "HOTKEYS")),
-            self.rows.iter().find(|r| r.kind == WidgetKind::Theme).map(|r| (r.rect.1, "APPEARANCE")),
-        ];
-        for (i, (y, name)) in firsts.into_iter().flatten().enumerate() {
-            let label_y = y - SECTION_BELOW - bitmap_font::GLYPH_H * SECTION_SCALE;
-            crate::hud::section_scaled(surf.buf, win_w, win_h, PAD, right, label_y, i + 1, name, SECTION_SCALE);
+        let strip_base = STRIP_Y + TAB_H;
+        fill_rect(&mut surf, PAD, strip_base - 1, right - PAD, 1, argb_to_framefang(HEADER_RULE()));
+        {
+            let hint_w = crate::keycap::line_width(TAB_HINT, 1);
+            let hint_y = STRIP_Y + (TAB_H - bitmap_font::GLYPH_H) / 2;
+            crate::keycap::draw_line_on(&mut surf, right - hint_w, hint_y, TAB_HINT, 1, TEXT_DIM());
         }
-
         let capturing = self.capturing_hotkey;
+        // The lines first, under every row: a hairline between settings, and
+        // each group's tree line to its sub-settings.
+        let mut first_group = true;
+        for row in &self.rows {
+            match row.kind {
+                WidgetKind::Card(sub) => {
+                    let (rx, ry, rw, _) = row.rect;
+                    if !first_group {
+                        fill_rect(&mut surf, rx, ry - CARD_GAP / 2, rw, 1, argb_to_framefang(PANEL_BORDER()));
+                    }
+                    first_group = false;
+                    if let Some(sy) = sub { render_tree(&mut surf, row, sy, &self.rows); }
+                }
+                WidgetKind::Divider => {
+                    let (rx, ry, rw, rh) = row.rect;
+                    fill_rect(&mut surf, rx, ry, rw, rh, argb_to_framefang(PANEL_BORDER()));
+                }
+                _ => {}
+            }
+        }
         for (i, row) in self.rows.iter().enumerate() {
+            if matches!(row.kind, WidgetKind::Card(_) | WidgetKind::Divider) { continue; }
+            if let WidgetKind::HoldRebind(hold) = row.kind {
+                render_rebind_button(&mut surf, row, self.listening_hold == Some(hold), self.hover == Some(i));
+                continue;
+            }
             let hovered = self.hover == Some(i);
-            if let WidgetKind::Reset(setting) = row.kind {
-                if !setting.is_default(&self.draft) { draw_mark(&mut surf, row, hovered); }
+            if let WidgetKind::Tab(t) = row.kind {
+                render_tab(&mut surf, row, t == self.tab, hovered);
                 continue;
             }
             if row.kind == WidgetKind::SystemShortcut {
@@ -990,51 +1380,66 @@ impl SettingsView {
                 render_theme_chip(&mut surf, row, scheme, hovered, &self.draft);
                 continue;
             }
-            if matches!(row.kind, WidgetKind::AfterCaptureChoice(_) | WidgetKind::SwitchKeyChoice(_)) {
-                render_choice_chip(&mut surf, row, hovered, &self.draft);
+            if let WidgetKind::HoldLine(hold) = row.kind {
+                let key_hovered = self.hover.is_some_and(|h| self.rows[h].kind == WidgetKind::HoldKey(hold));
+                render_hold_line(&mut surf, row, hold, &self.draft, self.listening_hold == Some(hold),
+                                 key_hovered, self.hold_refused.as_deref());
+                continue;
+            }
+            if matches!(row.kind, WidgetKind::HoldKey(_)) { continue; }
+            if matches!(row.kind, WidgetKind::AfterCaptureChoice(_) | WidgetKind::ScrollAfterChoice(_) | WidgetKind::FileNameChoice(_) | WidgetKind::RecordFormatChoice(_) | WidgetKind::FrameChoice(_)
+                | WidgetKind::QrLinksChoice(_)) {
+                let unavailable = row.kind == WidgetKind::RecordFormatChoice(true) && self.ffmpeg_found.is_none();
+                render_choice_chip(&mut surf, row, hovered, &self.draft, unavailable);
+                continue;
+            }
+            if row.kind == WidgetKind::RecordFormat && self.ffmpeg_found.is_none() {
+                render_label_with_caption(&mut surf, row, "GIF needs FFmpeg (above)");
+                continue;
+            }
+            if row.kind == WidgetKind::FileNames {
+                let next = framefang_core::file_name::render(&self.draft.file_name_pattern,
+                    &framefang_core::file_name::NameFacts {
+                        now: chrono::Local::now(), app: "Chrome".into(), title: "Notes".into(), w: 1280, h: 720,
+                    });
+                let caption = truncate_for(&format!("Next: {next}.png"), LABEL_W - 12);
+                render_label_with_caption(&mut surf, row, &caption);
                 continue;
             }
             if row.kind == WidgetKind::Ffmpeg {
-                let btn = self.rows.iter().position(|r| r.kind == WidgetKind::FfmpegDownload);
+                let find = |k: WidgetKind| self.rows.iter().position(|r| r.kind == k).map(|b| (&self.rows[b], self.hover == Some(b)));
+                let chosen = self.draft.chosen_ffmpeg();
                 let ff = FfmpegRow {
                     found: self.ffmpeg_found.as_deref(),
+                    chosen: chosen.as_deref(),
                     fetch: &self.fetch_seen,
-                    button: btn.filter(|_| ffmpeg_actionable).map(|b| (&self.rows[b], self.hover == Some(b))),
+                    button: find(WidgetKind::FfmpegDownload).filter(|_| ffmpeg_actionable),
+                    auto: find(WidgetKind::FfmpegAuto).filter(|_| chosen.is_some()),
+                    browse: find(WidgetKind::FfmpegBrowse),
                     attention: self.ffmpeg_attention && self.ffmpeg_found.is_none(),
                 };
                 render_ffmpeg_row(&mut surf, row, &ff);
                 continue;
             }
-            if row.kind == WidgetKind::FfmpegDownload { continue; } // drawn with its row
+            // Drawn with their row.
+            if matches!(row.kind, WidgetKind::FfmpegDownload | WidgetKind::FfmpegAuto | WidgetKind::FfmpegBrowse) { continue; }
             render_row(&mut surf, row, hovered, capturing, self.capture_hint.as_deref(), &self.draft);
-        }
-
-        // Pointing at a changed mark says what clicking it does, in place of
-        // the setting's name (its row follows its mark in `rows`).
-        if let Some(i) = self.hover {
-            if let (WidgetKind::Reset(_), Some(target)) = (self.rows[i].kind, self.rows.get(i + 1)) {
-                let (rx, ry, _, rh) = target.rect;
-                let indent = if target.kind == WidgetKind::CloseAfterCopy { SUB_INDENT } else { 0 };
-                fill_rect(&mut surf, rx, ry, LABEL_W - 8, rh, argb_to_framefang(BG_BODY()));
-                draw_text(&mut surf, rx + 6 + indent, ry + (rh - bitmap_font::GLYPH_H) / 2, 1,
-                          self.rows[i].label, argb_to_framefang(LASER()));
-            }
         }
 
         // Inline validation, in the same danger tint the convert dialogs
         // use — but parked directly under the HOTKEYS block instead of at
         // the window's bottom edge, because that's the section it is about
-        // and the gap before the APPEARANCE header is already reserved.
+        // and the gap under it is already reserved.
         if let Some(msg) = &self.error {
             if let Some(r) = self.rows.iter().rev()
                 .find(|r| matches!(r.kind, WidgetKind::HotkeyDisplay(_)))
             {
-                draw_text(&mut surf, PAD, r.rect.1 + ROW_H + 6, 1, msg,
+                draw_text(&mut surf, PAD, r.rect.1 + ROW_H + CARD_IN + 8, 1, msg,
                           argb_to_framefang(DANGER()));
             }
         }
 
-        self.title_bar.draw(&mut frame, win_w, &buf, "Settings", BG_TOP());
+        self.title_bar.draw(&mut frame, win_w, &buf, TITLE, BG_TOP());
         if let Err(e) = frame.present() {
             eprintln!("settings: buf.present: {e}");
         }
@@ -1071,17 +1476,37 @@ fn render_system_line<S: painter::Surface>(
 
 /// What the FFmpeg row shows.
 struct FfmpegRow<'a> {
+    /// The FFmpeg that will be used.
     found: Option<&'a std::path::Path>,
+    /// The one picked in Settings, whether or not it still exists.
+    chosen: Option<&'a std::path::Path>,
     fetch: &'a crate::ffmpeg_fetch::Fetch,
     /// The Download button and whether it is hovered, when it can be pressed.
     button: Option<(&'a Row, bool)>,
+    /// The Auto button, while an FFmpeg is picked.
+    auto: Option<(&'a Row, bool)>,
+    browse: Option<(&'a Row, bool)>,
     /// Lit because recording or conversion just needed FFmpeg.
     attention: bool,
 }
 
-/// The FFmpeg row: its label, a read-out field, and the Download button
-/// when there is nothing to use. While downloading, the field fills from
-/// the left like a progress bar.
+/// What the FFmpeg field says, and in which color, outside a download: the
+/// pick in bright text, one found by itself muted (like the folders'
+/// defaults), and a pick that is gone in the warning color with what is
+/// used instead.
+fn ffmpeg_field_text(found: Option<&std::path::Path>, chosen: Option<&std::path::Path>) -> Option<(String, u32)> {
+    match (chosen, found) {
+        (Some(c), Some(f)) if c == f => Some((f.display().to_string(), TEXT_BRIGHT)),
+        (Some(_), Some(f)) => Some((format!("Picked FFmpeg is gone, using {}", f.display()), WARN())),
+        (Some(c), None) => Some((format!("Not found: {}", c.display()), WARN())),
+        (None, Some(f)) => Some((f.display().to_string(), TEXT_MUTED())),
+        (None, None) => None,
+    }
+}
+
+/// The FFmpeg row: its label, a read-out field, then Download (when there
+/// is nothing to use) or Auto (while one is picked), and Browse... While
+/// downloading, the field fills from the left like a progress bar.
 fn render_ffmpeg_row<S: painter::Surface>(surf: &mut S, row: &Row, ff: &FfmpegRow) {
     use crate::ffmpeg_fetch::Fetch;
     let (rx, ry, rw, rh) = row.rect;
@@ -1091,11 +1516,12 @@ fn render_ffmpeg_row<S: painter::Surface>(surf: &mut S, row: &Row, ff: &FfmpegRo
 
     let val_x = rx + LABEL_W;
     let (val_y, val_h) = (ry + 4, rh - 8);
-    let right = match ff.button { Some((b, _)) => b.rect.0 - 8, None => rx + rw - 4 };
+    let right = ff.button.or(ff.auto).or(ff.browse).map_or(rx + rw - 4, |(b, _)| b.rect.0 - 8);
     let val_w = right - val_x;
 
     let border = if ff.attention { LASER() } else { FIELD_BORDER() };
     fill_rect(surf, val_x, val_y, val_w, val_h, argb_to_framefang(FIELD_BG()));
+    let ff_text = ffmpeg_field_text(ff.found, ff.chosen);
     let (text, color) = match (ff.found, ff.fetch) {
         (_, Fetch::Downloading { got, total }) => {
             // The field fills as the download comes in.
@@ -1106,6 +1532,8 @@ fn render_ffmpeg_row<S: painter::Surface>(surf: &mut S, row: &Row, ff: &FfmpegRo
             (format!("Downloading FFmpeg  {}", crate::ffmpeg_fetch::progress_text(*got, *total)), TEXT_BRIGHT)
         }
         (_, Fetch::Installing) => ("Checking and installing...".to_owned(), TEXT_BRIGHT),
+        _ if ff_text.is_some() => ff_text.clone().unwrap_or_default(),
+        // Covered by `ff_text` above; kept so the match is complete.
         (Some(path), _) => (path.display().to_string(), TEXT_MUTED()),
         (None, Fetch::Failed(e)) => (format!("Download failed: {e}"), DANGER()),
         (None, _) if crate::ffmpeg_fetch::offered() =>
@@ -1123,6 +1551,14 @@ fn render_ffmpeg_row<S: painter::Surface>(surf: &mut S, row: &Row, ff: &FfmpegRo
         let label = if matches!(ff.fetch, Fetch::Failed(_)) { "RETRY" } else { b.label };
         let tw = bitmap_font::measure(label, 1);
         draw_text(surf, bx + (bw - tw) / 2, by + (bh - bitmap_font::GLYPH_H) / 2, 1, label, argb_to_framefang(LASER()));
+    }
+    // Auto and Browse...: the folder rows' quiet outlined buttons.
+    for (b, hovered) in ff.auto.into_iter().chain(ff.browse) {
+        let (bx, by, bw, bh) = b.rect;
+        if hovered { fill_rect(surf, bx, by, bw, bh, argb_to_framefang(HOVER_FILL())); }
+        stroke_rect_argb(surf, bx, by, bw, bh, argb_to_framefang(if hovered { LASER_DIM() } else { FIELD_BORDER() }));
+        let tw = bitmap_font::measure(b.label, 1);
+        draw_text(surf, bx + (bw - tw) / 2, by + (bh - bitmap_font::GLYPH_H) / 2, 1, b.label, argb_to_framefang(TEXT_BRIGHT));
     }
 }
 
@@ -1154,6 +1590,22 @@ fn shows_windows_guide(page: Option<crate::system_shortcuts::Page>, draft: &AppS
 fn content_height(rows: &[Row]) -> u32 {
     let bottom = rows.iter().map(|r| r.rect.1 + r.rect.3).max().unwrap_or(0);
     (bottom + BOTTOM_BAND).max(0) as u32
+}
+
+/// A page's height with the Windows card drawn whole: the card is taller
+/// than its button, the only row it has.
+fn page_height(rows: &[Row], windows_guide: bool) -> u32 {
+    let card = rows.iter().find(|r| windows_guide && r.kind == WidgetKind::SystemShortcut)
+        .map(|r| (r.rect.1 - CARD_PAD + CARD_H + BOTTOM_BAND) as u32).unwrap_or(0);
+    content_height(rows).max(card)
+}
+
+/// The window's height: made for its tallest page (the Windows card
+/// counted), so switching tabs never resizes it.
+fn window_height(system_page: Option<crate::system_shortcuts::Page>) -> u32 {
+    let guide = system_page.is_some_and(|p| p.is_windows());
+    let pages = Tab::ALL.iter().map(|t| page_height(&SettingsView::build_rows(system_page, guide, *t), guide));
+    pages.max().unwrap_or(0) + crate::chrome::TITLE_H as u32
 }
 
 /// The status line, the page line and the color of the card's edge for `g`.
@@ -1299,32 +1751,7 @@ fn render_row<S: painter::Surface>(
 
     // ── REBIND button (sits to the right of the HotkeyDisplay box) ─────────
     if let WidgetKind::HotkeyRebind(action) = row.kind {
-        let active = capturing_hotkey == Some(action);
-        let border = if active { LASER() } else if hovered { LASER_DIM() } else { FIELD_BORDER() };
-        let fill   = if active { PRIMARY_FILL() } else if hovered { HOVER_FILL() } else { 0x0000_0000 };
-        if fill != 0 {
-            fill_rect(surf, rx, ry, rw, rh, argb_to_framefang(fill));
-        }
-        stroke_rect_argb(surf, rx, ry, rw, rh, argb_to_framefang(border));
-        // Label flips while we're listening for a key so the user knows the
-        // button "armed" the capture state, even though the actual readout
-        // lives in the display box to the left.
-        let label = if active { "LISTENING" } else { row.label };
-        let tw = bitmap_font::measure(label, 1);
-        let tx = rx + (rw - tw) / 2;
-        let ty = ry + (rh - bitmap_font::GLYPH_H) / 2;
-        let color = if active { LASER() } else { TEXT_BRIGHT };
-        draw_text(surf, tx, ty, 1, label, argb_to_framefang(color));
-        return;
-    }
-
-    // ── After a capture: the label, and under it what the held key does ────
-    if row.kind == WidgetKind::AfterCapture {
-        let gap = rh - 2 * bitmap_font::GLYPH_H;
-        let top = ry + gap / 3;
-        draw_text(surf, rx + 6, top, 1, row.label, argb_to_framefang(TEXT_BRIGHT));
-        crate::keycap::draw_line_on(surf, rx + 6, top + bitmap_font::GLYPH_H + gap / 3, &switch_caption(draft),
-                                    1, TEXT_MUTED());
+        render_rebind_button(surf, row, capturing_hotkey == Some(action), hovered);
         return;
     }
 
@@ -1434,51 +1861,117 @@ fn render_row<S: painter::Surface>(
                 draw_text(surf, val_x + 8, ty, 1, &truncated, argb_to_framefang(color));
             }
         }
-        WidgetKind::StartWithOs | WidgetKind::AutoCopy | WidgetKind::CloseAfterCopy | WidgetKind::CaptureCursor => {
+        WidgetKind::StartWithOs | WidgetKind::CloseAfterCopy | WidgetKind::CaptureCursor
+        | WidgetKind::KeepRecent => {
             let on = match row.kind {
-                WidgetKind::AutoCopy         => draft.auto_copy,
+                WidgetKind::KeepRecent      => draft.keep_recent,
                 WidgetKind::CloseAfterCopy   => draft.close_after_copy,
                 WidgetKind::CaptureCursor    => draft.capture_cursor,
                 _                            => draft.start_with_windows,
             };
-            draw_toggle(surf, val_x, val_y, val_h, on);
+            // At the row's right edge, where the other controls end.
+            draw_toggle(surf, rx + rw - 4 - TOGGLE_W, val_y, val_h, on);
         }
         _ => {}
     }
 }
 
-/// A changed mark: a small diamond in the accent, on its row's label line,
-/// a size up while pointed at.
-fn draw_mark<S: painter::Surface>(surf: &mut S, row: &Row, hovered: bool) {
-    let (_, ry, _, rh) = row.rect;
-    let (cx, cy) = (MARK_X, ry + rh / 2);
-    let r = if hovered { MARK_R + 1 } else { MARK_R };
-    let c = argb_to_framefang(LASER());
-    for dy in -r..=r {
-        let half = r - dy.abs();
-        fill_rect(surf, cx - half, cy + dy, 2 * half + 1, 1, c);
-    }
+/// A group's tree line: down from its setting's row to the middle of its
+/// last sub-setting, with a tick out to each sub-setting's words, so they
+/// read as hanging off the setting above.
+fn render_tree<S: painter::Surface>(surf: &mut S, group: &Row, sub: i32, rows: &[Row]) {
+    let (gx, gy, _, gh) = group.rect;
+    let mids: Vec<i32> = rows.iter()
+        .filter(|r| matches!(r.kind, WidgetKind::HoldLine(_) | WidgetKind::CloseAfterCopy)
+            && r.rect.1 >= sub && r.rect.1 < gy + gh)
+        .map(|r| r.rect.1 + r.rect.3 / 2).collect();
+    let Some(&last) = mids.last() else { return };
+    let color = argb_to_framefang(FIELD_BORDER());
+    let x = gx + TREE_X;
+    fill_rect(surf, x, sub - 6, 1, last - sub + 7, color);
+    for m in mids { fill_rect(surf, x, m, TREE_TICK - TREE_X, 1, color); }
 }
 
-/// What holding the switch key does, under the After-a-capture label.
-fn switch_caption(draft: &AppSettings) -> String {
-    // `[Key]` is drawn as a key (`keycap`).
-    let key = draft.switch_key().label();
-    if draft.open_editor {
-        format!("Hold [{key}] to copy only")
-    } else {
-        format!("Hold [{key}] to open the editor")
+/// A REBIND button: an outlined button that fills while it waits for a
+/// key, when it reads LISTENING (Hotkeys page and hold lines alike).
+fn render_rebind_button<S: painter::Surface>(surf: &mut S, row: &Row, active: bool, hovered: bool) {
+    let (rx, ry, rw, rh) = row.rect;
+    let border = if active { LASER() } else if hovered { LASER_DIM() } else { FIELD_BORDER() };
+    let fill   = if active { PRIMARY_FILL() } else if hovered { HOVER_FILL() } else { 0x0000_0000 };
+    if fill != 0 {
+        fill_rect(surf, rx, ry, rw, rh, argb_to_framefang(fill));
     }
+    stroke_rect_argb(surf, rx, ry, rw, rh, argb_to_framefang(border));
+    let label = if active { "LISTENING" } else { row.label };
+    let tw = bitmap_font::measure(label, 1);
+    let tx = rx + (rw - tw) / 2;
+    let ty = ry + (rh - bitmap_font::GLYPH_H) / 2;
+    let color = if active { LASER() } else { TEXT_BRIGHT };
+    draw_text(surf, tx, ty, 1, label, argb_to_framefang(color));
 }
 
-/// An After-a-capture chip. The picked one is filled and framed; the picked
-/// switch key is framed a step quieter than the picked mode, since the mode
-/// is the main choice and the key only refines it.
-fn render_choice_chip<S: painter::Surface>(surf: &mut S, row: &Row, hovered: bool, draft: &AppSettings) {
+/// A hold line: "Hold", the key as a keycap, then what holding it does,
+/// hanging off the choice above like any sub-setting, with REBIND at its
+/// right end. The key sinks under the pointer, like a press; waiting for a
+/// key it says so, and the words after it say how to give up (or why a key
+/// was refused).
+fn render_hold_line<S: painter::Surface>(surf: &mut S, line: &Row, hold: Hold, draft: &AppSettings,
+                                         listening: bool, key_hovered: bool, refused: Option<&str>) {
+    let name = hold_key_name(hold, draft, listening);
+    let (kx, ky, kw, _) = hold_key_rect(line, &name);
+    let text_y = line.rect.1 + (line.rect.3 - bitmap_font::GLYPH_H) / 2;
+    draw_text(surf, line.rect.0 + 6 + SUB_INDENT, text_y, 1, HOLD_WORD, argb_to_framefang(TEXT_MUTED()));
+    crate::keycap::draw_key_on(surf, kx, ky, &name, 1, key_hovered && !listening);
+    let (tail, color) = match (listening, refused) {
+        (true, Some(why)) => (why, WARN()),
+        (true, None) => ("Esc cancels", LASER()),
+        _ => (hold.tail(draft), TEXT_MUTED()),
+    };
+    draw_text(surf, kx + kw + HOLD_GAP, text_y, 1, tail, argb_to_framefang(color));
+}
+
+/// One tab in the strip. The one shown is a raised tab on the page's
+/// surface with the accent along its top; the rest sit back.
+fn render_tab<S: painter::Surface>(surf: &mut S, row: &Row, shown: bool, hovered: bool) {
+    let (rx, ry, rw, rh) = row.rect;
+    if shown {
+        fill_rect(surf, rx, ry, rw, rh, argb_to_framefang(BG_TOP()));
+        fill_rect(surf, rx, ry, rw, 2, argb_to_framefang(LASER()));
+        fill_rect(surf, rx, ry, 1, rh, argb_to_framefang(HEADER_RULE()));
+        fill_rect(surf, rx + rw - 1, ry, 1, rh, argb_to_framefang(HEADER_RULE()));
+    } else if hovered {
+        fill_rect(surf, rx, ry + 2, rw, rh - 3, argb_to_framefang(HOVER_FILL()));
+    }
+    let ty = ry + (rh - bitmap_font::GLYPH_H) / 2 + 1;
+    let color = if shown { TEXT_BRIGHT } else if hovered { TEXT_BRIGHT } else { TEXT_MUTED() };
+    draw_text(surf, rx + TAB_PAD, ty, 1, row.label, argb_to_framefang(color));
+}
+
+/// A row's label with one quiet line under it (the next file name, or why a
+/// choice is greyed).
+fn render_label_with_caption<S: painter::Surface>(surf: &mut S, row: &Row, caption: &str) {
+    let (rx, ry, _, rh) = row.rect;
+    let gap = rh - 2 * bitmap_font::GLYPH_H;
+    let top = ry + gap / 3;
+    draw_text(surf, rx + 6, top, 1, row.label, argb_to_framefang(TEXT_BRIGHT));
+    draw_text(surf, rx + 6, top + bitmap_font::GLYPH_H + gap / 3, 1, caption, argb_to_framefang(TEXT_MUTED()));
+}
+
+/// A chip in a row of choices. The picked one is filled and framed.
+/// `unavailable`: dim, though it still answers (GIF without
+/// FFmpeg points at where FFmpeg is set up).
+fn render_choice_chip<S: painter::Surface>(surf: &mut S, row: &Row, hovered: bool, draft: &AppSettings,
+                                           unavailable: bool) {
     let (rx, ry, rw, rh) = row.rect;
     let (chosen, accent) = match row.kind {
-        WidgetKind::AfterCaptureChoice(editor) => (draft.open_editor == editor, LASER()),
-        WidgetKind::SwitchKeyChoice(key) => (draft.switch_key() == key, LASER_DIM()),
+        WidgetKind::AfterCaptureChoice(after) => (draft.after_capture() == after, LASER()),
+        WidgetKind::ScrollAfterChoice(after) => (draft.scroll_after() == after, LASER()),
+        WidgetKind::FileNameChoice(choice) =>
+            (framefang_core::file_name::preset_index(&draft.file_name_pattern) == choice, LASER()),
+        WidgetKind::RecordFormatChoice(gif) =>
+            ((draft.record_format() == framefang_core::settings::RecordFormat::Gif) == gif, LASER()),
+        WidgetKind::FrameChoice(f) => (draft.output_frame() == f, LASER()),
+        WidgetKind::QrLinksChoice(open) => (draft.open_qr_links == open, LASER()),
         _ => return,
     };
     if chosen || hovered {
@@ -1487,7 +1980,7 @@ fn render_choice_chip<S: painter::Surface>(surf: &mut S, row: &Row, hovered: boo
     let border = if chosen { accent } else if hovered { LASER_DIM() } else { FIELD_BORDER() };
     stroke_rect_argb(surf, rx, ry, rw, rh, argb_to_framefang(border));
     let tw = bitmap_font::measure(row.label, 1);
-    let color = if chosen { TEXT_BRIGHT } else { TEXT_MUTED() };
+    let color = if unavailable { TEXT_DIM() } else if chosen { TEXT_BRIGHT } else { TEXT_MUTED() };
     draw_text(surf, rx + (rw - tw) / 2, ry + (rh - bitmap_font::GLYPH_H) / 2, 1,
               row.label, argb_to_framefang(color));
 }
@@ -1517,8 +2010,10 @@ fn render_theme_chip<S: painter::Surface>(
 
 /// Draw an ON/OFF toggle pill anchored at (x, y) with the given height; width
 /// is fixed at ~64 px. Knob slides to the right when on.
+const TOGGLE_W: i32 = 64;
+
 fn draw_toggle<S: painter::Surface>(s: &mut S, x: i32, y: i32, h: i32, on: bool) {
-    let w = 64;
+    let w = TOGGLE_W;
     let bg = if on { TOGGLE_ON() } else { TOGGLE_OFF() };
     fill_rect(s, x, y, w, h, argb_to_framefang(bg));
     let border = if on { LASER_DIM() } else { FIELD_BORDER() };
@@ -1765,6 +2260,23 @@ fn native_vk(key: PhysicalKey) -> Option<u32> {
     }
 }
 
+/// The Win32 virtual-key code of any key, modifiers included (by side): for
+/// binding a hold key, and for the capture window's held keys off Windows.
+pub(crate) fn vk_of(key: PhysicalKey) -> Option<u32> {
+    if let PhysicalKey::Code(code) = key {
+        let side = match code {
+            KeyCode::ShiftLeft => Some(0xA0), KeyCode::ShiftRight => Some(0xA1),
+            KeyCode::ControlLeft => Some(0xA2), KeyCode::ControlRight => Some(0xA3),
+            KeyCode::AltLeft => Some(0xA4), KeyCode::AltRight => Some(0xA5),
+            KeyCode::SuperLeft => Some(0x5B), KeyCode::SuperRight => Some(0x5C),
+            KeyCode::Escape => Some(0x1B),
+            _ => None,
+        };
+        if let Some(vk) = side.or_else(|| keycode_to_vk(code)) { return Some(vk); }
+    }
+    native_vk(key)
+}
+
 /// Surface the `vk_label` map for any caller outside this module that needs
 /// the same label table. Currently unused at module scope but kept here so
 /// future code (e.g. tray tooltip) doesn't reach into framefang-core directly.
@@ -1808,26 +2320,143 @@ mod tests {
     /// Space every label keeps before the control beside it.
     const MIN_GAP: i32 = 12;
 
+    /// Every page's rows, one after another.
+    fn all_rows(page: Option<crate::system_shortcuts::Page>, guide: bool) -> Vec<Row> {
+        Tab::ALL.into_iter().flat_map(|t| SettingsView::build_rows(page, guide, t)).collect()
+    }
+
+    #[test]
+    fn every_page_fits_a_small_screen_and_its_rows_stay_in_the_window() {
+        let page = crate::system_shortcuts::page();
+        let win_h = window_height(page) as i32;
+        // 1280 x 720 with a 48 px taskbar.
+        assert!(win_h <= 720 - 48, "{win_h} px tall");
+        for t in Tab::ALL {
+            for guide in [true, false] {
+                for r in SettingsView::build_rows(page, guide, t) {
+                    let (x, y, w, h) = r.rect;
+                    assert!(x >= 0 && x + w <= WIN_W as i32, "{} leaves the window", r.label);
+                    assert!(y >= 0 && y + h + crate::chrome::TITLE_H as i32 <= win_h, "{} is cut off on {t:?}", r.label);
+                    if !matches!(r.kind, WidgetKind::Tab(_) | WidgetKind::OpenJson | WidgetKind::ImportBtn | WidgetKind::ExportBtn) {
+                        assert!(y >= PAGE_TOP, "{} sits over the tab strip", r.label);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_tabs_and_their_hint_fit_the_strip_and_each_setting_is_on_one_page() {
+        let rows = SettingsView::build_rows(None, false, Tab::Captures);
+        let last = rows.iter().filter(|r| matches!(r.kind, WidgetKind::Tab(_))).last().unwrap();
+        let hint_x = WIN_W as i32 - PAD - crate::keycap::line_width(TAB_HINT, 1);
+        assert!(last.rect.0 + last.rect.2 + MIN_GAP <= hint_x, "the tabs run into the hint");
+        // A tab's words sit in the middle of it.
+        assert_eq!(last.rect.2, bitmap_font::measure(last.label, 1) + 2 * TAB_PAD);
+        let mut seen = std::collections::HashSet::new();
+        for t in Tab::ALL {
+            for r in SettingsView::build_rows(None, false, t) {
+                let setting = matches!(r.kind, WidgetKind::SaveFolder | WidgetKind::RecordingsFolder
+                    | WidgetKind::AfterCapture | WidgetKind::ScrollAfter | WidgetKind::CaptureCursor
+                    | WidgetKind::CloseAfterCopy | WidgetKind::HotkeyDisplay(_) | WidgetKind::Theme
+                    | WidgetKind::StartWithOs | WidgetKind::FileNames | WidgetKind::RecordFormat
+                    | WidgetKind::Frame | WidgetKind::QrLinks | WidgetKind::KeepRecent);
+                if setting { assert!(seen.insert(r.label), "{} on two pages", r.label); }
+            }
+        }
+        assert_eq!(Tab::Captures.step(-1), Tab::General);
+        assert_eq!(Tab::General.step(1), Tab::Captures);
+    }
+
+    #[test]
+    fn the_new_rows_keep_their_chips_in_the_value_column() {
+        let rows = SettingsView::build_rows(None, false, Tab::Files);
+        for (label, kind) in [("File names", WidgetKind::FileNames), ("Record as", WidgetKind::RecordFormat),
+                              ("Frame", WidgetKind::Frame)] {
+            let row = rows.iter().find(|r| r.kind == kind).unwrap_or_else(|| panic!("no {label} row"));
+            let right = row.rect.0 + row.rect.2 - 4;
+            let chips = rows.iter().filter(|r| r.rect.1 == row.rect.1 + 4 && matches!(r.kind,
+                WidgetKind::FileNameChoice(_) | WidgetKind::RecordFormatChoice(_) | WidgetKind::FrameChoice(_)));
+            for c in chips {
+                assert!(c.rect.0 >= row.rect.0 + LABEL_W && c.rect.0 + c.rect.2 <= right, "{} leaves {label}", c.label);
+                assert!(bitmap_font::measure(c.label, 1) + 16 <= c.rect.2, "{} is cramped", c.label);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scrolling_captures_have_their_own_after_choice_on_captures() {
+        use framefang_core::settings::AfterCapture;
+        let rows = SettingsView::build_rows(None, false, Tab::Captures);
+        let row = rows.iter().find(|r| r.kind == WidgetKind::ScrollAfter).expect("an After a scrolling capture row");
+        let chips: Vec<_> = rows.iter().filter(|r| matches!(r.kind, WidgetKind::ScrollAfterChoice(_))).collect();
+        assert_eq!(chips.len(), 3);
+        for c in &chips {
+            assert_eq!(c.rect.1, row.rect.1 + 4, "on its row");
+            assert!(c.rect.0 >= row.rect.0 + LABEL_W && c.rect.0 + c.rect.2 <= row.rect.0 + row.rect.2 - 4);
+        }
+        // It sits below the region's choice, and the page still fits.
+        let after = rows.iter().find(|r| r.kind == WidgetKind::AfterCapture).unwrap();
+        assert!(row.rect.1 > after.rect.1);
+        assert!((row.rect.1 + row.rect.3) as u32 + crate::chrome::TITLE_H as u32 <= window_height(None), "fits the window");
+        // A click on a chip sets only the scrolling choice.
+        let mut s = AppSettings::default();
+        s.set_scroll_after(AfterCapture::CopyOnly);
+        assert_eq!((s.scroll_after(), s.after_capture()), (AfterCapture::CopyOnly, AfterCapture::Edit));
+    }
+
+    #[test]
+    fn qr_links_sit_on_captures_and_say_what_the_switch_key_does() {
+        let rows = SettingsView::build_rows(None, false, Tab::Captures);
+        let row = rows.iter().find(|r| r.kind == WidgetKind::QrLinks).expect("a QR links row");
+        let chips: Vec<_> = rows.iter().filter(|r| matches!(r.kind, WidgetKind::QrLinksChoice(_))).collect();
+        assert_eq!(chips.len(), 2);
+        for c in &chips {
+            assert_eq!(c.rect.1, row.rect.1 + 4, "on its row");
+            assert!(c.rect.0 >= row.rect.0 + LABEL_W && c.rect.0 + c.rect.2 <= row.rect.0 + row.rect.2 - 4);
+        }
+        // Its own key, Ctrl unless set.
+        let mut s = AppSettings::default();
+        assert_eq!(s.qr_switch_key(), SwitchKey::Ctrl, "not Shift: that is the capture switch key");
+        s.open_qr_links = true;
+        assert_eq!(Hold::Qr.tail(&s), "to copy links instead");
+    }
+
     #[test]
     fn the_heading_and_labels_clear_their_controls() {
-        let rows = SettingsView::build_rows(crate::system_shortcuts::page(), true);
+        let rows = all_rows(crate::system_shortcuts::page(), true);
 
-        // The heading ends before the first header button.
-        let first_btn = rows.iter()
-            .filter(|r| matches!(r.kind, WidgetKind::OpenJson | WidgetKind::ImportBtn | WidgetKind::ExportBtn))
-            .map(|r| r.rect.0)
-            .min()
-            .unwrap();
-        let heading_end = PAD + bitmap_font::measure(TITLE, 2);
-        assert!(heading_end + MIN_GAP <= first_btn,
-            "heading ends at {heading_end}, the buttons start at {first_btn}");
+        // No header band: the title bar is the heading, and the tabs sit
+        // right under it. The settings file's buttons are GENERAL's last
+        // row, with room under them for what the last one did.
+        assert_eq!(TITLE, "// SETTINGS");
+        assert!(STRIP_Y <= 20, "the tabs start right under the title bar");
+        let general_rows = SettingsView::build_rows(None, false, Tab::General);
+        let file_row = general_rows.iter().find(|r| r.kind == WidgetKind::SettingsFile).unwrap();
+        let status_bottom = file_row.rect.1 + file_row.rect.3 + STATUS_GAP + bitmap_font::GLYPH_H;
+        assert!(status_bottom as u32 + crate::chrome::TITLE_H as u32 <= window_height(None), "the status line fits");
+        for r in &rows {
+            if matches!(r.kind, WidgetKind::OpenJson | WidgetKind::ImportBtn | WidgetKind::ExportBtn) {
+                assert!(r.rect.1 >= PAGE_TOP, "{} is still in the header", r.label);
+            }
+        }
+        let general = SettingsView::build_rows(None, false, Tab::General);
+        let order: Vec<&str> = general.iter()
+            .filter(|r| matches!(r.kind, WidgetKind::StartWithOs | WidgetKind::Theme | WidgetKind::SettingsFile))
+            .map(|r| r.label).collect();
+        assert_eq!(order, ["Start with system", "Theme", "Settings file"]);
+        assert_eq!(general.iter().filter(|r| matches!(r.kind,
+            WidgetKind::OpenJson | WidgetKind::ImportBtn | WidgetKind::ExportBtn)).count(), 3);
 
         // Every row label, indent included, ends before its control.
         for r in &rows {
             let indent = match r.kind {
                 WidgetKind::CloseAfterCopy => SUB_INDENT,
-                WidgetKind::SaveFolder | WidgetKind::RecordingsFolder | WidgetKind::Ffmpeg | WidgetKind::AutoCopy
-                | WidgetKind::CaptureCursor | WidgetKind::AfterCapture
+                WidgetKind::SaveFolder | WidgetKind::RecordingsFolder | WidgetKind::Ffmpeg
+                | WidgetKind::CaptureCursor | WidgetKind::AfterCapture | WidgetKind::ScrollAfter
+                | WidgetKind::FileNames | WidgetKind::RecordFormat | WidgetKind::Frame | WidgetKind::QrLinks
+                | WidgetKind::KeepRecent
                 | WidgetKind::HotkeyDisplay(_) | WidgetKind::Theme | WidgetKind::StartWithOs => 0,
                 _ => continue,
             };
@@ -1840,7 +2469,7 @@ mod tests {
     #[test]
     fn the_windows_guide_reads_in_every_state_without_touching_its_button() {
         let page = crate::system_shortcuts::page().expect("Windows has a page");
-        let rows = SettingsView::build_rows(Some(page), true);
+        let rows = SettingsView::build_rows(Some(page), true, Tab::Hotkeys);
         let btn = rows.iter().find(|r| r.kind == WidgetKind::SystemShortcut).unwrap();
         let text_x = PAD + 16 + 12;
         let card_right = WIN_W as i32 - PAD - CARD_PAD;
@@ -1857,30 +2486,17 @@ mod tests {
             assert!(end + MIN_GAP <= btn.rect.0, "\"{headline}\" runs into the button");
             assert!(text_x + bitmap_font::measure(&page_line, 1) <= card_right, "\"{page_line}\" leaves the card");
         }
-        // The card sits between the last hotkey row and the APPEARANCE heading.
+        // The card sits under the last hotkey row, whole inside the window
+        // with the bottom band under it (it was cut off, 2026-11-19).
         let last_hotkey = rows.iter().filter(|r| matches!(r.kind, WidgetKind::HotkeyDisplay(_))).last().unwrap();
-        let theme = rows.iter().find(|r| r.kind == WidgetKind::Theme).unwrap();
         let card_top = btn.rect.1 - CARD_PAD;
         assert!(card_top >= last_hotkey.rect.1 + ROW_H);
-        assert_eq!(theme.rect.1 - (card_top + CARD_H), SECTION_ABOVE + SECTION_BAND,
-                   "the APPEARANCE heading sits as far below the card as the others below their rows");
+        assert!(card_top + CARD_H + BOTTOM_BAND + crate::chrome::TITLE_H as i32 <= window_height(Some(page)) as i32);
 
-        // Another capture key: no card, and the window is shorter by it.
-        let without = SettingsView::build_rows(Some(page), false);
+        // Another capture key: no card.
+        let without = SettingsView::build_rows(Some(page), false, Tab::Hotkeys);
         assert!(!without.iter().any(|r| r.kind == WidgetKind::SystemShortcut));
-        let theme2 = without.iter().find(|r| r.kind == WidgetKind::Theme).unwrap();
-        assert_eq!(theme2.rect.1 - (last_hotkey.rect.1 + ROW_H), SECTION_ABOVE + SECTION_BAND,
-                   "same spacing as the other sections");
-        let close = without.iter().find(|r| r.kind == WidgetKind::CloseAfterCopy).unwrap();
-        let first_hotkey = without.iter().find(|r| matches!(r.kind, WidgetKind::HotkeyDisplay(_))).unwrap();
-        assert_eq!(first_hotkey.rect.1 - (close.rect.1 + ROW_H), SECTION_ABOVE + SECTION_BAND);
         assert!(content_height(&without) < content_height(&rows));
-        // The After-a-capture row (2026-11-17) took the last 40 px a 768 px
-        // screen had. The mouse-pointer row and then the roomier section
-        // headings (2026-11-19, both Brandon's asks) took it past 848: it now
-        // needs a 1080 px screen (title bar and a 48 px taskbar included).
-        // Pinned so the next row is a deliberate choice too.
-        assert!(content_height(&rows) + crate::chrome::TITLE_H as u32 + 48 <= 1000, "fits a 1080 px screen");
     }
 
     #[test]
@@ -1896,41 +2512,8 @@ mod tests {
     }
 
     #[test]
-    fn every_changed_mark_sits_beside_its_row_and_resets_just_that_setting() {
-        let rows = SettingsView::build_rows(None, false);
-        let mut c = AppSettings::default();
-        c.save_directory = "D:/shots".into();
-        c.recordings_directory = "D:/videos".into();
-        c.open_editor = false;
-        c.switch_key = "Alt".into();
-        c.capture_cursor = true;
-        c.auto_copy = true;
-        c.close_after_copy = true;
-        c.theme = "Orange".into();
-        c.start_with_windows = true;
-        for (i, a) in HotkeyAction::ALL.into_iter().enumerate() {
-            c.set_hotkey_for(a, Some(Hotkey { modifiers: HkMods::CONTROL, virtual_key: 0x70 + i as u32 }));
-        }
-        let mut seen = 0;
-        for (i, r) in rows.iter().enumerate() {
-            let WidgetKind::Reset(s) = r.kind else { continue };
-            seen += 1;
-            let row = &rows[i + 1];
-            assert_eq!(r.rect.1, row.rect.1, "{s:?}: the mark is on its row's line");
-            assert!(r.rect.0 >= 0 && r.rect.0 + r.rect.2 <= PAD, "{s:?}: the mark stays in the gutter");
-            assert!(!s.is_default(&c), "{s:?} reads as changed");
-            s.reset(&mut c);
-            assert!(s.is_default(&c), "{s:?} is back to default");
-        }
-        assert!(seen >= 10, "a mark for every setting row");
-        if framefang_platform::cursor::SUPPORTED {
-            assert_eq!(c, AppSettings::default(), "resetting every mark gives the defaults back");
-        }
-    }
-
-    #[test]
     fn header_button_words_fit_their_buttons() {
-        for r in SettingsView::build_rows(None, false) {
+        for r in all_rows(None, false) {
             if matches!(r.kind, WidgetKind::OpenJson | WidgetKind::ImportBtn | WidgetKind::ExportBtn) {
                 assert!(bitmap_font::measure(r.label, 1) + 2 * MIN_GAP <= r.rect.2, "{}", r.label);
             }
@@ -1939,38 +2522,112 @@ mod tests {
                 assert!(8 + 6 + bitmap_font::measure(r.label, 1) + MIN_GAP <= r.rect.2, "{}", r.label);
             }
             // An After-a-capture chip keeps 8 px either side of its word.
-            if matches!(r.kind, WidgetKind::AfterCaptureChoice(_) | WidgetKind::SwitchKeyChoice(_)) {
+            if matches!(r.kind, WidgetKind::AfterCaptureChoice(_)) {
                 assert!(bitmap_font::measure(r.label, 1) + 16 <= r.rect.2, "{}", r.label);
             }
         }
     }
 
     #[test]
-    fn the_after_capture_chips_stay_in_the_value_column_with_their_caption_clear() {
-        let rows = SettingsView::build_rows(None, false);
-        let row = rows.iter().find(|r| r.kind == WidgetKind::AfterCapture).unwrap();
-        let chips: Vec<&Row> = rows.iter()
-            .filter(|r| matches!(r.kind, WidgetKind::AfterCaptureChoice(_) | WidgetKind::SwitchKeyChoice(_)))
-            .collect();
-        assert_eq!(chips.len(), 5);
-        let right = row.rect.0 + row.rect.2 - 4;
-        // The keys end flush with the row's other controls, a clear gap
-        // after the two modes.
-        assert_eq!(chips[4].rect.0 + chips[4].rect.2, right);
-        assert!(chips[2].rect.0 - (chips[1].rect.0 + chips[1].rect.2) >= GROUP_GAP);
-        for c in &chips {
-            assert!(c.rect.0 >= row.rect.0 + LABEL_W && c.rect.0 + c.rect.2 <= right, "{} leaves the row", c.label);
-            assert!(c.rect.1 >= row.rect.1 && c.rect.1 + c.rect.3 <= row.rect.1 + ROW_H);
-        }
-        // The caption under the label, at its longest, ends before the chips.
-        let mut s = AppSettings::default();
-        for open_editor in [true, false] {
-            for key in SwitchKey::ALL {
-                s.open_editor = open_editor;
-                s.switch_key = key.name().into();
-                let caption = switch_caption(&s);
-                assert!(6 + crate::keycap::line_width(&caption, 1) + MIN_GAP <= LABEL_W, "\"{caption}\"");
+    fn each_hold_line_sits_under_the_choice_it_flips_and_fits_any_key() {
+        let rows = SettingsView::build_rows(None, false, Tab::Captures);
+        let mut holds = vec![(WidgetKind::AfterCapture, Hold::Capture), (WidgetKind::QrLinks, Hold::Qr)];
+        if crate::scroll::supported() { holds.push((WidgetKind::ScrollAfter, Hold::Scroll)); }
+        for (choice, hold) in holds {
+            let above = rows.iter().find(|r| r.kind == choice).unwrap();
+            let line = rows.iter().find(|r| r.kind == WidgetKind::HoldLine(hold)).unwrap();
+            assert_eq!(line.rect.1, above.rect.1 + ROW_H + SUB_IN, "{hold:?}: right under its choice, close");
+            // On its card's sub-strip, with its choice on the card above it.
+            let card = rows.iter().find(|r| matches!(r.kind, WidgetKind::Card(_))
+                && r.rect.1 <= above.rect.1 && line.rect.1 + line.rect.3 <= r.rect.1 + r.rect.3).expect("a card");
+            let WidgetKind::Card(Some(sub)) = card.kind else { panic!("{hold:?}: no sub-strip") };
+            assert!(above.rect.1 + above.rect.3 <= sub && sub <= line.rect.1);
+            assert!(rows.iter().any(|r| r.kind == WidgetKind::HoldKey(hold)));
+            // Its REBIND button sits inside the line at its right end, and
+            // reads LISTENING without spilling while it waits.
+            let btn = rows.iter().find(|r| r.kind == WidgetKind::HoldRebind(hold)).expect("a REBIND button");
+            assert_eq!(btn.rect.0 + btn.rect.2, line.rect.0 + line.rect.2 - 4, "{hold:?}: at the right end");
+            assert!(btn.rect.1 >= line.rect.1 && btn.rect.1 + btn.rect.3 <= line.rect.1 + line.rect.3);
+            assert!(bitmap_font::measure("LISTENING", 1) + 12 <= btn.rect.2);
+            // The longest it gets, waiting or refused or with a long key
+            // and the longer words, ends before the button.
+            let mut s = AppSettings::default();
+            for open in [true, false] {
+                s.open_editor = open;
+                s.open_qr_links = open;
+                s.set_scroll_after(if open { framefang_core::settings::AfterCapture::CopyAndEdit }
+                                   else { framefang_core::settings::AfterCapture::CopyOnly });
+                for key in [SwitchKey::Key(0x2C), SwitchKey::Ctrl] {
+                    hold.set(&mut s, key);
+                    for (listening, tail) in [(false, hold.tail(&s).to_owned()), (true, "Print Screen is in use".to_owned())] {
+                        let name = hold_key_name(hold, &s, listening);
+                        let (kx, _, kw, _) = hold_key_rect(line, &name);
+                        let end = kx + kw + HOLD_GAP + bitmap_font::measure(&tail, 1);
+                        assert!(end + MIN_GAP <= btn.rect.0, "{hold:?} {name} {tail}: ends at {end}");
+                    }
+                }
             }
         }
+        // It says what holding the key does, which flips with the choice.
+        let s = AppSettings::default();
+        assert_eq!(Hold::Capture.tail(&s), "to just copy instead");
+        assert_eq!(Hold::Qr.tail(&s), "to open links instead");
+        assert_eq!(Hold::Scroll.tail(&s), "to just copy instead", "a scrolling capture opens the editor by default");
+    }
+
+    #[test]
+    fn the_ffmpeg_row_can_pick_one_and_says_which_is_used() {
+        let rows = SettingsView::build_rows(None, false, Tab::Files);
+        let get = |k: WidgetKind| rows.iter().find(|r| r.kind == k).unwrap().rect;
+        let (browse, auto, download) = (get(WidgetKind::FfmpegBrowse), get(WidgetKind::FfmpegAuto), get(WidgetKind::FfmpegDownload));
+        let row = get(WidgetKind::Ffmpeg);
+        // Browse... ends where the folder rows' Browse... does; Auto or
+        // Download sits left of it, a gap apart.
+        assert_eq!(browse.0 + browse.2, row.0 + row.2 - 4);
+        for slot in [auto, download] { assert_eq!(slot.0 + slot.2 + 8, browse.0); }
+        assert!(auto.0 - 8 - (row.0 + LABEL_W) >= 160, "a picked path has room");
+        for (label, w) in [("Browse...", BROWSE_W), ("Auto", AUTO_W), ("DOWNLOAD", FFMPEG_BTN_W), ("RETRY", FFMPEG_BTN_W)] {
+            assert!(bitmap_font::measure(label, 1) + 16 <= w, "{label}");
+        }
+        // The field: the pick bright, a found one muted, a missing pick
+        // warned about with what is used instead.
+        let (p, q) = (std::path::Path::new("D:/tools/ffmpeg.exe"), std::path::Path::new("C:/ff/ffmpeg.exe"));
+        assert_eq!(ffmpeg_field_text(Some(p), Some(p)).unwrap().1, TEXT_BRIGHT);
+        assert_eq!(ffmpeg_field_text(Some(q), None).unwrap().1, TEXT_MUTED());
+        let (gone, color) = ffmpeg_field_text(Some(q), Some(p)).unwrap();
+        assert!(gone.contains("gone") && gone.contains("C:/ff") && color == WARN());
+        assert!(ffmpeg_field_text(None, Some(p)).unwrap().0.contains("Not found"));
+        assert!(ffmpeg_field_text(None, None).is_none());
+        // Blank means automatic.
+        let mut s = AppSettings::default();
+        assert_eq!(s.chosen_ffmpeg(), None);
+        s.ffmpeg_path = "  ".into();
+        assert_eq!(s.chosen_ffmpeg(), None);
+    }
+
+    #[test]
+    fn after_a_capture_offers_three_choices_and_holds_the_editor_copy_setting() {
+        use framefang_core::settings::AfterCapture;
+        let rows = SettingsView::build_rows(None, false, Tab::Captures);
+        let chips: Vec<_> = rows.iter().filter_map(|r| match r.kind {
+            WidgetKind::AfterCaptureChoice(a) => Some(a), _ => None }).collect();
+        assert_eq!(chips, AfterCapture::ALL.to_vec());
+        // No separate auto-copy switch: its card is gone.
+        assert!(!rows.iter().any(|r| r.label == "Copy screenshots automatically"));
+        // Close-after-copy sits under the hold line, on the same card's
+        // sub-strip as After a capture.
+        let line = rows.iter().find(|r| r.kind == WidgetKind::HoldLine(Hold::Capture)).unwrap();
+        let close = rows.iter().find(|r| r.kind == WidgetKind::CloseAfterCopy).unwrap();
+        assert_eq!(close.rect.1, line.rect.1 + line.rect.3, "right under the hold line");
+        let card = rows.iter().find(|r| matches!(r.kind, WidgetKind::Card(Some(sub)) if sub <= line.rect.1)
+            && r.rect.1 <= line.rect.1 && close.rect.1 + close.rect.3 <= r.rect.1 + r.rect.3).expect("one card");
+        assert!(card.rect.1 < line.rect.1);
+        // Picking a chip sets both stored fields.
+        let mut s = AppSettings::default();
+        s.set_after_capture(AfterCapture::CopyAndEdit);
+        assert!(s.open_editor && s.auto_copy);
+        assert_eq!(Hold::Capture.tail(&s), "to just copy instead");
+        s.set_after_capture(AfterCapture::CopyOnly);
+        assert_eq!(Hold::Capture.tail(&s), "to open the editor instead");
     }
 }

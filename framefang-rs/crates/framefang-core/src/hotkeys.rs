@@ -31,14 +31,28 @@ pub enum HotkeyAction {
     CaptureFullScreen,
     /// Start a screen recording, or stop the one that's running.
     ToggleRecording,
+    /// Take the last captured rectangle again, then do what a released
+    /// drag does.
+    CaptureLastRegion,
+    /// Open the picker in TEXT mode: the words in a region go on the
+    /// clipboard.
+    CaptureText,
+    /// Open the picker in QR mode: a QR code's contents go on the clipboard.
+    CaptureQr,
+    /// Open the picker in SCROLL mode: a page is scrolled and stitched.
+    CaptureScroll,
 }
 
 impl HotkeyAction {
     /// Every action, in dialog order.
-    pub const ALL: [HotkeyAction; 3] = [
+    pub const ALL: [HotkeyAction; 7] = [
         HotkeyAction::Capture,
         HotkeyAction::CaptureFullScreen,
         HotkeyAction::ToggleRecording,
+        HotkeyAction::CaptureLastRegion,
+        HotkeyAction::CaptureText,
+        HotkeyAction::CaptureQr,
+        HotkeyAction::CaptureScroll,
     ];
 
     /// Short user-facing name. Used as the Settings row label and inside
@@ -48,6 +62,10 @@ impl HotkeyAction {
             HotkeyAction::Capture           => "Capture region",
             HotkeyAction::CaptureFullScreen => "Capture full screen",
             HotkeyAction::ToggleRecording   => "Record screen",
+            HotkeyAction::CaptureLastRegion => "Capture last region",
+            HotkeyAction::CaptureText       => "Copy screen text",
+            HotkeyAction::CaptureQr         => "Read QR code",
+            HotkeyAction::CaptureScroll     => "Scrolling capture",
         }
     }
 
@@ -69,6 +87,14 @@ impl AppSettings {
                 (self.fullscreen_hotkey_modifiers, self.fullscreen_hotkey_virtual_key),
             HotkeyAction::ToggleRecording =>
                 (self.record_hotkey_modifiers, self.record_hotkey_virtual_key),
+            HotkeyAction::CaptureLastRegion =>
+                (self.last_region_hotkey_modifiers, self.last_region_hotkey_virtual_key),
+            HotkeyAction::CaptureText =>
+                (self.text_hotkey_modifiers, self.text_hotkey_virtual_key),
+            HotkeyAction::CaptureQr =>
+                (self.qr_hotkey_modifiers, self.qr_hotkey_virtual_key),
+            HotkeyAction::CaptureScroll =>
+                (self.scroll_hotkey_modifiers, self.scroll_hotkey_virtual_key),
         };
         if vk == UNSET_VK { return None; }
         Some(Hotkey { modifiers: Modifiers::from_bits_truncate(mods), virtual_key: vk })
@@ -95,6 +121,22 @@ impl AppSettings {
                 self.record_hotkey_modifiers   = mods;
                 self.record_hotkey_virtual_key = vk;
             }
+            HotkeyAction::CaptureLastRegion => {
+                self.last_region_hotkey_modifiers   = mods;
+                self.last_region_hotkey_virtual_key = vk;
+            }
+            HotkeyAction::CaptureText => {
+                self.text_hotkey_modifiers   = mods;
+                self.text_hotkey_virtual_key = vk;
+            }
+            HotkeyAction::CaptureQr => {
+                self.qr_hotkey_modifiers   = mods;
+                self.qr_hotkey_virtual_key = vk;
+            }
+            HotkeyAction::CaptureScroll => {
+                self.scroll_hotkey_modifiers   = mods;
+                self.scroll_hotkey_virtual_key = vk;
+            }
         }
     }
 
@@ -114,7 +156,9 @@ impl AppSettings {
     /// bound to the result, which then keeps it.
     pub fn capture_switch_chord(&self) -> Option<Hotkey> {
         let base = self.hotkey_for(HotkeyAction::Capture)?;
-        let m = self.switch_key().modifier();
+        // A switch key that isn't a modifier can't join a chord; it counts
+        // only as the drag is let go.
+        let m = self.switch_key().modifier()?;
         if base.modifiers.contains(m) { return None; }
         let chord = Hotkey { modifiers: base.modifiers | m, virtual_key: base.virtual_key };
         let taken = self.hotkey_bindings().iter().any(|(_, hk)| *hk == chord);
@@ -144,10 +188,10 @@ impl AppSettings {
 ///
 /// Kept short on purpose: it renders as a single unwrapped line of 5x7
 /// bitmap text in the dialog footer, which fits about 99 characters. The
-/// longest this can get -- both optional actions, every modifier, and a
-/// spelled-out key name -- is 96.
+/// longest this can get (the two longest labels, every modifier, and a
+/// spelled-out key name) is under that.
 pub fn conflict_message(a: HotkeyAction, b: HotkeyAction, hk: Hotkey) -> String {
-    format!("{} and {} share {} - rebind one.", a.label(), b.label(), hk.describe())
+    format!("{} and {} can't share {}.", a.label(), b.label(), hk.describe())
 }
 
 #[cfg(test)]
@@ -318,13 +362,12 @@ mod tests {
     fn worst_case_conflict_message_fits_the_footer() {
         let every_mod = Modifiers::CONTROL | Modifiers::SHIFT
             | Modifiers::ALT | Modifiers::SUPER;
-        let widest = HotkeyAction::ALL.iter()
-            .map(|a| a.label().len())
-            .max().unwrap();
-        let msg = conflict_message(HotkeyAction::CaptureFullScreen,
-                                   HotkeyAction::ToggleRecording,
-                                   hk(every_mod, 0x2C));
-        assert_eq!(widest, HotkeyAction::CaptureFullScreen.label().len());
+        let mut by_len = HotkeyAction::ALL.to_vec();
+        by_len.sort_by_key(|a| std::cmp::Reverse(a.label().len()));
+        // Every key name the dialog can spell out.
+        let longest_key = (1..=0xFE).map(|vk| hk(every_mod, vk))
+            .max_by_key(|h| h.describe().len()).unwrap();
+        let msg = conflict_message(by_len[0], by_len[1], longest_key);
         assert!(msg.len() <= 99, "{} chars: {msg}", msg.len());
     }
 
@@ -348,5 +391,21 @@ mod tests {
         assert!(!HotkeyAction::Capture.is_optional());
         assert!(HotkeyAction::CaptureFullScreen.is_optional());
         assert!(HotkeyAction::ToggleRecording.is_optional());
+        assert!(HotkeyAction::CaptureText.is_optional());
+        assert!(HotkeyAction::CaptureQr.is_optional());
+    }
+
+    #[test]
+    fn the_reading_keys_start_unbound_and_round_trip() {
+        let mut s = AppSettings::default();
+        assert_eq!(s.hotkey_for(HotkeyAction::CaptureText), None);
+        assert_eq!(s.hotkey_for(HotkeyAction::CaptureQr), None);
+        s.set_hotkey_for(HotkeyAction::CaptureText, Some(hk(Modifiers::CONTROL | Modifiers::SHIFT, 0x54)));
+        s.set_hotkey_for(HotkeyAction::CaptureQr, Some(hk(Modifiers::CONTROL | Modifiers::SHIFT, 0x51)));
+        let txt = serde_json::to_string(&s).unwrap();
+        for key in ["TextHotkeyVirtualKey", "QrHotkeyVirtualKey"] { assert!(txt.contains(key), "{key}"); }
+        let s2: AppSettings = serde_json::from_str(&txt).unwrap();
+        assert_eq!(s2.hotkey_for(HotkeyAction::CaptureText), Some(hk(Modifiers::CONTROL | Modifiers::SHIFT, 0x54)));
+        assert_eq!(s2.hotkey_for(HotkeyAction::CaptureQr), Some(hk(Modifiers::CONTROL | Modifiers::SHIFT, 0x51)));
     }
 }

@@ -15,6 +15,25 @@ pub struct OnScreenWindow {
     pub rect: (i32, i32, i32, i32),
     /// Its title, empty when it has none.
     pub title: String,
+    /// The process it belongs to (0 where unknown), for its app's name.
+    pub pid: u32,
+    /// Its handle (0 where there is none), to ask which part of it scrolls
+    /// (`scroll_parts`).
+    pub hwnd: isize,
+}
+
+/// The app a process runs, as a file name would want it: the program's
+/// name with a capital first letter ("Chrome", "Code"), or empty where it
+/// can't be read. A store app's frame host names no app, so it is empty and
+/// the window's title says what it is.
+#[cfg(windows)]
+pub fn app_name(pid: u32) -> String {
+    imp::app_name(pid)
+}
+
+#[cfg(not(windows))]
+pub fn app_name(_pid: u32) -> String {
+    String::new()
 }
 
 /// Every window a click could mean, frontmost first. Hidden, minimized and
@@ -88,7 +107,34 @@ mod imp {
         Some(OnScreenWindow {
             rect: (rect.left, rect.top, w, h),
             title: String::from_utf16_lossy(&title[..n]),
+            pid,
+            hwnd: hwnd.0 as isize,
         })
+    }
+
+    pub fn app_name(pid: u32) -> String {
+        use windows::core::PWSTR;
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::{
+            OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        if pid == 0 { return String::new(); }
+        let path = unsafe {
+            let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else { return String::new() };
+            let mut buf = [0u16; 512];
+            let mut len = buf.len() as u32;
+            let ok = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len).is_ok();
+            let _ = CloseHandle(h);
+            if !ok { return String::new(); }
+            String::from_utf16_lossy(&buf[..len as usize])
+        };
+        let stem = std::path::Path::new(&path).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        if stem.eq_ignore_ascii_case("ApplicationFrameHost") { return String::new(); }
+        let mut c = stem.chars();
+        match c.next() {
+            Some(f) => f.to_uppercase().chain(c).collect(),
+            None => String::new(),
+        }
     }
 
     /// The frame DWM draws, falling back to the window rect when DWM has

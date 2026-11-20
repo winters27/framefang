@@ -125,6 +125,19 @@ pub fn capture_all_screens() -> Result<Captured> {
     }
 }
 
+/// The pixels of one area of one screen, `(x, y, w, h)` in desktop pixels:
+/// the screen under its middle, the area cut to it. A few milliseconds on
+/// Windows, so scrolling capture can take one between every scroll.
+pub fn capture_area(x: i32, y: i32, w: u32, h: u32) -> Result<image::RgbaImage> {
+    let fail = |e: xcap::XCapError| Error::Capture(format!("capture_area: {e}"));
+    let m = xcap::Monitor::from_point(x + w as i32 / 2, y + h as i32 / 2).map_err(fail)?;
+    let (mx, my) = (m.x().map_err(fail)?, m.y().map_err(fail)?);
+    let (mw, mh) = (m.width().map_err(fail)?, m.height().map_err(fail)?);
+    let (rx, ry) = ((x - mx).max(0) as u32, (y - my).max(0) as u32);
+    let (rw, rh) = (w.min(mw.saturating_sub(rx)), h.min(mh.saturating_sub(ry)));
+    m.capture_region(rx, ry, rw, rh).map_err(fail)
+}
+
 /// Last resort when the native path can't produce a capture.
 ///
 /// Only Wayland has one: a Wayland-only session (no XWayland) fails monitor

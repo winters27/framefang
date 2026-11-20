@@ -59,6 +59,10 @@ fn shortcut_id(action: HotkeyAction) -> &'static str {
         HotkeyAction::Capture           => "capture",
         HotkeyAction::CaptureFullScreen => "capture-full-screen",
         HotkeyAction::ToggleRecording   => "toggle-recording",
+        HotkeyAction::CaptureLastRegion => "capture-last-region",
+        HotkeyAction::CaptureText       => "copy-screen-text",
+        HotkeyAction::CaptureQr         => "read-qr-code",
+        HotkeyAction::CaptureScroll     => "scrolling-capture",
     }
 }
 
@@ -74,6 +78,10 @@ fn shortcut_description(action: HotkeyAction) -> &'static str {
         HotkeyAction::Capture           => "Capture a screenshot",
         HotkeyAction::CaptureFullScreen => "Capture the full screen",
         HotkeyAction::ToggleRecording   => "Start or stop a screen recording",
+        HotkeyAction::CaptureLastRegion => "Capture the last region again",
+        HotkeyAction::CaptureText       => "Copy the text in a region of the screen",
+        HotkeyAction::CaptureQr         => "Read a QR code on the screen",
+        HotkeyAction::CaptureScroll     => "Capture a scrolling page",
     }
 }
 

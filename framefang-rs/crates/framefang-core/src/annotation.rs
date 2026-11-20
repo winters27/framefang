@@ -67,8 +67,26 @@ pub enum AnnotationKind {
     Ellipse    { stroke: Stroke, start: Point2, end: Point2 },
     Marker     { stroke: Stroke, points: Vec<Point2> },
     Text       { color: Rgba, position: Point2, text: String, font_size: f32 },
-    Step       { color: Rgba, center: Point2, number: u32 },
+    /// Words highlighted: a rectangle per line (see [`crate::mark`]).
+    TextMark   { rects: Vec<Rect>, look: crate::mark::MarkLook },
+    /// A numbered step, placed by its anchor (see [`crate::step`]).
+    Step       { center: Point2, number: u32, look: crate::step::StepLook },
     Pixelate   { start: Point2, end: Point2, block_size: u32 },
+    /// Everything of the picture outside this rectangle (and any other
+    /// spotlight) is dimmed; ink stays bright.
+    Spotlight  { start: Point2, end: Point2 },
+    /// A round lens at `center` reaching to `edge`, showing what is drawn
+    /// under it `zoom` times larger, ringed in the stroke.
+    Magnify    { stroke: Stroke, center: Point2, edge: Point2, zoom: u32 },
+}
+
+/// The largest lens Magnify draws: a bigger one costs every frame and shows
+/// little more.
+pub const MAGNIFY_MAX_RADIUS: f32 = 400.0;
+
+/// A Magnify lens's radius: from its center to the dragged edge, capped.
+pub fn magnify_radius(center: Point2, edge: Point2) -> f32 {
+    ((edge.x - center.x).powi(2) + (edge.y - center.y).powi(2)).sqrt().min(MAGNIFY_MAX_RADIUS)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -123,11 +141,31 @@ impl Annotation {
         let font_size = crate::text::clamp_px(font_size);
         Annotation { kind: AnnotationKind::Text { color, position: p, text: text.into(), font_size }, time: None }
     }
+    /// A plain disc step in `color`.
     pub fn step(color: Rgba, center: Point2, number: u32) -> Annotation {
-        Annotation { kind: AnnotationKind::Step { color, center, number }, time: None }
+        Annotation::step_styled(center, number, crate::step::StepLook::recipe(crate::step::StepShape::Disc, color))
+    }
+    pub fn step_styled(center: Point2, number: u32, look: crate::step::StepLook) -> Annotation {
+        Annotation { kind: AnnotationKind::Step { center, number, look }, time: None }
     }
     pub fn pixelate(a: Point2) -> Annotation {
         Annotation { kind: AnnotationKind::Pixelate { start: a, end: a, block_size: 10 }, time: None }
+    }
+    pub fn spotlight(a: Point2) -> Annotation {
+        Annotation { kind: AnnotationKind::Spotlight { start: a, end: a }, time: None }
+    }
+    pub fn magnify(stroke: Stroke, center: Point2, zoom: u32) -> Annotation {
+        Annotation { kind: AnnotationKind::Magnify { stroke, center, edge: center, zoom: zoom.clamp(2, 4) }, time: None }
+    }
+
+    /// Too small to be anything the user meant: a click with Spotlight or
+    /// Magnify in hand. Dropped on release, never recorded.
+    pub fn is_degenerate(&self) -> bool {
+        match &self.kind {
+            AnnotationKind::Spotlight { start, end } => (end.x - start.x).abs() < 4.0 || (end.y - start.y).abs() < 4.0,
+            AnnotationKind::Magnify { center, edge, .. } => magnify_radius(*center, *edge) < 8.0,
+            _ => false,
+        }
     }
 
     /// Update the in-progress annotation with the latest mouse position.
@@ -140,8 +178,12 @@ impl Annotation {
             AnnotationKind::Rectangle { end, .. }   => *end = p,
             AnnotationKind::Ellipse { end, .. }     => *end = p,
             AnnotationKind::Pixelate { end, .. }    => *end = p,
+            AnnotationKind::Spotlight { end, .. }   => *end = p,
+            AnnotationKind::Magnify { edge, .. }    => *edge = p,
             AnnotationKind::Text { .. }             => {}
             AnnotationKind::Step { .. }             => {}
+            // The editor sets its words as the drag goes.
+            AnnotationKind::TextMark { .. }         => {}
         }
     }
 }

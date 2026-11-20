@@ -26,9 +26,12 @@ const FADE_IN: Duration = Duration::from_millis(120);
 const HOLD: Duration = Duration::from_millis(1000);
 const FADE_OUT: Duration = Duration::from_millis(300);
 
-/// The pill's size in device pixels.
-pub fn size() -> (u32, u32) {
-    let w = crate::bitmap_font::measure(TEXT, SCALE) + PAD_X * 2;
+/// The "Copied to clipboard" pill's size in device pixels.
+pub fn size() -> (u32, u32) { size_for(TEXT) }
+
+/// A pill saying `text`: its size in device pixels.
+pub fn size_for(text: &str) -> (u32, u32) {
+    let w = crate::bitmap_font::measure(text, SCALE) + PAD_X * 2;
     let h = crate::bitmap_font::GLYPH_H * SCALE + PAD_Y * 2;
     (w as u32, h as u32)
 }
@@ -49,12 +52,22 @@ pub struct Toast {
     opened: Instant,
     /// The opacity last applied, so a tick that would not change it is free.
     alpha: u8,
+    text: String,
+    /// Green for done; amber for "nothing found".
+    color: u32,
 }
 
 impl Toast {
-    /// Show the pill with its top left at `pos`, in virtual-screen pixels.
+    /// Show "Copied to clipboard" with its top left at `pos`, in
+    /// virtual-screen pixels.
     pub fn new(loop_target: &ActiveEventLoop, pos: (i32, i32)) -> Result<Self> {
-        let (w, h) = size();
+        Self::saying(loop_target, pos, TEXT, true)
+    }
+
+    /// Show `text`: green when something was done, amber when there was
+    /// nothing to do (no text found).
+    pub fn saying(loop_target: &ActiveEventLoop, pos: (i32, i32), text: &str, done: bool) -> Result<Self> {
+        let (w, h) = size_for(text);
         let attrs = WindowAttributes::default()
             .with_title("Frame Fang")
             .with_decorations(false)
@@ -82,7 +95,8 @@ impl Toast {
         window.set_visible(true);
         let ctx = Context::new(window.clone()).map_err(|e| anyhow!("softbuffer Context::new (toast): {e}"))?;
         let surface = Surface::new(&ctx, window.clone()).map_err(|e| anyhow!("softbuffer Surface::new (toast): {e}"))?;
-        let mut me = Toast { window, _ctx: ctx, surface, opened: Instant::now(), alpha: 0 };
+        let color = if done { crate::editor::NEON_GREEN } else { 0x00_FF_B0_20 };
+        let mut me = Toast { window, _ctx: ctx, surface, opened: Instant::now(), alpha: 0, text: text.to_owned(), color };
         me.redraw();
         crate::reveal::uncloak(&me.window);
         Ok(me)
@@ -97,7 +111,7 @@ impl Toast {
         let Ok(mut buf) = self.surface.buffer_mut() else { return; };
         let (bw, bh) = (w.get() as usize, h.get() as usize);
         buf.fill(FILL);
-        let green = crate::editor::NEON_GREEN;
+        let green = self.color;
         // The 1 px frame of the editor's notices.
         for x in 0..bw {
             buf[x] = green;
@@ -107,11 +121,11 @@ impl Toast {
             buf[y * bw] = green;
             buf[y * bw + bw - 1] = green;
         }
-        let tw = crate::bitmap_font::measure(TEXT, SCALE);
+        let tw = crate::bitmap_font::measure(&self.text, SCALE);
         let th = crate::bitmap_font::GLYPH_H * SCALE;
         let mut surf = crate::painter::U32Surface { buf: &mut buf, stride: bw as i32, height: bh as i32 };
         let c = framefang_core::color::Rgba::new_opaque((green >> 16) as u8, (green >> 8) as u8, green as u8);
-        crate::painter::draw_text(&mut surf, (bw as i32 - tw) / 2, (bh as i32 - th) / 2, SCALE, TEXT, c);
+        crate::painter::draw_text(&mut surf, (bw as i32 - tw) / 2, (bh as i32 - th) / 2, SCALE, &self.text, c);
         let _ = buf.present();
     }
 
@@ -131,9 +145,11 @@ impl Toast {
 }
 
 /// The whole window at `alpha` (0 to 255): a layered window, which DWM
-/// blends over what is behind it.
+/// blends over what is behind it. Any click-through window needs it: winit
+/// makes one layered, and a layered window with no opacity set shows
+/// nothing (the scrolling indicator never showed, 2026-11-20).
 #[cfg(windows)]
-fn set_opacity(window: &Window, alpha: u8) {
+pub(crate) fn set_opacity(window: &Window, alpha: u8) {
     use windows::Win32::Foundation::{COLORREF, HWND};
     use windows::Win32::UI::WindowsAndMessaging::{
         GetWindowLongPtrW, SetLayeredWindowAttributes, SetWindowLongPtrW, GWL_EXSTYLE, LWA_ALPHA,

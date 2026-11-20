@@ -27,13 +27,16 @@ use crate::painter::Surface as _;
 use crate::palette::*;
 
 const WIN_W: u32 = 480;
-const WIN_H: u32 = 338;
+const WIN_H: u32 = 280;
 const PAD:   i32 = 22;
-const BTN_H: i32 = 30;
-const HEADER_H: i32 = 84;
+/// The version line's top: the window's first line, right under the title
+/// bar (which holds the heading).
+const BODY_Y: i32 = 22;
+/// The byline, a line gap under the version.
+const AUTHOR_Y: i32 = BODY_Y + 26;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum BtnKind { Project, Updates, Author, Close }
+enum BtnKind { Project, Updates, Author }
 
 struct Btn {
     kind:  BtnKind,
@@ -152,10 +155,7 @@ impl AboutView {
                         BtnKind::Project => AboutOutcome::OpenProject,
                         BtnKind::Updates => AboutOutcome::OpenUpdates,
                         BtnKind::Author  => AboutOutcome::OpenAuthor,
-                        BtnKind::Close   => AboutOutcome::Closed,
                     });
-                } else {
-                    crate::chrome::press_off_controls(&self.window, self.cursor.1, HEADER_H);
                 }
             }
             WindowEvent::Resized(_) | WindowEvent::RedrawRequested => self.redraw(),
@@ -171,20 +171,15 @@ impl AboutView {
     }
 
     fn build_btns(&self) -> Vec<Btn> {
+        // No Close button: the title bar's own closes the window.
         let mut btns = Vec::new();
-        // Header action bar (top-right) — primary "Close" lives here so the
-        // user's commit action is in the same spot as Settings.
-        let header_btn_y = (HEADER_H - BTN_H) / 2 + 4;
-        let close_w = 110;
-        let close_x = WIN_W as i32 - PAD - close_w;
-        btns.push(Btn { kind: BtnKind::Close, label: "Close", rect: (close_x, header_btn_y, close_w, BTN_H) });
 
         // Author byline hotspot. Geometry mirrors what `redraw` paints for
         // the byline so the click hit-rect hugs the underlined name only
         // (the lead-in stays non-clickable).
         let lead_w = bitmap_font::measure(BYLINE_LEAD, 1);
         let name_w = bitmap_font::measure(BYLINE_NAME, 1);
-        let author_y = HEADER_H + 28;
+        let author_y = AUTHOR_Y;
         let author_x = PAD + lead_w;
         // A bit of vertical padding so it's easy to hit.
         btns.push(Btn {
@@ -218,23 +213,21 @@ impl AboutView {
         // The dialog draws into its own buffer, placed below the title strip.
         let win_h = (h.get() as usize).saturating_sub(crate::chrome::TITLE_H as usize);
         let mut buf = vec![0u32; win_w * win_h];
-        crate::hud::backdrop(&mut buf, win_w, win_h, HEADER_H);
-        let _ = PANEL_BORDER();
-        let _ = TEXT_DIM();
+        // The title bar holds the heading; the glowing rule runs along the
+        // body's top.
+        crate::hud::backdrop(&mut buf, win_w, win_h, 0);
 
         let mut surf = BufferSurface { buf: &mut buf, w: win_w as i32, h: win_h as i32 };
 
-        // Title strip.
-        crate::hud::heading(surf.buf, win_w, win_h, PAD, 22, "FRAME FANG // ABOUT");
         // ASCII separator only — bitmap_font.rs ships glyphs for 0x20..=0x7E,
         // so a U+00B7 middle dot would render as `?`.
         let version = format!("v{}  //  the lightweight screenshot tool", env!("CARGO_PKG_VERSION"));
-        draw_text(&mut surf, PAD, 50, 1, &version, argb_to_framefang(TEXT_MUTED()));
+        draw_text(&mut surf, PAD, BODY_Y, 1, &version, argb_to_framefang(TEXT_MUTED()));
 
         // Body copy. The author's name is rendered separately so it can be
         // a clickable link (hit-rect built in `build_btns` as a
         // BtnKind::Author item).
-        let mut y = HEADER_H + 28;
+        let mut y = AUTHOR_Y;
         let (lead, name) = (BYLINE_LEAD, BYLINE_NAME);
         draw_text(&mut surf, PAD, y, 1, lead, argb_to_framefang(TEXT_BRIGHT));
         let lead_w = bitmap_font::measure(lead, 1);
@@ -268,7 +261,7 @@ impl AboutView {
             render_btn(&mut surf, b, hovered);
         }
 
-        self.title_bar.draw(&mut frame, win_w, &buf, "About", BG_TOP());
+        self.title_bar.draw(&mut frame, win_w, &buf, "// ABOUT", BG_TOP());
         if let Err(e) = frame.present() { eprintln!("about: buf.present: {e}"); }
     }
 }
@@ -278,16 +271,13 @@ fn render_btn<S: painter::Surface>(surf: &mut S, b: &Btn, hovered: bool) {
     // not as a framed button — skip the box+label drawing entirely.
     if b.kind == BtnKind::Author { return; }
     let (x, y, w, h) = b.rect;
-    let is_primary = b.kind == BtnKind::Close;
-    let border = if is_primary { LASER() } else if hovered { LASER_DIM() } else { PANEL_BORDER() };
-    let fill   = if is_primary && hovered { PRIMARY_FILL() } else if hovered { HOVER_FILL() } else { 0x0000_0000 };
-    if fill != 0 { fill_rect(surf, x, y, w, h, argb_to_framefang(fill)); }
+    let border = if hovered { LASER_DIM() } else { PANEL_BORDER() };
+    if hovered { fill_rect(surf, x, y, w, h, argb_to_framefang(HOVER_FILL())); }
     stroke_rect_argb(surf, x, y, w, h, argb_to_framefang(border));
     let tw = bitmap_font::measure(b.label, 1);
     let tx = x + (w - tw) / 2;
     let ty = y + (h - bitmap_font::GLYPH_H) / 2;
-    let color = if is_primary { LASER() } else { TEXT_BRIGHT };
-    draw_text(surf, tx, ty, 1, b.label, argb_to_framefang(color));
+    draw_text(surf, tx, ty, 1, b.label, argb_to_framefang(TEXT_BRIGHT));
 }
 
 // ── tiny rendering helpers (same shape as settings_form) ────────────────────

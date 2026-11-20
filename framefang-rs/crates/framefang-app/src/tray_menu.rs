@@ -10,9 +10,14 @@
 //!
 //! It is kept out of screenshots and recordings, so a capture started from it
 //! never shows it.
+//!
+//! With recent captures kept, a RECENT column on its right shows them as
+//! thumbnails, newest first: a click copies one, Shift+click opens it in the
+//! editor.
 
 use std::num::NonZeroU32;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
@@ -36,7 +41,7 @@ const PAD: i32 = TEXT_X;
 const HEADER_H: i32 = 50;
 const SECTION_H: i32 = 26;
 const ROW_H: i32 = 30;
-const CHIP_ROW_H: i32 = 34;
+const CHIP_ROW_H: i32 = 30;
 const CHIP_H: i32 = 22;
 const FOOTER_H: i32 = 40;
 /// Rows' hover wash stops this far from the window's sides.
@@ -74,17 +79,31 @@ pub struct MenuState {
     pub recording: bool,
     /// Which sound a recording started here takes.
     pub sound: RecordingOptions,
+    /// A region has been captured, so "Last region" has one to take.
+    pub last_region: bool,
+    /// Recordings end as GIF (no sound) instead of MP4.
+    pub gif: bool,
+    /// The last recording is still becoming a GIF.
+    pub converting: bool,
+    /// FFmpeg is there (a GIF needs it).
+    pub ffmpeg: bool,
 }
 
 pub enum MenuOutcome {
     Closed,
     Run(TrayEvent),
+    /// Recent capture `index` (newest first): copy it, or edit it.
+    Recent { index: usize, edit: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Act {
     Run(TrayEvent),
     Sound(RecordingOptions),
+    /// Record as GIF (`true`) or MP4.
+    Format(bool),
+    /// Recent capture `n`.
+    Recent(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +111,38 @@ enum Kind {
     Row,
     Chip,
     Footer,
+    /// A recent capture's thumbnail in the RECENT column.
+    Recent,
+}
+
+/// The RECENT column: its width, its thumbnails' cells (2 across, 5 down),
+/// the room between them, and the line under them.
+const COL_W: i32 = PAD * 2 + 2 * CELL.0 + CELL_GAP;
+const CELL: (i32, i32) = (crate::recent::THUMB.0 as i32 + 4, crate::recent::THUMB.1 as i32 + 4);
+const CELL_GAP: i32 = 8;
+const RECENT_COLS: usize = 2;
+const RECENT_HINT: &str = "Click copies  [Shift]+click edits";
+
+/// The menu's layout with the RECENT column's cells, one per kept capture
+/// (`recent`: how many, or `None` without the column).
+fn full_layout(s: &MenuState, recent: Option<usize>) -> Layout {
+    let mut l = layout(s);
+    if let Some(n) = recent {
+        let (x0, y0) = (W + PAD, HEADER_H + 4 + SECTION_H);
+        for i in 0..n.min(crate::recent::KEEP) {
+            let (c, r) = ((i % RECENT_COLS) as i32, (i / RECENT_COLS) as i32);
+            l.items.push(Item { kind: Kind::Recent,
+                                rect: (x0 + c * (CELL.0 + CELL_GAP), y0 + r * (CELL.1 + CELL_GAP), CELL.0, CELL.1),
+                                label: "", hint: None, act: Act::Recent(i), enabled: true });
+        }
+    }
+    l
+}
+
+/// Where the line under the RECENT grid goes: its top.
+fn recent_caption_y() -> i32 {
+    let rows = crate::recent::KEEP.div_ceil(RECENT_COLS) as i32;
+    HEADER_H + 4 + SECTION_H + rows * (CELL.1 + CELL_GAP) + 2
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +164,8 @@ struct Layout {
     sections: Vec<(i32, usize, &'static str)>,
     /// Chip rows' captions: row top, text.
     captions: Vec<(i32, &'static str)>,
+    /// A line of quiet text in a chip row's place: row top, text.
+    notes: Vec<(i32, &'static str)>,
     /// Hairlines between groups.
     rules: Vec<i32>,
     footer_y: i32,
@@ -134,15 +187,20 @@ fn layout(s: &MenuState) -> Layout {
         l.items.push(Item { kind: Kind::Row, rect: (INSET, *y, W - 2 * INSET, ROW_H), label, hint, act, enabled });
         *y += ROW_H;
     }
-    fn chips(l: &mut Layout, y: &mut i32, caption: &'static str, list: &[(&'static str, Act)]) {
+    fn chips(l: &mut Layout, y: &mut i32, caption: &'static str, list: &[(&'static str, Act, bool)]) {
         l.captions.push((*y, caption));
         let mut x = TEXT_X + CAPTION_W;
         let cy = *y + (CHIP_ROW_H - CHIP_H) / 2;
-        for &(label, act) in list {
+        for &(label, act, enabled) in list {
             let cw = chip_w(label);
-            l.items.push(Item { kind: Kind::Chip, rect: (x, cy, cw, CHIP_H), label, hint: None, act, enabled: true });
+            l.items.push(Item { kind: Kind::Chip, rect: (x, cy, cw, CHIP_H), label, hint: None, act, enabled });
             x += cw + 6;
         }
+        *y += CHIP_ROW_H;
+    }
+    fn note(l: &mut Layout, y: &mut i32, caption: &'static str, text: &'static str) {
+        l.captions.push((*y, caption));
+        l.notes.push((*y, text));
         *y += CHIP_ROW_H;
     }
     // An unbound key says so, so the row still shows where keys go.
@@ -155,32 +213,55 @@ fn layout(s: &MenuState) -> Layout {
     row(&mut l, &mut y, "Capture", key(&s.capture_key), Act::Run(TrayEvent::Capture), true);
     row(&mut l, &mut y, "Capture full screen", key(&s.full_key), Act::Run(TrayEvent::CaptureFullScreen), true);
     chips(&mut l, &mut y, "Delay", &[
-        ("3s", Act::Run(TrayEvent::CaptureDelayed(3))),
-        ("5s", Act::Run(TrayEvent::CaptureDelayed(5))),
-        ("10s", Act::Run(TrayEvent::CaptureDelayed(10))),
+        ("3s", Act::Run(TrayEvent::CaptureDelayed(3)), true),
+        ("5s", Act::Run(TrayEvent::CaptureDelayed(5)), true),
+        ("10s", Act::Run(TrayEvent::CaptureDelayed(10)), true),
+    ]);
+    // The other ways to capture, one chip each: keys for them are set in
+    // Settings.
+    chips(&mut l, &mut y, "Also", &[
+        ("Last region", Act::Run(TrayEvent::CaptureLastRegion), s.last_region),
+        ("Scroll", Act::Run(TrayEvent::CaptureScroll), crate::scroll::supported()),
+    ]);
+    // Captures that read what is on screen instead of keeping a picture.
+    chips(&mut l, &mut y, "Read", &[
+        ("Text", Act::Run(TrayEvent::CaptureText), true),
+        ("QR", Act::Run(TrayEvent::CaptureQr), true),
     ]);
 
     section(&mut l, &mut y, "RECORD");
+    let idle = !s.recording && !s.converting;
     if s.recording {
         row(&mut l, &mut y, "Stop recording", key(&s.record_key), Act::Run(TrayEvent::StopRecording), true);
+    } else if s.converting {
+        row(&mut l, &mut y, "Cancel GIF", None, Act::Run(TrayEvent::CancelGif), true);
     } else {
         row(&mut l, &mut y, "Record screen", key(&s.record_key), Act::Run(TrayEvent::StartRecording(s.sound)), true);
     }
-    row(&mut l, &mut y, "Record region", None, Act::Run(TrayEvent::StartRegionRecording(s.sound)), !s.recording);
-    chips(&mut l, &mut y, "Sound", &[
-        ("None", Act::Sound(RecordingOptions::NONE)),
-        ("Mic", Act::Sound(RecordingOptions::MIC_ONLY)),
-        ("PC", Act::Sound(RecordingOptions::SYSTEM_ONLY)),
-        ("Both", Act::Sound(RecordingOptions::MIC_AND_SYS)),
+    row(&mut l, &mut y, "Record region", None, Act::Run(TrayEvent::StartRegionRecording(s.sound)), idle);
+    chips(&mut l, &mut y, "Format", &[
+        ("MP4", Act::Format(false), idle),
+        // Without FFmpeg it stays clickable: it says how to get FFmpeg.
+        ("GIF", if s.ffmpeg { Act::Format(true) } else { Act::Run(TrayEvent::SetGif(true)) }, idle),
     ]);
+    if s.gif {
+        note(&mut l, &mut y, "Sound", "GIF has no sound");
+    } else {
+        chips(&mut l, &mut y, "Sound", &[
+            ("None", Act::Sound(RecordingOptions::NONE), idle),
+            ("Mic", Act::Sound(RecordingOptions::MIC_ONLY), idle),
+            ("PC", Act::Sound(RecordingOptions::SYSTEM_ONLY), idle),
+            ("Both", Act::Sound(RecordingOptions::MIC_AND_SYS), idle),
+        ]);
+    }
     row(&mut l, &mut y, "Annotate last recording", None, Act::Run(TrayEvent::AnnotateLastRecording), true);
 
     section(&mut l, &mut y, "FILES");
     row(&mut l, &mut y, "Open screenshots", None, Act::Run(TrayEvent::OpenSaveFolder), true);
     row(&mut l, &mut y, "Open recordings", None, Act::Run(TrayEvent::OpenRecordingsFolder), true);
     chips(&mut l, &mut y, "Convert", &[
-        ("Image", Act::Run(TrayEvent::ConvertImage)),
-        ("Video", Act::Run(TrayEvent::ConvertVideo)),
+        ("Image", Act::Run(TrayEvent::ConvertImage), true),
+        ("Video", Act::Run(TrayEvent::ConvertVideo), true),
     ]);
 
     y += 7;
@@ -239,20 +320,27 @@ pub struct TrayMenu {
     #[cfg(windows)]
     fg_at_open: isize,
     opened: Instant,
+    /// The recent captures, newest first; `None` while keeping them is off.
+    recent: Option<Arc<Vec<crate::recent::Entry>>>,
+    /// Shift is down: a recent capture opens in the editor.
+    shift: bool,
     pub outcome: Option<MenuOutcome>,
 }
 
 impl TrayMenu {
-    /// Open the menu for a tray click at `click` (physical screen pixels).
-    pub fn new(loop_target: &ActiveEventLoop, click: (i32, i32), state: MenuState) -> Result<Self> {
-        let lay = layout(&state);
+    /// Open the menu for a tray click at `click` (physical screen pixels),
+    /// with the RECENT column when `recent` is there.
+    pub fn new(loop_target: &ActiveEventLoop, click: (i32, i32), state: MenuState,
+               recent: Option<Arc<Vec<crate::recent::Entry>>>) -> Result<Self> {
+        let lay = full_layout(&state, recent.as_ref().map(|r| r.len()));
+        let width = W + if recent.is_some() { COL_W } else { 0 };
         let work = work_area(loop_target, click);
-        let (x, y) = place(click, (W, lay.h), work);
+        let (x, y) = place(click, (width, lay.h), work);
         let attrs = crate::chrome::frameless(WindowAttributes::default())
             .with_title("Frame Fang")
             .with_resizable(false)
             .with_visible(false)
-            .with_inner_size(PhysicalSize::new(W as u32, lay.h as u32))
+            .with_inner_size(PhysicalSize::new(width as u32, lay.h as u32))
             .with_position(PhysicalPosition::new(x, y))
             .with_window_level(WindowLevel::AlwaysOnTop);
         #[cfg(windows)]
@@ -276,6 +364,7 @@ impl TrayMenu {
             #[cfg(windows)]
             fg_at_open: foreground(),
             opened: Instant::now(),
+            recent, shift: false,
             outcome: None,
         };
         me.redraw();
@@ -288,6 +377,9 @@ impl TrayMenu {
 
     /// The sound chosen here, kept by the tray for the next time it opens.
     pub fn sound(&self) -> RecordingOptions { self.state.sound }
+
+    /// Whether GIF is chosen here.
+    pub fn gif(&self) -> bool { self.state.gif }
 
     /// Close when the user went to another window although the menu never
     /// had focus (Windows can refuse it to a background app).
@@ -318,6 +410,7 @@ impl TrayMenu {
             WindowEvent::CloseRequested => self.close(),
             WindowEvent::Focused(true) => self.had_focus = true,
             WindowEvent::Focused(false) => if self.had_focus { self.close() },
+            WindowEvent::ModifiersChanged(m) => self.shift = m.state().shift_key(),
             WindowEvent::KeyboardInput { event: winit::event::KeyEvent { logical_key, state: ElementState::Pressed, .. }, .. } => {
                 match logical_key {
                     Key::Named(NamedKey::Escape) => self.close(),
@@ -388,12 +481,20 @@ impl TrayMenu {
     fn activate(&mut self, i: usize) {
         let Some(it) = self.layout.items.get(i) else { return };
         if !it.enabled || self.outcome.is_some() { return; }
+        let recent_n = self.recent.as_ref().map(|r| r.len());
         match it.act {
             Act::Run(ev) => self.outcome = Some(MenuOutcome::Run(ev)),
+            Act::Recent(index) => self.outcome = Some(MenuOutcome::Recent { index, edit: self.shift }),
             Act::Sound(o) => {
                 self.state.sound = o;
                 // The record rows carry the sound, so lay out again.
-                self.layout = layout(&self.state);
+                self.layout = full_layout(&self.state, recent_n);
+                self.window.request_redraw();
+            }
+            Act::Format(gif) => {
+                self.state.gif = gif;
+                // GIF swaps the Sound chips for a note; the height is the same.
+                self.layout = full_layout(&self.state, recent_n);
                 self.window.request_redraw();
             }
         }
@@ -405,8 +506,11 @@ impl TrayMenu {
         if self.surface.resize(w, h).is_err() { return; }
         self.drawn_cursor = self.cursor_on();
         let Ok(mut buf) = self.surface.buffer_mut() else { return; };
-        draw(&mut buf, w.get() as usize, h.get() as usize, &self.layout, self.hover, self.state.sound,
+        draw(&mut buf, w.get() as usize, h.get() as usize, &self.layout, self.hover, &self.state,
              self.drawn_cursor);
+        if let Some(recent) = &self.recent {
+            draw_recent(&mut buf, w.get() as usize, h.get() as usize, &self.layout, self.hover, recent);
+        }
         let _ = buf.present();
     }
 }
@@ -435,14 +539,14 @@ fn text(buf: &mut [u32], w: usize, h: usize, x: f32, y: i32, band_h: i32, px: f3
     crate::painter::draw_unicode_text(&mut s, x, ty, px, t, rgba(c));
 }
 
-fn draw(buf: &mut [u32], w: usize, h: usize, l: &Layout, hover: Option<usize>, sound: RecordingOptions,
+fn draw(buf: &mut [u32], w: usize, h: usize, l: &Layout, hover: Option<usize>, s: &MenuState,
         cursor_on: bool) {
     crate::hud::backdrop(buf, w, h, HEADER_H);
     crate::hud::heading(buf, w, h, PAD, 18, "FRAME FANG");
     {
-        // The version, quiet, on the heading's middle.
+        // The version, quiet, on the heading's middle, at the window's right.
         let v = format!("v{}", env!("CARGO_PKG_VERSION"));
-        let vx = W - PAD - crate::bitmap_font::measure(&v, 1);
+        let vx = w as i32 - PAD - crate::bitmap_font::measure(&v, 1);
         let vy = 18 + (crate::bitmap_font::GLYPH_H * 2 - crate::bitmap_font::GLYPH_H) / 2;
         let mut s = crate::painter::U32Surface { buf, stride: w as i32, height: h as i32 };
         crate::painter::draw_text(&mut s, vx, vy, 1, &v, rgba(TEXT_DIM()));
@@ -453,12 +557,16 @@ fn draw(buf: &mut [u32], w: usize, h: usize, l: &Layout, hover: Option<usize>, s
     for &(y, caption) in &l.captions {
         text(buf, w, h, TEXT_X as f32, y, CHIP_ROW_H, SMALL_PX, caption, TEXT_MUTED());
     }
+    for &(y, note) in &l.notes {
+        text(buf, w, h, (TEXT_X + CAPTION_W) as f32, y, CHIP_ROW_H, SMALL_PX, note, TEXT_DIM());
+    }
     for &y in &l.rules {
         fill(buf, w, h, (PAD, y, W - 2 * PAD, 1), HEADER_RULE());
     }
-    // The footer: a band in the header's shade under a hairline.
-    fill(buf, w, h, (0, l.footer_y, W, h as i32 - l.footer_y), BG_TOP());
-    fill(buf, w, h, (0, l.footer_y, W, 1), HEADER_RULE());
+    // The footer: a band in the header's shade under a hairline, the
+    // window's whole width.
+    fill(buf, w, h, (0, l.footer_y, w as i32, h as i32 - l.footer_y), BG_TOP());
+    fill(buf, w, h, (0, l.footer_y, w as i32, 1), HEADER_RULE());
 
     for (i, it) in l.items.iter().enumerate() {
         let hot = hover == Some(i) && it.enabled;
@@ -485,13 +593,18 @@ fn draw(buf: &mut [u32], w: usize, h: usize, l: &Layout, hover: Option<usize>, s
                 }
             }
             Kind::Chip => {
-                let chosen = it.act == Act::Sound(sound);
-                let (bg, border, fg) = if chosen {
+                let chosen = it.act == Act::Sound(s.sound) || it.act == Act::Format(s.gif);
+                // GIF without FFmpeg: dim, but it still answers (with how to
+                // get FFmpeg).
+                let unavailable = it.act == Act::Run(TrayEvent::SetGif(true));
+                let (bg, border, fg) = if !it.enabled {
+                    (0, FIELD_BORDER(), TEXT_DIM())
+                } else if chosen {
                     (LASER(), LASER(), BG_BODY())
                 } else if hot {
-                    (HOVER_FILL(), LASER_DIM(), TEXT_BRIGHT)
+                    (HOVER_FILL(), LASER_DIM(), if unavailable { TEXT_MUTED() } else { TEXT_BRIGHT })
                 } else {
-                    (0, FIELD_BORDER(), TEXT_MUTED())
+                    (0, FIELD_BORDER(), if unavailable { TEXT_DIM() } else { TEXT_MUTED() })
                 };
                 if bg != 0 { fill(buf, w, h, it.rect, bg); }
                 stroke(buf, w, h, it.rect, border);
@@ -519,6 +632,54 @@ fn draw(buf: &mut [u32], w: usize, h: usize, l: &Layout, hover: Option<usize>, s
                 let tw = framefang_core::text::line_width(it.label, SMALL_PX);
                 text(buf, w, h, x as f32 + (iw as f32 - tw) / 2.0, y, ih, SMALL_PX, it.label, c);
             }
+            // Drawn by `draw_recent`.
+            Kind::Recent => {}
+        }
+    }
+}
+
+/// The RECENT column right of the menu: a hairline apart, its `04 //`
+/// label, the thumbnails (the pointed-at one ringed in the accent), and
+/// under them the pointed-at capture's time and size, or what a click does.
+/// With nothing kept yet, it says so.
+fn draw_recent(buf: &mut [u32], w: usize, h: usize, l: &Layout, hover: Option<usize>,
+               recent: &[crate::recent::Entry]) {
+    let x0 = W;
+    fill(buf, w, h, (x0, HEADER_H + 8, 1, l.footer_y - HEADER_H - 16), HEADER_RULE());
+    crate::hud::section(buf, w, h, x0 + PAD, x0 + COL_W - PAD, HEADER_H + 4 + 12, 4, "RECENT");
+    let mut hovered: Option<&crate::recent::Entry> = None;
+    for (i, it) in l.items.iter().enumerate() {
+        let Act::Recent(n) = it.act else { continue };
+        let Some(e) = recent.get(n) else { continue };
+        let hot = hover == Some(i);
+        if hot { hovered = Some(e); }
+        let (x, y, cw, ch) = it.rect;
+        fill(buf, w, h, it.rect, FIELD_BG());
+        // The thumbnail, centered in its cell.
+        let (tw, th) = (e.thumb.width() as i32, e.thumb.height() as i32);
+        let (tx, ty) = (x + (cw - tw) / 2, y + (ch - th) / 2);
+        for (px, py, p) in e.thumb.enumerate_pixels() {
+            let (bx, by) = (tx + px as i32, ty + py as i32);
+            if bx >= 0 && by >= 0 && (bx as usize) < w && (by as usize) < h {
+                buf[by as usize * w + bx as usize] = ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | p[2] as u32;
+            }
+        }
+        stroke(buf, w, h, it.rect, if hot { LASER() } else { FIELD_BORDER() });
+        if hot { stroke(buf, w, h, (x + 1, y + 1, cw - 2, ch - 2), LASER()); }
+    }
+    let cy = recent_caption_y();
+    let band = 22;
+    match hovered {
+        Some(e) => text(buf, w, h, (x0 + PAD) as f32, cy, band, SMALL_PX, &e.caption(), TEXT_BRIGHT),
+        None if recent.is_empty() => {
+            let gy = HEADER_H + 4 + SECTION_H;
+            text(buf, w, h, (x0 + PAD) as f32, gy + 6, band, SMALL_PX, "Nothing yet", TEXT_MUTED());
+            text(buf, w, h, (x0 + PAD) as f32, gy + 6 + band, band, SMALL_PX,
+                 "Captures you copy or save show here.", TEXT_DIM());
+        }
+        None => {
+            let text_y = cy + (band - crate::bitmap_font::GLYPH_H) / 2;
+            crate::keycap::draw_line(buf, w, h, x0 + PAD, text_y, RECENT_HINT, 1, TEXT_DIM());
         }
     }
 }
@@ -526,7 +687,7 @@ fn draw(buf: &mut [u32], w: usize, h: usize, l: &Layout, hover: Option<usize>, s
 /// The work area (screen minus taskbar) of the screen holding `p`, as
 /// `left, top, right, bottom`.
 #[cfg(windows)]
-fn work_area(_loop_target: &ActiveEventLoop, p: (i32, i32)) -> (i32, i32, i32, i32) {
+pub(crate) fn work_area(_loop_target: &ActiveEventLoop, p: (i32, i32)) -> (i32, i32, i32, i32) {
     use windows::Win32::Foundation::POINT;
     use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST};
     unsafe {
@@ -541,7 +702,7 @@ fn work_area(_loop_target: &ActiveEventLoop, p: (i32, i32)) -> (i32, i32, i32, i
 }
 
 #[cfg(not(windows))]
-fn work_area(loop_target: &ActiveEventLoop, p: (i32, i32)) -> (i32, i32, i32, i32) {
+pub(crate) fn work_area(loop_target: &ActiveEventLoop, p: (i32, i32)) -> (i32, i32, i32, i32) {
     let rect = |m: &winit::monitor::MonitorHandle| {
         let (pos, size) = (m.position(), m.size());
         (pos.x, pos.y, pos.x + size.width as i32, pos.y + size.height as i32)
@@ -568,6 +729,126 @@ mod tests {
             record_key: Some("Ctrl + Shift + R".into()),
             recording: false,
             sound: RecordingOptions::NONE,
+            last_region: true,
+            gif: false,
+            converting: false,
+            ffmpeg: true,
+        }
+    }
+
+    /// The tallest the menu gets (every key bound, a recording running) fits
+    /// a 1280 x 720 screen with a 48 px taskbar, gaps included.
+    #[test]
+    fn the_tallest_menu_fits_a_small_screen() {
+        let worst = MenuState {
+            capture_key: Some("Ctrl + Shift + Alt + Print Screen".into()),
+            full_key: Some("Ctrl + Shift + F".into()),
+            record_key: Some("Ctrl + Shift + R".into()),
+            recording: true,
+            ..state()
+        };
+        for s in [worst.clone(), MenuState { recording: false, converting: true, ..worst.clone() },
+                  MenuState { gif: true, ..worst }] {
+            let l = layout(&s);
+            assert!(l.h + 2 * GAP <= 720 - 48, "{} px tall", l.h);
+        }
+    }
+
+    #[test]
+    fn gif_swaps_the_sound_chips_for_a_note_and_converting_offers_cancel() {
+        let gif = layout(&MenuState { gif: true, ..state() });
+        assert!(gif.items.iter().all(|i| !matches!(i.act, Act::Sound(_))), "no sound chips for a GIF");
+        assert_eq!(gif.notes.len(), 1);
+        assert_eq!(gif.h, layout(&state()).h, "the menu keeps its height");
+        let busy = layout(&MenuState { converting: true, ..state() });
+        assert_eq!(find(&busy, "Cancel GIF").act, Act::Run(TrayEvent::CancelGif));
+        assert!(!find(&busy, "Record region").enabled);
+        assert!(busy.items.iter().filter(|i| i.kind == Kind::Chip && matches!(i.act, Act::Format(_)))
+            .all(|i| !i.enabled), "the format can't change while a GIF is made");
+        let none = layout(&MenuState { ffmpeg: false, ..state() });
+        assert_eq!(find(&none, "GIF").act, Act::Run(TrayEvent::SetGif(true)), "GIF without FFmpeg says how to get it");
+        let first = layout(&MenuState { last_region: false, ..state() });
+        assert!(!find(&first, "Last region").enabled, "nothing to take again yet");
+    }
+
+    /// Writes target/tray-menu-recent.png: the menu with a full RECENT
+    /// column (the third thumbnail pointed at) and target/tray-menu-empty.png
+    /// with nothing kept yet. Thumbnails from the kept captures in
+    /// `FF_RECENT_DIR` when set, else made up.
+    #[test]
+    #[ignore]
+    fn render_tray_menu_with_recent_to_png() {
+        let mut thumbs: Vec<image::RgbaImage> = std::env::var("FF_RECENT_DIR").ok()
+            .and_then(|d| std::fs::read_dir(d).ok())
+            .map(|rd| rd.flatten().filter(|f| f.file_name().to_string_lossy().ends_with(".thumb.png"))
+                .filter_map(|f| image::open(f.path()).ok().map(|i| i.to_rgba8())).collect())
+            .unwrap_or_default();
+        let shades: [(u8, u8, u8); 5] = [(40, 90, 160), (200, 200, 205), (30, 30, 34), (150, 60, 90), (240, 240, 240)];
+        let mut k = 0;
+        while thumbs.len() < crate::recent::KEEP {
+            let (r, g, b) = shades[k % shades.len()];
+            let (w, h) = if k % 3 == 0 { (96, 54) } else if k % 3 == 1 { (60, 60) } else { (96, 40) };
+            thumbs.push(image::RgbaImage::from_fn(w, h, |x, y| {
+                let stripe = if y % 9 < 2 && x > 8 && x < w - 8 { 40 } else { 0 };
+                image::Rgba([r.saturating_sub(stripe), g.saturating_sub(stripe), b.saturating_sub(stripe), 255])
+            }));
+            k += 1;
+        }
+        let entries: Vec<crate::recent::Entry> = thumbs.into_iter().enumerate().map(|(i, thumb)| crate::recent::Entry {
+            id: format!("{i}"), ms: 1_795_140_000_000 + i as u64 * 60_000, size: (1280 + i as u32 * 10, 720), thumb,
+        }).collect();
+        let s = state();
+        for (name, list, hover_cell) in [("recent", entries.clone(), Some(2)), ("empty", Vec::new(), None)] {
+            let l = full_layout(&s, Some(list.len()));
+            let (w, h) = ((W + COL_W) as usize, l.h as usize);
+            let mut buf = vec![0u32; w * h];
+            let hover = hover_cell.and_then(|c| l.items.iter().position(|i| i.act == Act::Recent(c)));
+            draw(&mut buf, w, h, &l, hover, &s, false);
+            draw_recent(&mut buf, w, h, &l, hover, &list);
+            let img = image::RgbImage::from_fn(w as u32, h as u32, |x, y| {
+                let p = buf[y as usize * w + x as usize];
+                image::Rgb([(p >> 16) as u8, (p >> 8) as u8, p as u8])
+            });
+            img.save(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../target/tray-menu-{name}.png"))).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_recent_column_sits_right_of_the_menu_above_the_footer() {
+        let worst = MenuState { recording: true, full_key: Some("Ctrl + Shift + F".into()), ..state() };
+        let l = full_layout(&worst, Some(crate::recent::KEEP));
+        let cells: Vec<&Item> = l.items.iter().filter(|i| i.kind == Kind::Recent).collect();
+        assert_eq!(cells.len(), crate::recent::KEEP);
+        for c in &cells {
+            let (x, y, w, h) = c.rect;
+            assert!(x >= W + PAD && x + w <= W + COL_W - PAD + 1, "{:?} in the column", c.rect);
+            assert!(y >= HEADER_H && y + h <= recent_caption_y(), "{:?} above its caption", c.rect);
+        }
+        assert!(recent_caption_y() + 22 <= l.footer_y, "the caption clears the footer");
+        assert!(W + COL_W <= 1024 - 2 * GAP, "fits a small screen");
+        // The menu's own items don't move.
+        assert_eq!(l.items.iter().filter(|i| i.kind != Kind::Recent).count(), layout(&worst).items.len());
+        assert!(crate::keycap::line_width(RECENT_HINT, 1) <= COL_W - 2 * PAD, "the hint fits");
+        // Fewer kept: that many cells; keeping off: none.
+        assert_eq!(full_layout(&state(), Some(3)).items.iter().filter(|i| i.kind == Kind::Recent).count(), 3);
+        assert_eq!(full_layout(&state(), None).items.len(), layout(&state()).items.len());
+    }
+
+    #[test]
+    fn the_other_captures_have_chips_that_open_their_pickers() {
+        let l = layout(&state());
+        let (last, scroll) = (find(&l, "Last region"), find(&l, "Scroll"));
+        let (text, qr) = (find(&l, "Text"), find(&l, "QR"));
+        assert_eq!(text.act, Act::Run(TrayEvent::CaptureText));
+        assert_eq!(qr.act, Act::Run(TrayEvent::CaptureQr));
+        assert_eq!(scroll.act, Act::Run(TrayEvent::CaptureScroll));
+        assert!(text.enabled && qr.enabled);
+        assert_eq!(scroll.enabled, crate::scroll::supported());
+        assert_eq!(last.rect.1, scroll.rect.1, "Last region and Scroll share a row");
+        assert_eq!(text.rect.1, qr.rect.1, "Text and QR share the Read row");
+        assert!(text.rect.1 > last.rect.1, "Read comes after Also");
+        for it in [scroll, qr] {
+            assert!(it.rect.0 + it.rect.2 <= W - PAD, "{} inside the words' right edge", it.label);
         }
     }
 
@@ -634,7 +915,7 @@ mod tests {
             for (tag, hover) in [("plain", None), ("row", hovered), ("chip", chip), ("quit", quit)] {
                 let (w, h) = (W as usize, l.h as usize);
                 let mut buf = vec![0u32; w * h];
-                draw(&mut buf, w, h, &l, hover, st.sound, true);
+                draw(&mut buf, w, h, &l, hover, &st, true);
                 let img = image::RgbImage::from_fn(w as u32, h as u32, |x, y| {
                     let p = buf[y as usize * w + x as usize];
                     image::Rgb([(p >> 16) as u8, (p >> 8) as u8, p as u8])

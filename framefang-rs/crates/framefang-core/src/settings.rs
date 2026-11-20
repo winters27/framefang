@@ -225,6 +225,14 @@ pub struct AppSettings {
     #[serde(rename = "OpenEditor", default = "default_true")]
     pub open_editor: bool,
 
+    /// What a scrolling capture does when it is finished, apart from a
+    /// region capture's: `"Edit"`, `"CopyAndEdit"` (the default) or
+    /// `"CopyOnly"` (see [`AfterCapture`]). A long page is worth a look
+    /// even when quick captures only copy (Brandon 2026-11-20: "how do we
+    /// even edit these pics? no editor comes up").
+    #[serde(rename = "ScrollAfterCapture", default = "default_scroll_after_capture")]
+    pub scroll_after_capture: String,
+
     /// The key that, held with the capture key or as the drag is let go,
     /// makes that one capture do the other thing: `"Shift"`, `"Ctrl"` or
     /// `"Alt"` (see [`SwitchKey`]).
@@ -252,6 +260,11 @@ pub struct AppSettings {
 
     #[serde(rename = "RecordingsDirectory", default)]
     pub recordings_directory: String,
+
+    /// The FFmpeg the user picked in Settings. Empty: found by itself (next
+    /// to the app, PATH, then the downloaded copy).
+    #[serde(rename = "FfmpegPath", default)]
+    pub ffmpeg_path: String,
 
     #[serde(rename = "HotkeyModifiers", default = "default_hotkey_modifiers")]
     pub hotkey_modifiers: u32,
@@ -298,9 +311,139 @@ pub struct AppSettings {
     /// menu's Sound chips.
     #[serde(rename = "RecordSound", default = "default_record_sound")]
     pub record_sound: String,
+
+    /// How saved screenshots and recordings are named: tokens like
+    /// `{yyyy}`, `{date}`, `{app}` (see `crate::file_name`). The default
+    /// gives the name every version before this one used.
+    #[serde(rename = "FileNamePattern", default = "default_file_name_pattern")]
+    pub file_name_pattern: String,
+
+    /// The last pattern that was not one of Settings' presets, kept so
+    /// picking a preset and then CUSTOM brings it back.
+    #[serde(rename = "FileNameCustom", default)]
+    pub file_name_custom: String,
+
+    /// What a recording ends as: `"MP4"` or `"GIF"` (see [`RecordFormat`]).
+    #[serde(rename = "RecordFormat", default = "default_record_format")]
+    pub record_format: String,
+
+    /// A frame added to every saved or copied screenshot: `"None"`,
+    /// `"Border"` or `"Shadow"` (see [`OutputFrame`]).
+    #[serde(rename = "OutputFrame", default = "default_output_frame")]
+    pub output_frame: String,
+
+    /// Optional binding: take the last captured rectangle again. Encoding and
+    /// "not bound" rule as the other optional hotkeys.
+    #[serde(rename = "LastRegionHotkeyModifiers", default)]
+    pub last_region_hotkey_modifiers: u32,
+
+    #[serde(rename = "LastRegionHotkeyVirtualKey", default)]
+    pub last_region_hotkey_virtual_key: u32,
+
+    /// Optional binding: open the picker in TEXT mode, to copy the words in
+    /// a region.
+    #[serde(rename = "TextHotkeyModifiers", default)]
+    pub text_hotkey_modifiers: u32,
+
+    #[serde(rename = "TextHotkeyVirtualKey", default)]
+    pub text_hotkey_virtual_key: u32,
+
+    /// Optional binding: open the picker in QR mode, to read a QR code.
+    #[serde(rename = "QrHotkeyModifiers", default)]
+    pub qr_hotkey_modifiers: u32,
+
+    #[serde(rename = "QrHotkeyVirtualKey", default)]
+    pub qr_hotkey_virtual_key: u32,
+
+    /// Optional binding: open the picker in SCROLL mode.
+    #[serde(rename = "ScrollHotkeyModifiers", default)]
+    pub scroll_hotkey_modifiers: u32,
+
+    #[serde(rename = "ScrollHotkeyVirtualKey", default)]
+    pub scroll_hotkey_virtual_key: u32,
+
+    /// How much the Magnify lens enlarges: 2, 3 or 4, set from its flyout.
+    #[serde(rename = "MagnifyZoom", default = "default_magnify_zoom")]
+    pub magnify_zoom: u32,
+
+    /// A QR code that holds a web link opens it in the browser instead of
+    /// copying it. Off: every QR code is copied.
+    #[serde(rename = "OpenQrLinks", default)]
+    pub open_qr_links: bool,
+
+    /// Held as a QR read is let go, a link does the other thing (opens
+    /// instead of copying, or the other way round): `"Shift"`, `"Ctrl"` or
+    /// `"Alt"`. Its own key, set apart from the capture switch key.
+    #[serde(rename = "QrSwitchKey", default = "default_qr_switch_key")]
+    pub qr_switch_key: String,
+
+    /// Held as the part to scroll is clicked, a scrolling capture does the
+    /// other thing (the editor, or just copying; see `ScrollAfterCapture`).
+    /// Its own key, Shift unless set.
+    #[serde(rename = "ScrollSwitchKey", default = "default_scroll_switch_key")]
+    pub scroll_switch_key: String,
+
+    /// How numbered steps look: shape, each part's color, shadow (see
+    /// [`crate::step`]). `None` until one is picked: a plain disc in the
+    /// Step tool's own color.
+    #[serde(rename = "StepLook", default)]
+    pub step_look: Option<crate::step::StepLook>,
+
+    /// The Highlight tool's look (its color is the tool's own).
+    #[serde(rename = "HighlightStyle", default)]
+    pub highlight_style: crate::mark::MarkStyle,
+
+    /// Keep the last 10 captures (copy-only included) for the tray's RECENT
+    /// list. Turning it off deletes them.
+    #[serde(rename = "KeepRecentCaptures", default = "default_true")]
+    pub keep_recent: bool,
 }
 
+fn default_magnify_zoom() -> u32 { 2 }
+
 fn default_record_sound() -> String { "None".to_owned() }
+pub fn default_file_name_pattern() -> String { crate::file_name::DEFAULT_PATTERN.to_owned() }
+fn default_record_format() -> String { RecordFormat::Mp4.name().to_owned() }
+fn default_output_frame() -> String { OutputFrame::None.name().to_owned() }
+
+/// What a recording ends as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordFormat { Mp4, Gif }
+
+impl RecordFormat {
+    pub const ALL: [RecordFormat; 2] = [RecordFormat::Mp4, RecordFormat::Gif];
+
+    /// The stored word. Anything unknown reads as MP4.
+    pub fn parse(s: &str) -> RecordFormat {
+        RecordFormat::ALL.into_iter().find(|f| f.name().eq_ignore_ascii_case(s)).unwrap_or(RecordFormat::Mp4)
+    }
+
+    pub fn name(self) -> &'static str {
+        match self { RecordFormat::Mp4 => "MP4", RecordFormat::Gif => "GIF" }
+    }
+
+    /// The file extension, without the dot.
+    pub fn extension(self) -> &'static str {
+        match self { RecordFormat::Mp4 => "mp4", RecordFormat::Gif => "gif" }
+    }
+}
+
+/// A frame around every saved or copied screenshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFrame { None, Border, Shadow }
+
+impl OutputFrame {
+    pub const ALL: [OutputFrame; 3] = [OutputFrame::None, OutputFrame::Border, OutputFrame::Shadow];
+
+    /// The stored word. Anything unknown reads as None.
+    pub fn parse(s: &str) -> OutputFrame {
+        OutputFrame::ALL.into_iter().find(|f| f.name().eq_ignore_ascii_case(s)).unwrap_or(OutputFrame::None)
+    }
+
+    pub fn name(self) -> &'static str {
+        match self { OutputFrame::None => "None", OutputFrame::Border => "Border", OutputFrame::Shadow => "Shadow" }
+    }
+}
 
 impl Default for AppSettings {
     fn default() -> Self {
@@ -313,12 +456,14 @@ impl Default for AppSettings {
             auto_copy:           false,
             close_after_copy:    false,
             open_editor:         true,
+            scroll_after_capture: default_scroll_after_capture(),
             switch_key:          default_switch_key(),
             capture_cursor:      false,
             capture_mode:        default_capture_mode(),
             tool_styles:         Default::default(),
             save_directory:      String::new(),
             recordings_directory: String::new(),
+            ffmpeg_path:         String::new(),
             hotkey_modifiers:    default_hotkey_modifiers(),
             hotkey_virtual_key:  default_vk(),
             fullscreen_hotkey_modifiers:   0,
@@ -330,53 +475,220 @@ impl Default for AppSettings {
             theme:               default_theme(),
             marker_opacity:      default_marker_opacity(),
             record_sound:        default_record_sound(),
+            file_name_pattern:   default_file_name_pattern(),
+            file_name_custom:    String::new(),
+            record_format:       default_record_format(),
+            output_frame:        default_output_frame(),
+            last_region_hotkey_modifiers:   0,
+            last_region_hotkey_virtual_key: 0,
+            text_hotkey_modifiers:          0,
+            text_hotkey_virtual_key:        0,
+            qr_hotkey_modifiers:            0,
+            qr_hotkey_virtual_key:          0,
+            scroll_hotkey_modifiers:        0,
+            scroll_hotkey_virtual_key:      0,
+            magnify_zoom:        default_magnify_zoom(),
+            open_qr_links:       false,
+            qr_switch_key:       default_qr_switch_key(),
+            scroll_switch_key:   default_scroll_switch_key(),
+            step_look:           None,
+            highlight_style:     Default::default(),
+            keep_recent:         true,
         }
     }
 }
 
 fn default_true()        -> bool    { true }
 fn default_capture_mode() -> String { "Auto".to_owned() }
-fn default_switch_key()  -> String  { SwitchKey::Shift.name().to_owned() }
+fn default_switch_key()  -> String  { SwitchKey::Shift.name() }
 
-/// The key that flips one capture between opening the editor and just
-/// copying. Modifiers only: they can be held through a drag without typing
-/// anything, and the region picker gives none of them a meaning.
+/// A key held as a capture is let go to do the other thing: the capture
+/// switch key (editor or just copy) and QR's key (open a link or copy it).
+/// A modifier, or any other key the user binds (Brandon 2026-11-19: "ppl
+/// should be able to bind their own"), stored by its Win32 virtual-key code
+/// like the hotkeys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SwitchKey { Shift, Ctrl, Alt }
+pub enum SwitchKey { Shift, Ctrl, Alt, Key(u32) }
 
 impl SwitchKey {
+    /// The modifiers, the usual picks.
     pub const ALL: [SwitchKey; 3] = [SwitchKey::Shift, SwitchKey::Ctrl, SwitchKey::Alt];
 
     /// The stored word. Anything unknown reads as Shift.
-    pub fn parse(s: &str) -> SwitchKey {
-        SwitchKey::ALL.into_iter().find(|k| k.name().eq_ignore_ascii_case(s)).unwrap_or(SwitchKey::Shift)
+    pub fn parse(s: &str) -> SwitchKey { SwitchKey::parse_or(s, SwitchKey::Shift) }
+
+    /// The stored word: `Shift`, `Ctrl`, `Alt` or `Key:0x51`; anything
+    /// unknown, or a key that can't be held for this, reads as `fallback`.
+    pub fn parse_or(s: &str, fallback: SwitchKey) -> SwitchKey {
+        if let Some(k) = SwitchKey::ALL.into_iter().find(|k| k.name().eq_ignore_ascii_case(s)) { return k; }
+        let hex = s.trim().strip_prefix("Key:").and_then(|h| h.strip_prefix("0x").or(h.strip_prefix("0X")));
+        match hex.and_then(|h| u32::from_str_radix(h, 16).ok()) {
+            Some(vk) => SwitchKey::from_vk(vk).unwrap_or(fallback),
+            None => fallback,
+        }
     }
 
-    pub fn name(self) -> &'static str {
-        match self { SwitchKey::Shift => "Shift", SwitchKey::Ctrl => "Ctrl", SwitchKey::Alt => "Alt" }
+    /// The key a press of `vk` binds: a modifier (either side) as itself,
+    /// another key as itself. `None` for a key the capture screen or the
+    /// system already gives a meaning (Tab, Enter, Esc, the Windows keys).
+    pub fn from_vk(vk: u32) -> Option<SwitchKey> {
+        match vk {
+            0x10 | 0xA0 | 0xA1 => Some(SwitchKey::Shift),
+            0x11 | 0xA2 | 0xA3 => Some(SwitchKey::Ctrl),
+            0x12 | 0xA4 | 0xA5 => Some(SwitchKey::Alt),
+            0 | 0x01..=0x07 | 0x09 | 0x0D | 0x1B | 0x5B | 0x5C => None,
+            v if v > 0xFE => None,
+            v => Some(SwitchKey::Key(v)),
+        }
+    }
+
+    pub fn name(self) -> String {
+        match self {
+            SwitchKey::Shift => "Shift".to_owned(),
+            SwitchKey::Ctrl => "Ctrl".to_owned(),
+            SwitchKey::Alt => "Alt".to_owned(),
+            SwitchKey::Key(vk) => format!("Key:0x{vk:02X}"),
+        }
     }
 
     /// The key's name as this platform's keyboards print it (Option on a Mac).
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            SwitchKey::Alt if cfg!(target_os = "macos") => "Opt",
+            SwitchKey::Alt if cfg!(target_os = "macos") => "Opt".to_owned(),
+            SwitchKey::Key(vk) => vk_label(vk).map(str::to_owned).unwrap_or_else(|| format!("Key 0x{vk:02X}")),
             k => k.name(),
         }
     }
 
-    /// The same key as a hotkey modifier bit.
-    pub fn modifier(self) -> Modifiers {
-        match self { SwitchKey::Shift => Modifiers::SHIFT, SwitchKey::Ctrl => Modifiers::CONTROL, SwitchKey::Alt => Modifiers::ALT }
+    /// Its Win32 virtual-key code, to ask whether it is down.
+    pub fn vk(self) -> u32 {
+        match self { SwitchKey::Shift => 0x10, SwitchKey::Ctrl => 0x11, SwitchKey::Alt => 0x12, SwitchKey::Key(v) => v }
+    }
+
+    /// The same key as a hotkey modifier bit; `None` for a key that isn't one.
+    pub fn modifier(self) -> Option<Modifiers> {
+        match self {
+            SwitchKey::Shift => Some(Modifiers::SHIFT),
+            SwitchKey::Ctrl => Some(Modifiers::CONTROL),
+            SwitchKey::Alt => Some(Modifiers::ALT),
+            SwitchKey::Key(_) => None,
+        }
     }
 }
+
+fn default_qr_switch_key() -> String { SwitchKey::Ctrl.name() }
+fn default_scroll_switch_key() -> String { SwitchKey::Shift.name() }
 
 impl AppSettings {
     pub fn switch_key(&self) -> SwitchKey { SwitchKey::parse(&self.switch_key) }
 
+    /// The key that flips what a QR link does. Anything unknown reads as
+    /// its default, Ctrl.
+    pub fn qr_switch_key(&self) -> SwitchKey { SwitchKey::parse_or(&self.qr_switch_key, SwitchKey::Ctrl) }
+
+    pub fn scroll_switch_key(&self) -> SwitchKey { SwitchKey::parse_or(&self.scroll_switch_key, SwitchKey::Shift) }
+
+    pub fn record_format(&self) -> RecordFormat { RecordFormat::parse(&self.record_format) }
+
+    pub fn output_frame(&self) -> OutputFrame { OutputFrame::parse(&self.output_frame) }
+
+    /// Values a hand edit or an old file can get wrong, put back in range.
+    /// Run on every way settings come in (load, import, a patch).
+    pub fn clamp(&mut self) {
+        if self.file_name_pattern.trim().is_empty() { self.file_name_pattern = default_file_name_pattern(); }
+        self.record_format = self.record_format().name().to_owned();
+        self.output_frame = self.output_frame().name().to_owned();
+        self.switch_key = self.switch_key().name();
+        self.qr_switch_key = self.qr_switch_key().name();
+        self.scroll_switch_key = self.scroll_switch_key().name();
+        self.scroll_after_capture = self.scroll_after().name().to_owned();
+        if !self.last_thickness.is_finite() || self.last_thickness <= 0.0 { self.last_thickness = default_thickness(); }
+        if !self.last_text_size.is_finite() || self.last_text_size <= 0.0 { self.last_text_size = default_text_size(); }
+        if self.pixelate_block < 2 { self.pixelate_block = default_pixelate_block(); }
+        self.magnify_zoom = self.magnify_zoom.clamp(2, 4);
+        // Copy only copies everything (full-screen shots, and a capture
+        // flipped into the editor), as Settings shows it.
+        if !self.open_editor { self.auto_copy = true; }
+        // Crop is never the tool an editor opens with.
+        if crate::tool::Tool::ALL.iter().any(|t| t.name() == self.last_tool && !t.can_open_with()) {
+            self.last_tool = default_tool();
+        }
+    }
+
     /// Whether a region capture opens the editor, given whether the switch
     /// key was held for it.
     pub fn opens_editor(&self, switch_held: bool) -> bool { self.open_editor != switch_held }
+
+    /// The FFmpeg picked in Settings, if any (blank reads as none).
+    pub fn chosen_ffmpeg(&self) -> Option<std::path::PathBuf> {
+        let p = self.ffmpeg_path.trim();
+        (!p.is_empty()).then(|| std::path::PathBuf::from(p))
+    }
+
+    /// What a capture does, as the one choice Settings offers.
+    pub fn after_capture(&self) -> AfterCapture {
+        if !self.open_editor { AfterCapture::CopyOnly }
+        else if self.auto_copy { AfterCapture::CopyAndEdit }
+        else { AfterCapture::Edit }
+    }
+
+    pub fn set_after_capture(&mut self, a: AfterCapture) {
+        self.open_editor = a != AfterCapture::CopyOnly;
+        self.auto_copy = a != AfterCapture::Edit;
+    }
+
+    /// What a scrolling capture does, set apart from [`Self::after_capture`].
+    pub fn scroll_after(&self) -> AfterCapture { AfterCapture::parse(&self.scroll_after_capture) }
+
+    pub fn set_scroll_after(&mut self, a: AfterCapture) { self.scroll_after_capture = a.name().to_owned(); }
+
+    /// Whether a scrolling capture opens the editor, given whether the
+    /// switch key was held as it was picked.
+    pub fn scroll_opens_editor(&self, switch_held: bool) -> bool {
+        (self.scroll_after() != AfterCapture::CopyOnly) != switch_held
+    }
+
+    /// Whether a scrolling capture is copied: always, except Edit opening
+    /// the editor (flipped into Copy only, it is copied).
+    pub fn scroll_copies(&self, switch_held: bool) -> bool {
+        self.scroll_after() != AfterCapture::Edit || !self.scroll_opens_editor(switch_held)
+    }
 }
+
+/// What a capture does when the drag ends: open the editor; open it with the
+/// picture already copied (and copy again on save or pin, and full-screen
+/// shots too); or only copy. Stored as `OpenEditor` plus `AutoCopy`
+/// (Brandon 2026-11-20: the separate auto-copy switch overlapped Copy only).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AfterCapture { Edit, CopyAndEdit, CopyOnly }
+
+impl AfterCapture {
+    pub const ALL: [AfterCapture; 3] = [AfterCapture::Edit, AfterCapture::CopyAndEdit, AfterCapture::CopyOnly];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AfterCapture::Edit        => "Edit",
+            AfterCapture::CopyAndEdit => "Copy + edit",
+            AfterCapture::CopyOnly    => "Copy only",
+        }
+    }
+
+    /// How it is stored (`ScrollAfterCapture`).
+    pub fn name(self) -> &'static str {
+        match self {
+            AfterCapture::Edit        => "Edit",
+            AfterCapture::CopyAndEdit => "CopyAndEdit",
+            AfterCapture::CopyOnly    => "CopyOnly",
+        }
+    }
+
+    /// A stored name back; anything else is the default, Copy + edit.
+    pub fn parse(s: &str) -> AfterCapture {
+        AfterCapture::ALL.into_iter().find(|a| a.name().eq_ignore_ascii_case(s.trim())).unwrap_or(AfterCapture::CopyAndEdit)
+    }
+}
+
+fn default_scroll_after_capture() -> String { AfterCapture::CopyAndEdit.name().to_owned() }
 
 fn default_tool()        -> String  { "Pen".to_owned() }
 fn default_color_argb()  -> i32     { 0xFFFF_0000_u32 as i32 }
@@ -432,6 +744,10 @@ impl ToolStyle {
         let vivid = &crate::annotation::Palettes::ALL[0].colors;
         match tool {
             crate::tool::Tool::Marker => ToolStyle { color_argb: vivid[3].to_argb(), thickness: 16.0 },
+            // A highlighter's yellow.
+            crate::tool::Tool::Highlight => ToolStyle {
+                color_argb: crate::mark::MarkLook::default().color.to_argb(), thickness: s.last_thickness,
+            },
             _ => ToolStyle {
                 color_argb: if s.last_color_argb == default_color_argb() { vivid[0].to_argb() } else { s.last_color_argb },
                 thickness: s.last_thickness,
@@ -506,7 +822,9 @@ impl AppSettings {
     /// that isn't JSON, or a field of the wrong kind, is an error naming the
     /// line and column.
     pub fn parse(text: &str) -> Result<AppSettings, String> {
-        serde_json::from_str(text).map_err(|e| e.to_string())
+        let mut s: AppSettings = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        s.clamp();
+        Ok(s)
     }
 
     /// Settings read from a file the user picked (Import in Settings).
@@ -514,33 +832,6 @@ impl AppSettings {
         let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
         if text.trim().is_empty() { return Err("the file is empty".to_owned()); }
         Self::parse(&text)
-    }
-
-    /// Save only what the capture editor remembers (tools, colors, sizes,
-    /// the capture mode) into `settings.json` as it is on disk now. The
-    /// editor holds a copy of the settings from when it opened; saving all
-    /// of it would undo anything changed in Settings, or in the file, since.
-    /// A file that doesn't parse is left alone for the user to fix.
-    pub fn save_editor_fields(&self) -> io::Result<()> {
-        let mut on_disk = match Self::settings_path().map(fs::read_to_string) {
-            Some(Ok(text)) => Self::parse(&text).map_err(io::Error::other)?,
-            _ => AppSettings::default(),
-        };
-        self.copy_editor_fields_to(&mut on_disk);
-        on_disk.save()
-    }
-
-    /// The fields the capture editor owns, copied onto `to`.
-    pub fn copy_editor_fields_to(&self, to: &mut AppSettings) {
-        to.last_tool       = self.last_tool.clone();
-        to.last_color_argb = self.last_color_argb;
-        to.last_thickness  = self.last_thickness;
-        to.last_text_size  = self.last_text_size;
-        to.pixelate_block  = self.pixelate_block;
-        to.tool_styles     = self.tool_styles.clone();
-        to.palette_index   = self.palette_index;
-        to.marker_opacity  = self.marker_opacity;
-        to.capture_mode    = self.capture_mode.clone();
     }
 
     /// These settings written to a file the user picked (Export in Settings),
@@ -825,7 +1116,78 @@ mod tests {
         assert_eq!((back.open_editor, back.switch_key()), (false, SwitchKey::Alt));
         // Unknown words fall back to Shift rather than to no key.
         assert_eq!(SwitchKey::parse("Hyper"), SwitchKey::Shift);
-        for k in SwitchKey::ALL { assert_eq!(SwitchKey::parse(k.name()), k); }
+        for k in SwitchKey::ALL { assert_eq!(SwitchKey::parse(&k.name()), k); }
+    }
+
+    #[test]
+    fn after_a_capture_is_one_choice_of_three_over_the_two_stored_fields() {
+        // Every file reads as one of the three, and each choice round-trips.
+        let read = |json: &str| { let mut s: AppSettings = serde_json::from_str(json).unwrap(); s.clamp(); s };
+        assert_eq!(read("{}").after_capture(), AfterCapture::Edit, "the editor, nothing copied, by default");
+        assert_eq!(read("{\"AutoCopy\":true}").after_capture(), AfterCapture::CopyAndEdit);
+        assert_eq!(read("{\"OpenEditor\":false,\"AutoCopy\":true}").after_capture(), AfterCapture::CopyOnly);
+        // An old copy-only file with auto-copy off now copies everything,
+        // full-screen shots too, as Copy only says.
+        let old = read("{\"OpenEditor\":false}");
+        assert_eq!(old.after_capture(), AfterCapture::CopyOnly);
+        assert!(old.auto_copy);
+        for a in AfterCapture::ALL {
+            let mut s = AppSettings::default();
+            s.set_after_capture(a);
+            s.clamp();
+            assert_eq!(s.after_capture(), a);
+            assert_eq!(s.opens_editor(false), a != AfterCapture::CopyOnly);
+        }
+    }
+
+    #[test]
+    fn a_scrolling_capture_has_its_own_after_choice_that_opens_the_editor_by_default() {
+        let read = |json: &str| { let mut s: AppSettings = serde_json::from_str(json).unwrap(); s.clamp(); s };
+        // A copy-only file from before still opens long pages in the editor.
+        let old = read("{\"OpenEditor\":false,\"AutoCopy\":true}");
+        assert_eq!(old.scroll_after(), AfterCapture::CopyAndEdit);
+        assert!(old.scroll_opens_editor(false) && old.scroll_copies(false));
+        assert!(!old.scroll_opens_editor(true), "the switch key flips it to copy only");
+        assert_eq!(read("{\"ScrollAfterCapture\":\"nonsense\"}").scroll_after_capture, "CopyAndEdit");
+        for a in AfterCapture::ALL {
+            let mut s = AppSettings::default();
+            s.set_scroll_after(a);
+            s.clamp();
+            assert_eq!(s.scroll_after(), a, "round trip");
+            assert_eq!(s.after_capture(), AfterCapture::Edit, "region captures untouched");
+            assert_eq!(s.scroll_opens_editor(false), a != AfterCapture::CopyOnly);
+            assert_eq!(s.scroll_copies(false), a != AfterCapture::Edit);
+            // Flipped, it always ends up copied one way or the other.
+            assert!(s.scroll_copies(true) || s.scroll_opens_editor(true));
+        }
+        assert_eq!(AppSettings::default().scroll_switch_key(), SwitchKey::Shift, "its own key, Shift unless set");
+        assert_eq!(read("{\"ScrollSwitchKey\":\"Alt\"}").scroll_switch_key(), SwitchKey::Alt);
+        let mut edit = AppSettings::default();
+        edit.set_scroll_after(AfterCapture::Edit);
+        assert!(!edit.scroll_opens_editor(true) && edit.scroll_copies(true), "Edit flipped: copied only");
+    }
+
+    #[test]
+    fn any_key_can_be_the_hold_key_but_the_capture_screens_own() {
+        // A bound key is stored by its code and read back.
+        let q = SwitchKey::Key(0x51);
+        assert_eq!(q.name(), "Key:0x51");
+        assert_eq!(SwitchKey::parse(&q.name()), q);
+        assert_eq!(q.label(), "Q");
+        assert_eq!(q.modifier(), None);
+        // Either side of a modifier is the modifier.
+        assert_eq!(SwitchKey::from_vk(0xA1), Some(SwitchKey::Shift));
+        assert_eq!(SwitchKey::from_vk(0xA3), Some(SwitchKey::Ctrl));
+        assert_eq!(SwitchKey::from_vk(0x20), Some(SwitchKey::Key(0x20)));
+        // Tab, Enter, Esc and the Windows keys already mean something.
+        for vk in [0x09, 0x0D, 0x1B, 0x5B, 0x5C, 0] { assert_eq!(SwitchKey::from_vk(vk), None, "{vk:#x}"); }
+        assert_eq!(SwitchKey::parse_or("Key:0x09", SwitchKey::Ctrl), SwitchKey::Ctrl, "a hand-edited Tab falls back");
+        // QR's key: Ctrl unless set; anything stored is kept through clamp.
+        let mut s = AppSettings::default();
+        assert_eq!(s.qr_switch_key(), SwitchKey::Ctrl);
+        s.qr_switch_key = "Key:0x20".into();
+        s.clamp();
+        assert_eq!(s.qr_switch_key(), SwitchKey::Key(0x20));
     }
 
     #[test]

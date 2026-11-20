@@ -44,12 +44,16 @@ use crate::painter;
 use crate::palette::*;
 
 const WIN_W: u32 = 760;
-const WIN_H: u32 = 720;
+const WIN_H: u32 = 671;
 const PAD:   i32 = 24;
 const ROW_H: i32 = 36;
 const LABEL_W: i32 = 150;
 const BTN_H: i32 = 34;
-const HEADER_H: i32 = 88;
+/// The first row's top, right under the title bar (which holds the
+/// heading); its section header sits above it.
+const BODY_Y: i32 = 44;
+/// Convert now, in the bar along the bottom with the status beside it.
+const CONVERT_W: i32 = 140;
 // Tall, label-only pill for the format picker. Sized to fit one row inside
 // the content area (no LABEL_W column reservation — the FORMAT section
 // header already names it) so we can give each pill plenty of real estate.
@@ -174,24 +178,24 @@ impl VidFormat {
                 "-c".into(), "copy".into(),
                 dst.into(),
             ],
-            VidFormat::Gif => {
-                // Build the filter chain: fps cap, optional scale cap, then
-                // the standard two-pass palette pipeline that keeps GIFs
-                // from looking like 1998.
-                let mut filter = format!("fps={}", gif_fps.fps());
-                if let Some(scale) = resize.scale_expr() {
-                    filter.push(',');
-                    filter.push_str(scale);
-                }
-                filter.push_str(",split[s0][s1];[s0]palettegen=stats_mode=diff[p];[s1][p]paletteuse=dither=sierra2_4a");
-                vec![
-                    "-y".into(), "-i".into(), src.into(),
-                    "-vf".into(), filter,
-                    dst.into(),
-                ]
-            }
+            // Two FFmpeg runs (palette, then GIF) through `crate::gif`: one
+            // run with `split` holds every frame in memory.
+            VidFormat::Gif => crate::gif::gif_args(
+                std::path::Path::new(src), &gif_palette(std::path::Path::new(dst)),
+                std::path::Path::new(dst), self.gif_opts(resize, gif_fps)),
         }
     }
+
+    fn gif_opts(&self, resize: VidResize, gif_fps: GifFps) -> crate::gif::GifOpts {
+        crate::gif::GifOpts { fps: gif_fps.fps(), scale: resize.scale_expr() }
+    }
+}
+
+/// Where `crate::gif::convert` keeps the palette for `dst`.
+fn gif_palette(dst: &std::path::Path) -> PathBuf {
+    let mut p = dst.as_os_str().to_owned();
+    p.push(".palette.png");
+    p.into()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -213,7 +217,6 @@ enum WidgetKind {
     GifFps12,
     GifFps24,
     Convert,
-    Close,
 }
 
 struct Row {
@@ -354,8 +357,6 @@ impl ConvertVideoView {
                 }
                 if let Some(i) = self.hit_test(self.cursor.0, self.cursor.1) {
                     self.activate(i);
-                } else {
-                    crate::chrome::press_off_controls(&self.window, self.cursor.1, HEADER_H);
                 }
             }
             WindowEvent::Resized(_) | WindowEvent::RedrawRequested => self.redraw(),
@@ -411,10 +412,6 @@ impl ConvertVideoView {
             WidgetKind::Convert => {
                 self.start_conversion();
             }
-            WidgetKind::Close => {
-                self.outcome = Some(ConvertVideoOutcome::Closed);
-                return;
-            }
         }
         self.window.request_redraw();
     }
@@ -450,7 +447,14 @@ impl ConvertVideoView {
         self.status = Status::Running { since: Instant::now() };
 
         let dst_thread = dst.clone();
+        let gif = (self.format == VidFormat::Gif).then(|| self.format.gif_opts(self.resize, self.gif_fps));
         std::thread::spawn(move || {
+            if let Some(o) = gif {
+                let cancel = std::sync::atomic::AtomicBool::new(false);
+                let outcome = crate::gif::convert(&ffmpeg, &src, &dst_thread, o, &cancel).map(|_| dst_thread);
+                let _ = tx.send(outcome);
+                return;
+            }
             let mut cmd = Command::new(&ffmpeg);
             cmd.args(&args)
                 .stdin(std::process::Stdio::null())
@@ -477,15 +481,12 @@ impl ConvertVideoView {
         let mut rows = Vec::new();
         let row_w = WIN_W as i32 - PAD * 2;
 
-        let header_btn_y = (HEADER_H - BTN_H) / 2 + 4;
-        let close_w   = 110;
-        let convert_w = 140;
-        let close_x   = WIN_W as i32 - PAD - close_w;
-        let convert_x = close_x - 10 - convert_w;
-        rows.push(Row { kind: WidgetKind::Close,   label: "Close",       rect: (close_x,   header_btn_y, close_w,   BTN_H) });
-        rows.push(Row { kind: WidgetKind::Convert, label: "Convert now", rect: (convert_x, header_btn_y, convert_w, BTN_H) });
+        // Convert now at the bottom right, where a dialog's commit goes; the
+        // title bar's own button closes the window.
+        rows.push(Row { kind: WidgetKind::Convert, label: "Convert now",
+                        rect: (WIN_W as i32 - PAD - CONVERT_W, WIN_H as i32 - PAD - BTN_H, CONVERT_W, BTN_H) });
 
-        let mut y = HEADER_H + 14 + 18;
+        let mut y = BODY_Y;
         rows.push(Row { kind: WidgetKind::Source, label: "Source video", rect: (PAD, y, row_w, ROW_H) });
         y += ROW_H + 22;
 
@@ -557,14 +558,11 @@ impl ConvertVideoView {
         // The dialog draws into its own buffer, placed below the title strip.
         let win_h = (h.get() as usize).saturating_sub(crate::chrome::TITLE_H as usize);
         let mut buf = vec![0u32; win_w * win_h];
-        crate::hud::backdrop(&mut buf, win_w, win_h, HEADER_H);
-        let _ = PANEL_BORDER();
+        // The title bar holds the heading; the glowing rule runs along the
+        // body's top.
+        crate::hud::backdrop(&mut buf, win_w, win_h, 0);
 
         let mut surf = BufferSurface { buf: &mut buf, w: win_w as i32, h: win_h as i32 };
-
-        crate::hud::heading(surf.buf, win_w, win_h, PAD, 22, "FRAME FANG // CONVERT VIDEO");
-        draw_text(&mut surf, PAD, 50, 1, "Re-encode MP4 / MOV / WEBM / MKV / GIF with ffmpeg.",
-                  argb_to_framefang(TEXT_MUTED()));
 
         // Section headers, numbered in the order shown.
         let mut sec = 0;
@@ -608,27 +606,28 @@ impl ConvertVideoView {
             render_row(&mut surf, row, hovered, &self.source, format, quality, resize, gif_fps);
         }
 
-        // Status footer.
-        let footer_y = WIN_H as i32 - PAD - bitmap_font::GLYPH_H;
+        // Status in the bottom bar, level with Convert now and clear of it.
+        let footer_y = WIN_H as i32 - PAD - (BTN_H + bitmap_font::GLYPH_H) / 2;
+        let footer_w = WIN_W as i32 - PAD - CONVERT_W - 16 - PAD;
         match &self.status {
             Status::Idle => {}
             Status::Running { since } => {
                 let dots = (since.elapsed().as_millis() / 400) % 4;
                 let dots_s: String = std::iter::repeat('.').take(dots as usize).collect();
                 let secs = since.elapsed().as_secs();
-                let msg = format!("encoding{dots_s}  ({secs}s elapsed - framefang keeps running, this is a background job)");
-                draw_text(&mut surf, PAD, footer_y, 1, &msg, argb_to_framefang(TEXT_MUTED()));
+                let msg = format!("encoding{dots_s}  {secs}s  (runs in the background)");
+                draw_text(&mut surf, PAD, footer_y, 1, &truncate_for(&msg, footer_w), argb_to_framefang(TEXT_MUTED()));
             }
             Status::Ok(path) => {
                 let msg = format!("Saved: {}", path.display());
-                draw_text(&mut surf, PAD, footer_y, 1, &msg, argb_to_framefang(OK_TINT));
+                draw_text(&mut surf, PAD, footer_y, 1, &truncate_for(&msg, footer_w), argb_to_framefang(OK_TINT));
             }
             Status::Err(e) => {
-                draw_text(&mut surf, PAD, footer_y, 1, e, argb_to_framefang(DANGER()));
+                draw_text(&mut surf, PAD, footer_y, 1, &truncate_for(e, footer_w), argb_to_framefang(DANGER()));
             }
         }
 
-        self.title_bar.draw(&mut frame, win_w, &buf, "Convert video", BG_TOP());
+        self.title_bar.draw(&mut frame, win_w, &buf, "// CONVERT VIDEO", BG_TOP());
         if let Err(e) = frame.present() { eprintln!("convert-video: buf.present: {e}"); }
     }
 }
@@ -676,8 +675,8 @@ fn render_row<S: painter::Surface>(
 ) {
     let (rx, ry, rw, rh) = row.rect;
 
-    if matches!(row.kind, WidgetKind::Convert | WidgetKind::Close) {
-        let is_primary = row.kind == WidgetKind::Convert;
+    if row.kind == WidgetKind::Convert {
+        let is_primary = true;
         let border = if is_primary { LASER() } else if hovered { LASER_DIM() } else { PANEL_BORDER() };
         let fill   = if is_primary && hovered { PRIMARY_FILL() } else if hovered { HOVER_FILL() } else { 0x0000_0000 };
         if fill != 0 { fill_rect(surf, rx, ry, rw, rh, argb_to_framefang(fill)); }

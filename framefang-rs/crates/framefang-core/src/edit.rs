@@ -13,8 +13,11 @@ use crate::annotation::{Annotation, AnnotationKind, Point2, Rect};
 /// counts as a hit. Thin 2-px ink is otherwise nearly impossible to click.
 pub const HIT_SLOP: f32 = 5.0;
 
-/// Disc radius of a numbered-step marker. Mirrors `painter::step_marker`.
-pub const STEP_RADIUS: f32 = 14.0;
+/// What a step marker covers on the canvas, from its look (`crate::step`).
+fn step_rect(center: Point2, number: u32, look: &crate::step::StepLook) -> Rect {
+    let (l, t, r, b) = crate::step::extent(number, look);
+    Rect { x: center.x + l, y: center.y + t, w: r - l, h: b - t }
+}
 
 /// Painted width x height of a text annotation. `font_size` is the pixel
 /// em-size the Text tool renders at, so the box comes straight from the same
@@ -131,23 +134,32 @@ pub fn hit_test(a: &Annotation, p: Point2) -> bool {
             }
             .contains(p)
         }
-        AnnotationKind::Step { center, .. } => {
-            let dx = p.x - center.x;
-            let dy = p.y - center.y;
-            (dx * dx + dy * dy).sqrt() <= STEP_RADIUS + HIT_SLOP
+        AnnotationKind::Step { center, number, look } => {
+            let r = step_rect(*center, *number, look);
+            Rect { x: r.x - HIT_SLOP, y: r.y - HIT_SLOP, w: r.w + HIT_SLOP * 2.0, h: r.h + HIT_SLOP * 2.0 }.contains(p)
         }
-        AnnotationKind::Pixelate { start, end, .. } => {
-            // Pixelate is a filled effect — its whole rect is the body.
+        AnnotationKind::TextMark { rects, .. } => rects.iter()
+            .any(|r| Rect { x: r.x - HIT_SLOP, y: r.y - HIT_SLOP, w: r.w + HIT_SLOP * 2.0, h: r.h + HIT_SLOP * 2.0 }.contains(p)),
+        AnnotationKind::Pixelate { start, end, .. } | AnnotationKind::Spotlight { start, end } => {
+            // Filled effects: the whole rect is the body.
             let r = Rect::from_corners(*start, *end);
             Rect { x: r.x - HIT_SLOP, y: r.y - HIT_SLOP, w: r.w + HIT_SLOP * 2.0, h: r.h + HIT_SLOP * 2.0 }
                 .contains(p)
         }
+        AnnotationKind::Magnify { center, edge, .. } => {
+            let r = crate::annotation::magnify_radius(*center, *edge);
+            ((p.x - center.x).powi(2) + (p.y - center.y).powi(2)).sqrt() <= r + HIT_SLOP
+        }
     }
 }
 
-/// Index of the topmost (last-drawn) annotation under `p`.
+/// Index of the topmost (last-drawn) annotation under `p`. A spotlight is
+/// drawn under all the ink whatever its place in the list, so ink over it
+/// wins the click, and a spotlight is only picked where nothing else is.
 pub fn hit_test_topmost(annotations: &[Annotation], p: Point2) -> Option<usize> {
-    annotations.iter().rposition(|a| hit_test(a, p))
+    let spot = |a: &Annotation| matches!(a.kind, AnnotationKind::Spotlight { .. });
+    annotations.iter().rposition(|a| !spot(a) && hit_test(a, p))
+        .or_else(|| annotations.iter().rposition(|a| spot(a) && hit_test(a, p)))
 }
 
 /// Axis-aligned box covering everything the annotation paints, including
@@ -177,17 +189,18 @@ pub fn bounds(a: &Annotation) -> Rect {
         AnnotationKind::Arrow { stroke, start, end } => {
             span(&[*start, *end], (stroke.thickness * 2.0).max(5.0))
         }
-        AnnotationKind::Pixelate { start, end, .. } => span(&[*start, *end], 0.0),
+        AnnotationKind::Pixelate { start, end, .. } | AnnotationKind::Spotlight { start, end } =>
+            span(&[*start, *end], 0.0),
+        AnnotationKind::Magnify { stroke, center, edge, .. } => {
+            let r = crate::annotation::magnify_radius(*center, *edge) + stroke.thickness / 2.0;
+            Rect { x: center.x - r, y: center.y - r, w: r * 2.0, h: r * 2.0 }
+        }
         AnnotationKind::Text { position, text, font_size, .. } => {
             let (w, h) = text_extent(text, *font_size);
             Rect { x: position.x, y: position.y, w, h }
         }
-        AnnotationKind::Step { center, .. } => Rect {
-            x: center.x - STEP_RADIUS,
-            y: center.y - STEP_RADIUS,
-            w: STEP_RADIUS * 2.0,
-            h: STEP_RADIUS * 2.0,
-        },
+        AnnotationKind::Step { center, number, look } => step_rect(*center, *number, look),
+        AnnotationKind::TextMark { rects, look } => crate::mark::bounds(rects, look.style),
     }
 }
 
@@ -202,9 +215,12 @@ pub fn translate(a: &mut Annotation, dx: f32, dy: f32) {
         | AnnotationKind::Arrow { start, end, .. }
         | AnnotationKind::Rectangle { start, end, .. }
         | AnnotationKind::Ellipse { start, end, .. }
-        | AnnotationKind::Pixelate { start, end, .. } => { shift(start); shift(end); }
+        | AnnotationKind::Pixelate { start, end, .. }
+        | AnnotationKind::Spotlight { start, end } => { shift(start); shift(end); }
+        AnnotationKind::Magnify { center, edge, .. } => { shift(center); shift(edge); }
         AnnotationKind::Text { position, .. } => shift(position),
         AnnotationKind::Step { center, .. }   => shift(center),
+        AnnotationKind::TextMark { rects, .. } => for r in rects.iter_mut() { r.x += dx; r.y += dy; },
     }
 }
 
@@ -350,6 +366,36 @@ mod tests {
     }
 
     #[test]
+    fn a_spotlight_is_clicked_only_where_no_ink_is() {
+        let mut arrow = Annotation::arrow(stroke(), p(0.0, 50.0));
+        arrow.extend(p(100.0, 50.0));
+        let mut spot = Annotation::spotlight(p(0.0, 0.0));
+        spot.extend(p(200.0, 200.0));
+        // The spotlight came later, but it is drawn under the arrow.
+        let list = vec![arrow, spot];
+        assert_eq!(hit_test_topmost(&list, p(50.0, 50.0)), Some(0), "the arrow on top wins");
+        assert_eq!(hit_test_topmost(&list, p(150.0, 150.0)), Some(1), "the spotlight elsewhere");
+    }
+
+    #[test]
+    fn a_lens_is_a_filled_disc_and_too_small_ones_are_dropped() {
+        let mut lens = Annotation::magnify(stroke(), p(100.0, 100.0), 2);
+        assert!(lens.is_degenerate(), "a click is no lens");
+        lens.extend(p(140.0, 100.0));
+        assert!(!lens.is_degenerate());
+        assert!(hit_test(&lens, p(100.0, 100.0)) && hit_test(&lens, p(130.0, 110.0)));
+        assert!(!hit_test(&lens, p(200.0, 100.0)));
+        let mut far = Annotation::magnify(stroke(), p(0.0, 0.0), 9);
+        far.extend(p(5000.0, 0.0));
+        assert_eq!(bounds(&far).w, (crate::annotation::MAGNIFY_MAX_RADIUS + 2.0) * 2.0, "capped");
+        let AnnotationKind::Magnify { zoom, .. } = far.kind else { unreachable!() };
+        assert_eq!(zoom, 4, "zoom stays 2 to 4");
+        let mut thin = Annotation::spotlight(p(0.0, 0.0));
+        thin.extend(p(300.0, 2.0));
+        assert!(thin.is_degenerate(), "a sliver lights nothing");
+    }
+
+    #[test]
     fn hit_test_topmost_on_empty_canvas() {
         assert_eq!(hit_test_topmost(&[], p(1.0, 1.0)), None);
     }
@@ -366,8 +412,10 @@ mod tests {
         let mut rect = Annotation::rectangle(stroke(), p(1.0, 2.0));  rect.extend(p(3.0, 4.0));
         let mut ell = Annotation::ellipse(stroke(), p(1.0, 2.0));     ell.extend(p(3.0, 4.0));
         let mut blur = Annotation::pixelate(p(1.0, 2.0));             blur.extend(p(3.0, 4.0));
+        let mut spot = Annotation::spotlight(p(1.0, 2.0));            spot.extend(p(30.0, 40.0));
+        let mut lens = Annotation::magnify(stroke(), p(50.0, 50.0), 2); lens.extend(p(80.0, 50.0));
         vec![
-            pen, marker, line, arrow, rect, ell, blur,
+            pen, marker, line, arrow, rect, ell, blur, spot, lens,
             Annotation::text(Rgba::RED, p(1.0, 2.0), "abc"),
             Annotation::step(Rgba::RED, p(1.0, 2.0), 7),
         ]
@@ -422,7 +470,14 @@ mod tests {
     fn bounds_cover_the_painted_body() {
         let a = Annotation::step(Rgba::RED, p(100.0, 100.0), 1);
         let b = bounds(&a);
-        assert_eq!((b.x, b.y, b.w, b.h), (86.0, 86.0, 28.0, 28.0));
+        assert_eq!((b.x, b.y, b.w, b.h), (85.0, 85.0, 30.0, 30.0), "a 15 px disc");
+        // A pin stands above the spot it marks.
+        use crate::step::{StepLook, StepShape};
+        let pin = Annotation::step_styled(p(100.0, 100.0), 1, StepLook::recipe(StepShape::Pin, Rgba::RED));
+        let b = bounds(&pin);
+        assert!(b.y < 60.0 && b.y + b.h <= 103.0, "{b:?}");
+        assert!(hit_test(&pin, p(100.0, 75.0)), "its head");
+        assert!(!hit_test(&pin, p(100.0, 115.0)), "below its tip");
     }
 
     #[test]

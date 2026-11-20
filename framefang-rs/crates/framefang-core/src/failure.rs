@@ -17,7 +17,7 @@ pub fn save_folder_failure(dir: &str, reason: &str) -> String {
     format!(
         "Couldn't use the save folder {dir}: {reason}. \
          The screenshot was not saved. Pick a different folder under \
-         Settings > Save folder, then capture again."
+         Settings > FILES > Screenshots folder, then capture again."
     )
 }
 

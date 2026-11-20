@@ -61,6 +61,12 @@ softbuffer  = { workspace = true }
 tiny-skia   = { workspace = true }
 sha2        = { workspace = true }
 winit       = "0.30"
+# QR codes read from the screen (QR mode). Pure Rust; (MIT OR Apache-2.0) AND ISC.
+rqrr        = "0.11"
+
+[dev-dependencies]
+# Makes the QR codes the QR tests read back.
+qrcode      = { version = "0.14", default-features = false, features = ["image"] }
 
 # X11 keyboard focus + grab — winit's `focus_window()` sends
 # `_NET_ACTIVE_WINDOW` which Cinnamon ignores fast enough that the overlay

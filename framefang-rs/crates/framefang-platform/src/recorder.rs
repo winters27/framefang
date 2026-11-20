@@ -567,18 +567,40 @@ pub fn downloaded_ffmpeg_path() -> Option<PathBuf> {
     }
 }
 
+/// The FFmpeg picked in Settings (`FfmpegPath`), set by the tray whenever
+/// settings load or change; `None` to find one automatically.
+static CHOSEN_FFMPEG: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+pub fn set_chosen_ffmpeg(path: Option<PathBuf>) {
+    *CHOSEN_FFMPEG.lock().unwrap_or_else(|e| e.into_inner()) = path;
+}
+
 /// Locate a usable `ffmpeg` binary: the one lookup recording, conversion and
-/// Settings all share. Search order:
-///
-///   1. Next to our own executable (a local build's copy).
-///   2. macOS `.app/Contents/Resources/ffmpeg`.
-///   3. `PATH`, so an FFmpeg the user already has always wins.
-///   4. The copy Framefang downloaded (`downloaded_ffmpeg_path`).
+/// Settings all share. The FFmpeg picked in Settings comes first while that
+/// file exists; otherwise `auto_ffmpeg`.
 ///
 /// Returns `None` if no candidate is found — callers fall back to plain
 /// `"ffmpeg"` so the existing "ffmpeg not found in PATH" error message still
 /// surfaces from `Command::spawn`.
 pub fn locate_ffmpeg() -> Option<PathBuf> {
+    let chosen = CHOSEN_FFMPEG.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    locate_ffmpeg_with(chosen.as_deref())
+}
+
+/// `locate_ffmpeg` with `chosen` as the picked FFmpeg (Settings asks this of
+/// its draft before the tray has the change).
+pub fn locate_ffmpeg_with(chosen: Option<&Path>) -> Option<PathBuf> {
+    if let Some(c) = chosen.filter(|c| c.is_file()) { return Some(c.to_path_buf()); }
+    auto_ffmpeg()
+}
+
+/// Find FFmpeg without the user's pick. Search order:
+///
+///   1. Next to our own executable (a local build's copy).
+///   2. macOS `.app/Contents/Resources/ffmpeg`.
+///   3. `PATH`, so an FFmpeg the user already has always wins.
+///   4. The copy Framefang downloaded (`downloaded_ffmpeg_path`).
+pub fn auto_ffmpeg() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
     let bundle_name = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
@@ -1493,6 +1515,20 @@ mod tests {
 
     /// A 1920x1080 desktop rooted at the origin — the single-monitor case.
     fn desktop() -> DesktopBounds { DesktopBounds::new(0, 0, 1920, 1080) }
+
+    #[test]
+    fn a_picked_ffmpeg_wins_while_it_exists_and_falls_back_when_gone() {
+        let dir = std::env::temp_dir().join(format!("ff-pick-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let picked = dir.join(if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" });
+        std::fs::write(&picked, b"stub").unwrap();
+        assert_eq!(locate_ffmpeg_with(Some(&picked)), Some(picked.clone()), "the pick comes first");
+        assert_eq!(locate_ffmpeg_with(None), auto_ffmpeg());
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(locate_ffmpeg_with(Some(&picked)), auto_ffmpeg(), "a missing pick falls back");
+        // A folder is not an FFmpeg.
+        assert_eq!(locate_ffmpeg_with(Some(&std::env::temp_dir())), auto_ffmpeg());
+    }
 
     /// The rectangle a user would drag for "record this window", already
     /// clamped + even-sized the way the overlay hands it to the recorder.

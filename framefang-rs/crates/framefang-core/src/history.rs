@@ -24,6 +24,10 @@ pub enum EditOp {
     /// The whole canvas was cleared — Esc on a live selection. Carries the
     /// annotations so one Ctrl+Z brings the entire session back.
     Clear { annotations: Vec<Annotation> },
+    /// The picture was cropped from `before` to `after` (`x, y, w, h` in the
+    /// editor's canvas). Changes no annotation; the editor applies the rect
+    /// `undo` or `redo` hands back.
+    Crop { before: (i32, i32, i32, i32), after: (i32, i32, i32, i32) },
 }
 
 /// Undo/redo stacks over an externally-owned `Vec<Annotation>`.
@@ -51,7 +55,7 @@ impl History {
     /// overlay asks for confirmation first.
     pub fn holds_recoverable_work(&self) -> bool {
         self.undo.iter().chain(self.redo.iter()).any(|op| match op {
-            EditOp::Add { .. } | EditOp::Delete { .. } | EditOp::Move { .. } => true,
+            EditOp::Add { .. } | EditOp::Delete { .. } | EditOp::Move { .. } | EditOp::Crop { .. } => true,
             EditOp::Clear { annotations } => !annotations.is_empty(),
         })
     }
@@ -75,6 +79,7 @@ impl History {
                 annotations.clear();
                 annotations.extend(saved.iter().cloned());
             }
+            EditOp::Crop { .. } => {}
         }
         self.redo.push(op.clone());
         Some(op)
@@ -95,6 +100,7 @@ impl History {
                 if let Some(a) = annotations.get_mut(*index) { edit::translate(a, *dx, *dy); }
             }
             EditOp::Clear { .. } => annotations.clear(),
+            EditOp::Crop { .. } => {}
         }
         self.undo.push(op.clone());
         Some(op)
@@ -196,6 +202,17 @@ mod tests {
         h.undo(&mut anns);
         assert!(anns.is_empty());
         assert!(h.holds_recoverable_work(), "undone work is still recoverable with Ctrl+Y");
+    }
+
+    #[test]
+    fn a_crop_is_work_and_comes_back_from_undo_and_redo() {
+        let (mut h, mut anns) = (History::new(), Vec::<Annotation>::new());
+        let op = EditOp::Crop { before: (0, 0, 100, 100), after: (10, 10, 50, 50) };
+        h.record(op.clone());
+        assert!(h.holds_recoverable_work(), "closing after a crop asks first");
+        assert_eq!(h.undo(&mut anns), Some(op.clone()), "the editor gets the rects back");
+        assert_eq!(h.redo(&mut anns), Some(op));
+        assert!(anns.is_empty());
     }
 
     #[test]

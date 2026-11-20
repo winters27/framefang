@@ -24,18 +24,73 @@ pub enum PickMode {
     Screen,
     /// One click takes every screen.
     AllScreens,
+    /// Drag over words (or click a window): their text goes to the clipboard.
+    Text,
+    /// Drag over a QR code (or click a window): what it says goes to the
+    /// clipboard.
+    Qr,
+    /// Drag over a scrolling page (or click a window): it is scrolled to its
+    /// end and stitched into one tall picture.
+    Scroll,
 }
 
-impl PickMode {
-    pub const ALL: [PickMode; 3] = [PickMode::Auto, PickMode::Screen, PickMode::AllScreens];
+/// How a one-shot mode draws its selection (the terminal look, Brandon
+/// 2026-11-19): what its prompt says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Look { Text, Qr, Scroll }
 
-    /// The stored word. Anything unknown reads as Auto.
+impl PickMode {
+    /// Every mode, in Tab order.
+    pub const ALL: [PickMode; 6] = [PickMode::Auto, PickMode::Screen, PickMode::AllScreens, PickMode::Text,
+                                    PickMode::Qr, PickMode::Scroll];
+    /// The modes that take a picture. Only these are kept for the next
+    /// capture: one that reads text is chosen for one capture at a time.
+    pub const CAPTURE: [PickMode; 3] = [PickMode::Auto, PickMode::Screen, PickMode::AllScreens];
+
+    /// The stored word. Anything unknown, and a reading mode, reads as Auto.
     pub fn parse(s: &str) -> PickMode {
-        PickMode::ALL.into_iter().find(|m| m.name() == s).unwrap_or(PickMode::Auto)
+        PickMode::CAPTURE.into_iter().find(|m| m.name() == s).unwrap_or(PickMode::Auto)
     }
 
     pub fn name(self) -> &'static str {
-        match self { PickMode::Auto => "Auto", PickMode::Screen => "Screen", PickMode::AllScreens => "AllScreens" }
+        match self {
+            PickMode::Auto => "Auto", PickMode::Screen => "Screen", PickMode::AllScreens => "AllScreens",
+            PickMode::Text => "Text", PickMode::Qr => "Qr", PickMode::Scroll => "Scroll",
+        }
+    }
+
+    /// The terminal look this mode draws its selection in, if it is a
+    /// one-shot mode.
+    pub fn look(self) -> Option<Look> {
+        match self {
+            PickMode::Text => Some(Look::Text),
+            PickMode::Qr => Some(Look::Qr),
+            PickMode::Scroll => Some(Look::Scroll),
+            _ => None,
+        }
+    }
+
+    /// What this mode reads, if it reads rather than captures.
+    pub fn reads(self) -> Option<crate::read_text::ReadKind> {
+        match self {
+            PickMode::Text => Some(crate::read_text::ReadKind::Text),
+            PickMode::Qr => Some(crate::read_text::ReadKind::Qr),
+            _ => None,
+        }
+    }
+
+    /// The mode the next capture opens in, after this one: a one-shot mode
+    /// (TEXT, QR, SCROLL) is never kept.
+    pub fn remembered(self) -> Option<PickMode> {
+        self.look().is_none().then_some(self)
+    }
+
+    /// The mode the next capture opens in once this one is picked, in a
+    /// capture that opened in `opened`: a capture mode is kept; a reading
+    /// mode keeps `opened`, so the capture modes Tab passed on the way to
+    /// TEXT or QR are not.
+    pub fn kept(self, opened: PickMode) -> PickMode {
+        self.remembered().or(opened.remembered()).unwrap_or(PickMode::Auto)
     }
 
     /// Its chip in the mode bar.
@@ -45,12 +100,22 @@ impl PickMode {
             PickMode::Auto => "Region or window",
             PickMode::Screen => "Screen",
             PickMode::AllScreens => "All screens",
+            PickMode::Text => "Text",
+            PickMode::Qr => "QR code",
+            PickMode::Scroll => "Scrolling page",
         }
     }
 
-    /// The modes the bar offers: All screens only with more than one.
-    pub fn offered(screens: usize) -> &'static [PickMode] {
-        if screens > 1 { &PickMode::ALL } else { &PickMode::ALL[..2] }
+    /// The modes the bar offers: All screens only with more than one; the
+    /// one-shot modes only where a capture can use them (`readers`), not
+    /// where a region is picked to record; SCROLL only where Frame Fang can
+    /// scroll other windows.
+    pub fn offered(screens: usize, readers: bool) -> Vec<PickMode> {
+        PickMode::ALL.into_iter()
+            .filter(|m| *m != PickMode::AllScreens || screens > 1)
+            .filter(|m| readers || m.look().is_none())
+            .filter(|m| *m != PickMode::Scroll || crate::scroll::supported())
+            .collect()
     }
 
     /// This mode where only `offered` exist: All screens on one screen is
@@ -60,8 +125,8 @@ impl PickMode {
     }
 
     /// The next one Tab goes to.
-    pub fn next(self, screens: usize) -> PickMode {
-        let offered = PickMode::offered(screens);
+    pub fn next(self, screens: usize, readers: bool) -> PickMode {
+        let offered = PickMode::offered(screens, readers);
         let i = offered.iter().position(|m| *m == self.available(screens)).unwrap_or(0);
         offered[(i + 1) % offered.len()]
     }
@@ -72,6 +137,9 @@ impl PickMode {
             PickMode::Auto => "REGION",
             PickMode::Screen => "SCREEN",
             PickMode::AllScreens => "ALL SCREENS",
+            PickMode::Text => "TEXT",
+            PickMode::Qr => "QR",
+            PickMode::Scroll => "SCROLL",
         }
     }
 }
@@ -275,20 +343,59 @@ mod tests {
 
     #[test]
     fn tab_cycles_the_modes_on_offer() {
-        assert_eq!(PickMode::Auto.next(2), PickMode::Screen);
-        assert_eq!(PickMode::Screen.next(2), PickMode::AllScreens);
-        assert_eq!(PickMode::AllScreens.next(2), PickMode::Auto);
+        assert_eq!(PickMode::Auto.next(2, false), PickMode::Screen);
+        assert_eq!(PickMode::Screen.next(2, false), PickMode::AllScreens);
+        assert_eq!(PickMode::AllScreens.next(2, false), PickMode::Auto);
         // One screen: no All screens to go to, or to stay in.
-        assert_eq!(PickMode::Screen.next(1), PickMode::Auto);
+        assert_eq!(PickMode::Screen.next(1, false), PickMode::Auto);
         assert_eq!(PickMode::AllScreens.available(1), PickMode::Screen);
         assert_eq!(PickMode::parse("nonsense"), PickMode::Auto);
-        for m in PickMode::ALL { assert_eq!(PickMode::parse(m.name()), m); }
+        for m in PickMode::CAPTURE { assert_eq!(PickMode::parse(m.name()), m); }
+    }
+
+    #[test]
+    fn the_reading_modes_follow_the_capture_ones_and_are_never_kept() {
+        let scroll: &[PickMode] = if crate::scroll::supported() { &[PickMode::Scroll] } else { &[] };
+        assert_eq!(PickMode::offered(2, true),
+                   [&[PickMode::Auto, PickMode::Screen, PickMode::AllScreens, PickMode::Text, PickMode::Qr][..], scroll].concat());
+        assert_eq!(PickMode::offered(1, true),
+                   [&[PickMode::Auto, PickMode::Screen, PickMode::Text, PickMode::Qr][..], scroll].concat());
+        assert_eq!(PickMode::offered(2, false), PickMode::CAPTURE.to_vec(), "a record picker reads nothing");
+        assert_eq!(PickMode::AllScreens.next(2, true), PickMode::Text);
+        let last = *PickMode::offered(2, true).last().unwrap();
+        assert_eq!(last.next(2, true), PickMode::Auto, "round again");
+        // The next capture never opens in a one-shot mode.
+        assert_eq!(PickMode::Text.remembered(), None);
+        assert_eq!(PickMode::Scroll.remembered(), None);
+        assert_eq!(PickMode::parse("Scroll"), PickMode::Auto);
+        assert_eq!(PickMode::Screen.remembered(), Some(PickMode::Screen));
+        assert_eq!(PickMode::parse("Text"), PickMode::Auto, "a stored reading mode reads as Auto");
+        assert_eq!(PickMode::parse("Qr"), PickMode::Auto);
+    }
+
+    #[test]
+    fn tabbing_on_to_text_keeps_the_mode_the_capture_opened_in() {
+        // Opened in Region, Tab passes Screen and All screens to reach TEXT:
+        // the next capture opens in Region again.
+        let opened = PickMode::Auto;
+        let mut kept = opened;
+        for m in [PickMode::Screen, PickMode::AllScreens, PickMode::Text] { kept = m.kept(opened); }
+        assert_eq!(kept, PickMode::Auto);
+        assert_eq!(PickMode::Qr.kept(PickMode::Screen), PickMode::Screen);
+        // Round again to a capture mode: that one is kept.
+        assert_eq!(PickMode::Screen.kept(PickMode::Auto), PickMode::Screen);
+    }
+
+    #[test]
+    fn the_dock_with_every_mode_fits_a_small_screen() {
+        let d = dock_layout((0, 0, 1280, 720), &PickMode::offered(2, true), false);
+        assert!(d.rect.0 >= 0 && d.rect.0 + d.rect.2 <= 1280, "{:?}", d.rect);
     }
 
     #[test]
     fn the_dock_is_centered_at_the_bottom_in_order_and_inside() {
         for record in [false, true] {
-            let d = dock_layout((100, 0, 1400, 800), &PickMode::ALL, record);
+            let d = dock_layout((100, 0, 1400, 800), &PickMode::offered(2, !record), record);
             let (left, right) = (d.rect.0 - 100, 1400 - (d.rect.0 - 100 + d.rect.2));
             assert!((left - right).abs() <= 1, "centered: {left} vs {right}");
             assert_eq!(d.rect.1 + d.rect.3, 800 - DOCK_MARGIN, "on the bottom of the screen");
