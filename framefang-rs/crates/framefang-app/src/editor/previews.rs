@@ -9,11 +9,14 @@ use framefang_core::step::{StepLook, StepPart, StepShape};
 use framefang_core::tool::Tool;
 use image::{ImageBuffer, Rgba};
 
-use super::chrome::{draw_flyout, draw_notice_bar, draw_tool_panel, draw_tooltip, FlyoutFrame};
+use super::chrome::{
+    draw_action_panel, draw_dimension_chip, draw_flyout, draw_notice_bar, draw_selection_frame, draw_tool_panel,
+    draw_tooltip, FlyoutFrame,
+};
 use super::dock::{draw_dock, draw_reading_frame, DockAnim, ReadLook};
 use super::flyout::flyout_layout;
 use super::paint::Canvas;
-use super::panels::EDITOR_SLOTS;
+use super::panels::{EDITOR_SLOTS, LOCKED_ACTIONS};
 use crate::pick::{self, Look, PickMode};
 
 /// Save a framebuffer as `target/<name>`, `zoom` times bigger.
@@ -35,6 +38,27 @@ fn busy(w: usize, h: usize, blocks: (usize, usize), colors: [u32; 2], stripes: O
             _ => colors[(x / blocks.0 + y / blocks.1) % 2],
         }
     }).collect()
+}
+
+/// The selection on a light page at 2x: mid-drag (frame and size chip, no
+/// handles), settled with handles (record region), and a box against the
+/// top of the screen whose chip sits inside: `target/selection.png`.
+#[test]
+#[ignore]
+fn preview_selection() {
+    let (w, h) = (900usize, 420usize);
+    let mut px = busy(w, h, (90, 60), [0x00_EB_EE_F2, 0x00_D2_DC_EB], Some(0x00_28_32_46));
+    let mut c = Canvas::new(&mut px, w, h);
+    let screen = (0, 0, w as i32, h as i32);
+    for (sel, handles) in [((40, 80, 360, 220), false), ((480, 80, 360, 220), true)] {
+        draw_selection_frame(&mut c, (sel.0, sel.1, sel.0 + sel.2, sel.1 + sel.3), handles);
+        draw_dimension_chip(&mut c, screen, sel, sel.2 as u32, sel.3 as u32);
+    }
+    let top = (120, 330, 300, 80);
+    let low_screen = (0, 330, w as i32, 90);
+    draw_selection_frame(&mut c, (top.0, top.1, top.0 + top.2, top.1 + top.3), false);
+    draw_dimension_chip(&mut c, low_screen, top, top.2 as u32, top.3 as u32);
+    save(&px, w, h, 2, "selection.png");
 }
 
 /// The capture dock at moments of its animations (still, mid sweep, mid
@@ -89,7 +113,12 @@ fn preview_editor_tools() {
     crate::painter::render_all(&mut crate::painter::ImageSurface(&mut pic), ink.iter(),
         &crate::painter::Pass { source: Some(&pristine), src_offset: (0, 0), bounds: (0, 0, 760, h as i32) });
     let mut px: Vec<u32> = pic.pixels().map(|p| (u32::from(p[0]) << 16) | (u32::from(p[1]) << 8) | u32::from(p[2])).collect();
-    draw_tool_panel(&mut Canvas::new(&mut px, w, h), &EDITOR_SLOTS, (0, 0, w as i32, h as i32), (20, 20, 760, 600), Some(Tool::Magnify));
+    // Arrow fully hovered, Ellipse halfway through easing lit, Copy hovered
+    // in the action row under the picture.
+    let mut c = Canvas::new(&mut px, w, h);
+    let (screen, sel) = ((0, 0, w as i32, h as i32), (20, 20, 760, 560));
+    draw_tool_panel(&mut c, &EDITOR_SLOTS, screen, sel, Some(Tool::Magnify), |i| [0.0, 0.0, 1.0, 0.0, 0.5].get(i).copied().unwrap_or(0.0));
+    draw_action_panel(&mut c, screen, sel, &LOCKED_ACTIONS, |i| if i == 1 { 1.0 } else { 0.0 });
     save(&px, w, h, 1, "editor-tools.png");
 }
 

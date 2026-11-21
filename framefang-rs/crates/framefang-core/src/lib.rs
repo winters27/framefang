@@ -22,8 +22,9 @@ pub mod file_name;
 pub mod settings;
 pub mod settings_store;
 
-// Keyboard shortcuts.
+// Keyboard shortcuts, and other tools that want the same key.
 pub mod hotkeys;
+pub mod rivals;
 pub mod shortcut;
 
 // Screens, regions and the capture state machine.

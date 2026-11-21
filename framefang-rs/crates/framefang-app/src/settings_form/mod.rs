@@ -391,6 +391,10 @@ pub struct SettingsView {
     /// going to the Snipping Tool). Re-read whenever the window regains
     /// focus, so it clears as soon as the user comes back from the page.
     system_takes_capture: bool,
+    /// Another screenshot tool that wants Print Screen is running (only
+    /// looked for while the capture key is Print Screen). Re-read with
+    /// `system_takes_capture`.
+    rival: Option<&'static str>,
     /// Shown in the listening hotkey box in place of "[ PRESS A KEY ]" when
     /// the last key pressed can't be used alone. In the box, so nothing
     /// else on the page moves while the rebind is listening.
@@ -490,6 +494,7 @@ impl SettingsView {
             notice: None,
             system_page,
             system_takes_capture: false,
+            rival: None,
             capture_hint: None,
             switch_name: crate::system_shortcuts::switch_name(),
             switch_page: crate::system_shortcuts::windows_page_path(),
@@ -578,8 +583,14 @@ impl SettingsView {
     fn refresh_system_takes(&mut self) {
         let takes = self.draft.hotkey_for(HotkeyAction::Capture)
             .is_some_and(|hk| crate::system_shortcuts::system_takes(&hk));
-        if takes != self.system_takes_capture {
+        // Only worth a look while the card shows, which is while the key is
+        // plain Print Screen.
+        let rival = shows_windows_guide(self.system_page, &self.draft)
+            .then(crate::system_shortcuts::print_screen_rival)
+            .flatten();
+        if takes != self.system_takes_capture || rival != self.rival {
             self.system_takes_capture = takes;
+            self.rival = rival;
             self.window.request_redraw();
         }
     }
@@ -1372,6 +1383,7 @@ impl SettingsView {
                     if self.guide_shown {
                         let guide = WindowsGuide {
                             takes:  self.system_takes_capture,
+                            rival:  self.rival,
                             switch: &self.switch_name,
                             page:   self.switch_page,
                         };
@@ -1452,6 +1464,8 @@ impl SettingsView {
 struct WindowsGuide<'a> {
     /// Windows' switch is on, so it is taking Print Screen.
     takes: bool,
+    /// Another screenshot tool that wants Print Screen is running.
+    rival: Option<&'static str>,
     /// The switch's name as this Windows shows it, and its page.
     switch: &'a str,
     page: &'static str,
@@ -1680,8 +1694,10 @@ mod tests {
             .filter(|k| !k.alone).max_by_key(|k| k.label.len()).unwrap().vk;
         let hint = typing_key_hint(longest_typing);
         assert!(bitmap_font::measure(&hint, 1) <= hint_room, "\"{hint}\" is cut off in the box");
-        for takes in [true, false] {
-            let g = WindowsGuide { takes, switch: "x", page: "Bluetooth & devices > Keyboard" };
+        // Every state, including each known tool named in the headline.
+        let rivals = std::iter::once(None).chain(framefang_core::rivals::KNOWN.iter().map(|r| Some(r.name)));
+        for (takes, rival) in rivals.flat_map(|r| [(true, r), (false, r)]) {
+            let g = WindowsGuide { takes, rival, switch: "x", page: "Bluetooth & devices > Keyboard" };
             let (headline, page_line, _) = guide_text(&g);
             let end = text_x + bitmap_font::measure(&headline, 1);
             assert!(end + MIN_GAP <= btn.rect.0, "\"{headline}\" runs into the button");

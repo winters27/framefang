@@ -229,6 +229,29 @@ fn rgba(color: u32) -> framefang_core::color::Rgba {
 }
 
 impl Page {
+    /// A page with no window behind it, `w` by `h` of dialog backdrop, so a
+    /// test can paint a dialog and look at it.
+    #[cfg(test)]
+    pub(crate) fn offscreen(w: u32, h: u32) -> Page {
+        let (wu, hu) = (w as usize, h as usize);
+        let mut px = vec![0u32; wu * hu];
+        crate::hud::backdrop(&mut px, wu, hu, 0);
+        let frame = (NonZeroU32::new(w.max(1)).unwrap(), NonZeroU32::new(h.max(1) + TITLE_H as u32).unwrap());
+        Page { px, w: w as i32, h: h as i32, frame }
+    }
+
+    /// The whole window as it would show, title strip on top, as an image.
+    #[cfg(test)]
+    pub(crate) fn window_image(&self, heading: &str) -> image::RgbImage {
+        let (w, h) = (self.frame.0.get(), self.frame.1.get());
+        let mut frame = vec![0u32; (w * h) as usize];
+        TitleBar::default().draw(&mut frame, w as usize, &self.px, heading, BG_TOP());
+        image::RgbImage::from_fn(w, h, |x, y| {
+            let c = frame[(y * w + x) as usize];
+            image::Rgb([(c >> 16) as u8, (c >> 8) as u8, c as u8])
+        })
+    }
+
     /// Fill `r` (clipped to the page) with `color`.
     pub(crate) fn fill(&mut self, r: Rect, color: u32) {
         let (x0, y0) = (r.0.max(0), r.1.max(0));

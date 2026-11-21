@@ -17,6 +17,7 @@ use super::dock::{draw_dock, draw_reading_frame, draw_target, DockAnim, ReadLook
 use super::flyout::{ease_out, flyout_layout, FLYOUT_OPEN};
 use super::geometry::rect_contains;
 use super::paint::{word, Canvas};
+use super::panels::PanelHot;
 use super::video::{draw_timeline_bar, visible_at, DURATIONS};
 use super::*;
 use crate::painter::{self, U32Surface};
@@ -30,8 +31,6 @@ const ANIM_FRAME: Duration = Duration::from_millis(33);
 /// How long "Copied to clipboard" stays after a Copy that keeps the editor.
 const COPIED_NOTICE: Duration = Duration::from_millis(1400);
 
-/// The selection's frame and its handles.
-const HANDLE_FILL: u32 = 0x00_FF_FF_FF;
 /// The dashed frame around text being typed.
 const TYPING_FRAME: u32 = 0x00_88_88_8C;
 const CARET: u32 = 0x00_E8_E8_EC;
@@ -138,6 +137,8 @@ impl Overlay {
         let picture_bounds = self.picture_bounds();
         let panel_sel = self.panel_sel();
         let playhead = self.clip.as_ref().map(|c| c.at);
+        // Copies, taken before the window's pixels are borrowed below.
+        let (hot, cooling, tip_up) = (self.hot, self.cooling, self.tip_shown());
 
         if let Err(e) = self.surface.resize(w, h) {
             eprintln!("framefang: the overlay's framebuffer could not be resized: {e}");
@@ -218,14 +219,12 @@ impl Overlay {
             match &read_look {
                 Some(look) => draw_reading_frame(&mut c, (x0, y0, x1 - x0, y1 - y0), look, None),
                 None => {
-                    c.outline(x0, y0, x1, y1, SELECTION_BLUE);
-                    if !locked || crop_in_hand {
-                        let (xm, ym, xe, ye) = ((x0 + x1) / 2, (y0 + y1) / 2, x1 - 1, y1 - 1);
-                        for (x, y) in [(x0, y0), (xm, y0), (xe, y0), (x0, ym), (xe, ym), (x0, ye), (xm, ye), (xe, ye)] {
-                            c.fill(x - 3, y - 3, x + 3, y + 3, HANDLE_FILL);
-                            c.outline(x - 3, y - 3, x + 3, y + 3, SELECTION_BLUE);
-                        }
-                    }
+                    // Handles only where they can be grabbed: a settled box
+                    // that can still be pulled (record region, the in-place
+                    // editor, Crop). Mid-drag the button is already down,
+                    // so there they would only be clutter.
+                    let grabbable = (!locked || crop_in_hand) && self.state != State::Dragging;
+                    draw_selection_frame(&mut c, (x0, y0, x1, y1), grabbable);
                 }
             }
         }
@@ -246,8 +245,8 @@ impl Overlay {
         // while a crop is dragged (people crop to exact sizes); not in TEXT
         // and QR either, where what is read matters, not how big.
         let wants_size = read_look.is_none() && (!editor || self.crop_drag.is_some());
-        if let Some((x, y, w, h)) = self.selection.filter(|r| wants_size && r.2 > 8 && r.3 > 8) {
-            draw_dimension_chip(&mut c, around_selection.unwrap_or(whole), (x + w, y + h), w as u32, h as u32);
+        if let Some(sel) = self.selection.filter(|r| wants_size && r.2 > 8 && r.3 > 8) {
+            draw_dimension_chip(&mut c, around_selection.unwrap_or(whole), sel, sel.2 as u32, sel.3 as u32);
         }
 
         // The panels, from the moment a region is picked; the pulse starts
@@ -260,11 +259,12 @@ impl Overlay {
         if let Some(sel) = panel_sel.filter(|_| editing && read_look.is_none()) {
             let bounds = around_selection.unwrap_or(whole);
             // Record mode is the selection alone: no column, just the row.
+            let lit = |b: PanelHot| super::hover::hover_level_of(hot, cooling, b);
             if self.mode != Mode::Record {
-                draw_tool_panel(&mut c, slots, bounds, sel, self.armed.then_some(self.tool));
+                draw_tool_panel(&mut c, slots, bounds, sel, self.armed.then_some(self.tool), |i| lit(PanelHot::Slot(i)));
                 draw_tool_panel_glow(&mut c, slots, bounds, sel, self.opened_at.elapsed().as_secs_f32());
             }
-            draw_action_panel(&mut c, bounds, sel, actions);
+            draw_action_panel(&mut c, bounds, sel, actions, |i| lit(PanelHot::Action(i)));
             if let Some(since) = self.pulse_from.filter(|_| ready).map(|t| t.elapsed().as_secs_f32()) {
                 if since < PULSE_SECS {
                     // The editor window's pulse has no outer haze: past the
@@ -306,7 +306,11 @@ impl Overlay {
             draw_timeline_bar(&mut c, near_pointer, clip.at, total, DURATIONS[clip.choice % DURATIONS.len()].1, &starts);
         }
 
-        if let Some((label, x, y)) = self.tip.filter(|_| ready) { draw_tooltip(&mut c, near_pointer, label, x, y); }
+        // Only once the pointer has rested: the button's own hover already
+        // said what a click would hit.
+        if let Some((label, x, y)) = self.tip.filter(|_| ready && tip_up) {
+            draw_tooltip(&mut c, near_pointer, label, x, y);
+        }
 
         // The notice bar: the Esc confirmation, else select mode's cue, else
         // the word that a copy worked.
@@ -380,7 +384,9 @@ impl Overlay {
         // `Ready`: while drawing, resizing or typing, input brings frames
         // already, and pacing those would only add lag. The glide and the
         // flyout's slide run at 60 frames a second, the glow and pulse at 30.
-        let sliding = self.flyout.is_some() && self.flyout_since.elapsed() < FLYOUT_OPEN;
+        // A button easing lit or back is paced like the slide, so the ease
+        // reads smooth rather than in two or three steps.
+        let sliding = (self.flyout.is_some() && self.flyout_since.elapsed() < FLYOUT_OPEN) || self.hover_easing();
         if gliding {
             let since = self.anim_at.map_or(ANIM_FRAME, |t| t.elapsed());
             if since < ANIM_FRAME / 2 { std::thread::sleep(ANIM_FRAME / 2 - since); }

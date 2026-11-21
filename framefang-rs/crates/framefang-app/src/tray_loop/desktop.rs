@@ -26,8 +26,9 @@ fn silent(program: &str) -> Command {
     cmd
 }
 
+
 /// Show a desktop toast through whatever the OS offers (`notify-send`,
-/// `osascript`, a PowerShell toast). Best effort: a missing helper means no
+/// `osascript`, a Windows toast from this process). Best effort: a missing helper means no
 /// toast and no error. `urgent` keeps it up for 5 s instead of 3 s where the
 /// OS lets us choose.
 pub(super) fn notify(title: &str, body: &str, urgent: bool) {
@@ -51,19 +52,20 @@ pub(super) fn notify(title: &str, body: &str, urgent: bool) {
     }
     #[cfg(target_os = "windows")]
     {
+        // The plain two-line template, through Windows PowerShell. Tried
+        // 2026-11-20: the newer generic layout (the one that can carry a
+        // logo) never displayed for this identity, sent this way or from the
+        // process itself, while this one always did.
         let _ = urgent;
         let quote = |text: &str| text.replace('\'', "''");
-        let set_title = format!("$template.GetElementsByTagName('text').Item(0).InnerText = '{}';", quote(title));
-        let set_body = format!("$template.GetElementsByTagName('text').Item(1).InnerText = '{}';", quote(body));
-        let steps = [
-            "[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime] | Out-Null;",
-            "[Windows.Data.Xml.Dom.XmlDocument,Windows.Data.Xml.Dom.XmlDocument,ContentType=WindowsRuntime] | Out-Null;",
-            "$template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);",
-            set_title.as_str(),
-            set_body.as_str(),
-            "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Framefang').Show($template);",
-        ];
-        let script = steps.join(" ");
+        let script = [
+            "[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime] | Out-Null;".to_owned(),
+            "$t = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);".to_owned(),
+            format!("$t.GetElementsByTagName('text').Item(0).InnerText = '{}';", quote(title)),
+            format!("$t.GetElementsByTagName('text').Item(1).InnerText = '{}';", quote(body)),
+            format!("[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{}').Show($t);", crate::toast_identity::APP_ID),
+        ]
+        .join(" ");
         let mut cmd = silent("powershell");
         cmd.args(["-NoProfile", "-Command", &script]);
         let _ = no_console_window(&mut cmd).spawn();

@@ -11,7 +11,7 @@ use {std::sync::OnceLock, winit::window::Icon};
 
 /// The brand PNG, compiled in. 256 pixels downsamples cleanly to any size an
 /// OS asks for while staying only a few kilobytes.
-const BRAND_PNG: &[u8] =
+pub(crate) const BRAND_PNG: &[u8] =
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../icons/linux_hicolor/256x256/apps/framefang.png"));
 
 /// Decoded once, since a normal session opens several windows and each

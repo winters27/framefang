@@ -5,7 +5,7 @@ members = ["crates/framefang-app", "crates/framefang-core", "crates/framefang-pl
 resolver = "2"
 
 [workspace.package]
-version = "1.7.0"
+version = "1.7.1"
 description = "Fast screenshots with annotations, native on Windows, macOS and Linux"
 authors = ["winters27"]
 repository = "https://github.com/winters27/framefang"

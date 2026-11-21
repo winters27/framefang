@@ -259,6 +259,13 @@ pub(super) fn guide_text(g: &WindowsGuide) -> (String, String, u32) {
             format!("To use Print Screen here, turn this off in {}:", g.page),
             WARN(),
         )
+    } else if let Some(rival) = g.rival {
+        // Windows' switch is fine, but another tool wants the key too.
+        (
+            format!("{rival} is also using Print Screen; turn it off there"),
+            format!("Keep this off in {} for Print Screen to work:", g.page),
+            WARN(),
+        )
     } else {
         (
             "Print Screen goes straight to Frame Fang".to_owned(),
@@ -326,8 +333,9 @@ pub(super) fn render_windows_card<S: painter::Surface>(surf: &mut S, btn: &Row, 
         x += bitmap_font::measure("->", 1) + 6;
         mini_switch(surf, x, row3 + 1, false, TEXT_BRIGHT);
     } else {
-        // Off, as it should stay.
-        mini_switch(surf, x, row3 + 1, false, status);
+        // Off, as it should stay: fine even when another tool is the
+        // problem (the edge says that).
+        mini_switch(surf, x, row3 + 1, false, LASER());
     }
     x += MINI_SWITCH_W + 10;
     let name = format!("\u{201C}{}\u{201D}", g.switch);

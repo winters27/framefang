@@ -47,6 +47,8 @@ impl TrayApp {
         // shortcut that registered simply works and needs no word.
         if let Some(reason) = self.hotkey_error.take() {
             notify("Frame Fang: capture shortcut unavailable", &reason, true);
+        } else if let Some(advice) = self.rival_notice.take() {
+            notify("Frame Fang: Print Screen is shared", &advice, true);
         }
     }
 

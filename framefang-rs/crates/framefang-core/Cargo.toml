@@ -15,10 +15,12 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
-# Text annotations are drawn with the font compiled in from assets/fonts/,
-# rasterized by fontdue, so they look the same on every OS and need no system
-# font library. unicode-segmentation lets Backspace remove a whole visible
-# character (an emoji, an accented letter), not one code point. Both are
-# MIT OR Apache-2.0.
-fontdue = { version = "0.9", features = ["std"], default-features = false }
+# Text is drawn with the font compiled in from assets/fonts/, rasterized by
+# ab_glyph, so it looks the same on every OS and needs no system font
+# library. ab_glyph reads each glyph's outline from the embedded bytes when it
+# is first drawn, instead of preparing all of them up front (fontdue did that,
+# about 9.5 MB held for the life of the app). unicode-segmentation lets
+# Backspace remove a whole visible character (an emoji, an accented letter),
+# not one code point. Both are MIT OR Apache-2.0.
+ab_glyph = { version = "0.2.32", features = ["std"], default-features = false }
 unicode-segmentation = "1"

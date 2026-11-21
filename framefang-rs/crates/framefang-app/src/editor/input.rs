@@ -71,7 +71,12 @@ impl Overlay {
             // picture and panels): a tip would stay over a button no one
             // points at.
             WindowEvent::CursorLeft { .. } => {
-                if self.tip.take().is_some() { self.repaint(); }
+                let had_tip = self.tip.take().is_some();
+                // The button it was on eases back to rest.
+                if let Some((left, _)) = self.hot.take() {
+                    self.cooling = Some((left, Instant::now(), self.hover_level(left)));
+                }
+                if had_tip || self.cooling.is_some() { self.repaint(); }
                 Out::Continue
             }
             WindowEvent::Resized(_) => { self.repaint(); Out::Continue }
@@ -125,14 +130,15 @@ impl Overlay {
                 self.repaint();
             }
             State::Ready => {
-                // The cursor says what a press does here, and a tip names
-                // the button under it. The eyedropper's lens follows the
-                // pointer, and so does Highlight's outline of a word.
+                // The cursor says what a press does here, the button under
+                // it eases lit, and after a rest a tip names it. The
+                // eyedropper's lens follows the pointer, and so does
+                // Highlight's outline of a word.
                 self.update_cursor();
-                let before = self.tip;
-                self.tip = self.compute_tip();
+                let hot_changed = self.refresh_hot();
+                let tip_changed = self.refresh_tip();
                 let follows = self.eyedropper || (self.tool == Tool::Highlight && self.armed);
-                if before != self.tip || follows { self.repaint(); }
+                if hot_changed || tip_changed || follows { self.repaint(); }
             }
             State::Waiting => {
                 // The magnifier and the highlight follow the pointer, so the

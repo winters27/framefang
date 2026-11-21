@@ -45,6 +45,8 @@ mod settings_form;
 mod stitch;
 mod system_shortcuts;
 mod toast;
+#[cfg(target_os = "windows")]
+mod toast_identity;
 mod tray_loop;
 mod tray_menu;
 mod updates_form;

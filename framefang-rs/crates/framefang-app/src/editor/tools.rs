@@ -56,7 +56,7 @@ impl Overlay {
         self.stop_picking();
         // The pointer hasn't moved, so the tip from before the click would
         // stay up, on top of the flyout.
-        self.tip = self.compute_tip();
+        self.refresh_tip();
         self.repaint();
     }
 
@@ -67,7 +67,7 @@ impl Overlay {
         self.flyout = None;
         self.eyedropper = false;
         self.leave_select_mode();
-        self.tip = self.compute_tip();
+        self.refresh_tip();
         self.update_cursor();
         self.repaint();
     }

@@ -33,6 +33,9 @@ mod raw_keys;
 pub mod tray;
 pub mod clipboard;
 
+/// The running programs, to spot another tool that wants Print Screen.
+pub mod processes;
+
 // Recording and the process around it.
 pub mod recorder;
 pub mod child_guard;

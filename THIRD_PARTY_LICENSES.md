@@ -16,12 +16,13 @@ identically on Windows, Linux and macOS without depending on any system font.
 - Copyright 2022 The Noto Project Authors
 - The font is used unmodified and is not sold separately, as OFL-1.1 requires.
 
-The rasterizer itself is the pure-Rust **fontdue** crate (`MIT OR Apache-2.0 OR
-Zlib`, pulling in **ttf-parser**, `MIT OR Apache-2.0`), with grapheme
-segmentation from **unicode-segmentation** (`MIT OR Apache-2.0`). All three are
-ordinary Cargo dependencies under permissive licenses, compiled into the
-binary; none of them needs a system font stack, so the Text tool behaves the
-same on all three platforms.
+The rasterizer itself is the pure-Rust **ab_glyph** crate (`Apache-2.0`, with
+**ab_glyph_rasterizer** and **owned_ttf_parser**, both `Apache-2.0`, and
+**ttf-parser**, `MIT OR Apache-2.0`), with grapheme segmentation from
+**unicode-segmentation** (`MIT OR Apache-2.0`). All are ordinary Cargo
+dependencies under permissive licenses, compiled into the binary; none of them
+needs a system font stack, so the Text tool behaves the same on all three
+platforms.
 
 ## rqrr (QR code reader)
 

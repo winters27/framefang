@@ -12,12 +12,12 @@ use framefang_core::tool::Tool;
 
 use super::geometry::{rect_contains, Rect4};
 
-/// A panel button's side.
-pub(super) const PANEL_BTN: i32 = 36;
+/// A panel button's side (36 until 1.7.1; Brandon wanted them smaller).
+pub(super) const PANEL_BTN: i32 = 30;
 /// Between neighbouring buttons.
-pub(super) const PANEL_GAP: i32 = 4;
+pub(super) const PANEL_GAP: i32 = 3;
 /// Between a panel's edge and its buttons.
-pub(super) const PANEL_PAD: i32 = 5;
+pub(super) const PANEL_PAD: i32 = 4;
 /// Between the selection and a panel.
 pub(super) const PANEL_OFFSET: i32 = 5;
 /// The corner radius the panels are meant to have (they draw square for
@@ -167,6 +167,15 @@ pub(super) fn divider_y(slots: &[ToolSlot], origin: (i32, i32)) -> i32 {
 /// The `i`th button of an action row whose top left is `origin`.
 pub(super) fn action_rect(origin: (i32, i32), i: usize) -> Rect4 {
     (origin.0 + PANEL_PAD + i as i32 * (PANEL_BTN + PANEL_GAP), origin.1 + PANEL_PAD, PANEL_BTN, PANEL_BTN)
+}
+
+/// The panel button under the pointer, which draws lit up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PanelHot {
+    /// The `n`th button of the tool column.
+    Slot(usize),
+    /// The `n`th button of the action row.
+    Action(usize),
 }
 
 /// The column button under `p`, with its index.

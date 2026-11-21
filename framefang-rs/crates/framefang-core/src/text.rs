@@ -7,8 +7,9 @@
 //!
 //! It depends on nothing installed on the machine. The typeface
 //! (`assets/fonts/NotoSans-Regular.ttf`, OFL-1.1) is built into the binary and
-//! `fontdue` rasterizes it, so a Text annotation looks identical on Windows,
-//! Linux and macOS.
+//! `ab_glyph` rasterizes it, so a Text annotation looks identical on Windows,
+//! Linux and macOS. Glyph outlines are read from the embedded bytes when a
+//! character is first drawn, so the font costs next to nothing until then.
 //!
 //! Coordinates are relative to the top-left of the text block, with y
 //! growing downward like the painter's surfaces. To draw a [`TextBlock`],
@@ -17,7 +18,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use fontdue::{Font, FontSettings, Metrics};
+use ab_glyph::{point, Font, FontRef, GlyphId, PxScale, ScaleFont};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// The built-in typeface. Provenance is in `assets/fonts/README.md`, the
@@ -34,17 +35,23 @@ pub const MAX_PX: f32 = 400.0;
 /// step of the editor's thickness cycle produces.
 pub const DEFAULT_PX: f32 = 28.0;
 
-/// The parsed built-in font, loaded on first use and kept for the life of
-/// the process.
-pub fn font() -> &'static Font {
-    static PARSED: OnceLock<Font> = OnceLock::new();
-    PARSED.get_or_init(|| {
-        let settings = FontSettings::default();
-        match Font::from_bytes(FONT_DATA, settings) {
-            Ok(parsed) => parsed,
-            Err(why) => panic!("could not read the built-in Noto Sans font ({why}); assets/fonts is damaged"),
-        }
+/// The built-in font. It borrows the embedded bytes and only indexes the
+/// font's tables, so keeping it for the life of the process is cheap; glyph
+/// outlines are read when a glyph is drawn.
+pub fn font() -> &'static FontRef<'static> {
+    static PARSED: OnceLock<FontRef<'static>> = OnceLock::new();
+    PARSED.get_or_init(|| match FontRef::try_from_slice(FONT_DATA) {
+        Ok(parsed) => parsed,
+        Err(why) => panic!("could not read the built-in Noto Sans font ({why}); assets/fonts is damaged"),
     })
+}
+
+/// The font at em-size `px` (pixels per em). ab_glyph's own scale is the
+/// height from descender to ascender, so the em-size is converted into it.
+fn at_size(px: f32) -> impl ScaleFont<&'static FontRef<'static>> {
+    let face = font();
+    let units_per_em = face.units_per_em().unwrap_or(1000.0);
+    face.as_scaled(PxScale::from(px * face.height_unscaled() / units_per_em))
 }
 
 /// Bring any requested size into the range we draw at. A size that is not
@@ -76,14 +83,13 @@ pub fn font_size_for_thickness(thickness: f32) -> f32 {
 
 /// Distance from one baseline to the next at `px`.
 pub fn line_height(px: f32) -> f32 {
-    let size = clamp_px(px);
-    font().horizontal_line_metrics(size).map_or(size * 1.35, |lm| lm.new_line_size)
+    let scaled = at_size(clamp_px(px));
+    scaled.height() + scaled.line_gap()
 }
 
 /// Distance from the top of the block down to the first baseline at `px`.
 pub fn ascent(px: f32) -> f32 {
-    let size = clamp_px(px);
-    font().horizontal_line_metrics(size).map_or(size, |lm| lm.ascent)
+    at_size(clamp_px(px)).ascent()
 }
 
 // Measuring
@@ -95,16 +101,17 @@ pub fn ascent(px: f32) -> f32 {
 ///
 /// Measuring and layout both go through here, so they add up the same
 /// numbers in the same order and always agree.
-fn walk_line(line: &str, px: f32, mut advance: impl FnMut(char, f32) -> f32) -> f32 {
-    let face = font();
+fn walk_line(line: &str, px: f32, mut advance: impl FnMut(char, GlyphId, f32) -> f32) -> f32 {
+    let scaled = at_size(px);
     let mut pen = 0.0f32;
-    let mut before: Option<char> = None;
+    let mut before: Option<GlyphId> = None;
     line.chars().for_each(|letter| {
+        let id = scaled.glyph_id(letter);
         if let Some(left) = before {
-            pen += face.horizontal_kern(left, letter, px).unwrap_or(0.0);
+            pen += scaled.kern(left, id);
         }
-        pen += advance(letter, pen);
-        before = Some(letter);
+        pen += advance(letter, id, pen);
+        before = Some(id);
     });
     pen.max(0.0)
 }
@@ -113,7 +120,8 @@ fn walk_line(line: &str, px: f32, mut advance: impl FnMut(char, f32) -> f32) -> 
 /// included.
 pub fn line_width(line: &str, px: f32) -> f32 {
     let size = clamp_px(px);
-    walk_line(line, size, |ch, _| font().metrics(ch, size).advance_width)
+    let scaled = at_size(size);
+    walk_line(line, size, |_, id, _| scaled.h_advance(id))
 }
 
 /// The advance width of every line. Text ending in a newline has an empty
@@ -289,25 +297,20 @@ pub fn layout(text: &str, px: f32) -> TextBlock {
     let mut inked: Vec<PlacedGlyph> = Vec::new();
     for (line, content) in rows.into_iter().enumerate() {
         let baseline = ascent + line as f32 * line_height;
-        let width = walk_line(content, size, |letter, pen| {
-            let shape = rasterized(letter, size);
-            let m = shape.metrics;
-            if m.width > 0 && m.height > 0 {
-                // fontdue's `ymin` is how far the bitmap's bottom edge sits
-                // above the baseline (y up). Our y points down, so the top
-                // edge is the baseline minus the bitmap's full rise.
-                let rise = (m.ymin + m.height as i32) as f32;
+        let width = walk_line(content, size, |letter, id, pen| {
+            let shape = rasterized(id, size);
+            if shape.w > 0 && shape.h > 0 {
                 inked.push(PlacedGlyph {
                     ch: letter,
                     line,
-                    x: (pen + m.xmin as f32).round() as i32,
-                    y: (baseline - rise).round() as i32,
-                    w: m.width,
-                    h: m.height,
+                    x: (pen + shape.left as f32).round() as i32,
+                    y: (baseline + shape.top as f32).round() as i32,
+                    w: shape.w,
+                    h: shape.h,
                     coverage: shape.coverage,
                 });
             }
-            m.advance_width
+            shape.advance
         });
         line_widths.push(width);
     }
@@ -317,15 +320,23 @@ pub fn layout(text: &str, px: f32) -> TextBlock {
 
 // Glyph cache
 
-/// A rasterized glyph as fontdue returned it.
+/// One glyph drawn with its pen at the origin on the baseline.
 #[derive(Clone)]
 struct Rasterized {
-    metrics: Metrics,
+    /// Bitmap's left edge relative to the pen, in whole pixels.
+    left: i32,
+    /// Bitmap's top edge relative to the baseline, y down (so negative for
+    /// anything that rises above the baseline).
+    top: i32,
+    w: usize,
+    h: usize,
+    /// How far the glyph moves the pen.
+    advance: f32,
     coverage: Arc<Vec<u8>>,
 }
 
-/// Cache key: the character and the exact bits of the em-size.
-type GlyphKey = (char, u32);
+/// Cache key: the glyph and the exact bits of the em-size.
+type GlyphKey = (u16, u32);
 
 /// Entries kept before the cache is emptied and starts over. Annotation
 /// text is short and comes in a handful of sizes, so real use never gets
@@ -340,18 +351,36 @@ fn glyph_cache() -> &'static Mutex<HashMap<GlyphKey, Rasterized>> {
     CACHE.get_or_init(Default::default)
 }
 
-/// `ch` at `px`, from the cache when possible.
-fn rasterized(ch: char, px: f32) -> Rasterized {
-    let render = || {
-        let (metrics, alpha) = font().rasterize(ch, px);
-        Rasterized { metrics, coverage: alpha.into() }
+/// Draw glyph `id` at em-size `px`. A glyph with no outline (a space)
+/// comes back with an empty bitmap and only its advance.
+fn draw_glyph(id: GlyphId, px: f32) -> Rasterized {
+    let scaled = at_size(px);
+    let advance = scaled.h_advance(id);
+    let glyph = id.with_scale_and_position(scaled.scale(), point(0.0, 0.0));
+    let Some(outlined) = scaled.outline_glyph(glyph) else {
+        return Rasterized { left: 0, top: 0, w: 0, h: 0, advance, coverage: Arc::new(Vec::new()) };
     };
+    // The bounds are already whole pixels: the outline's edges rounded out.
+    let bounds = outlined.px_bounds();
+    let (w, h) = (bounds.width() as usize, bounds.height() as usize);
+    let mut coverage = vec![0u8; w * h];
+    outlined.draw(|x, y, ink| {
+        if let Some(cell) = coverage.get_mut(y as usize * w + x as usize) {
+            *cell = (ink.clamp(0.0, 1.0) * 255.0).round() as u8;
+        }
+    });
+    Rasterized { left: bounds.min.x as i32, top: bounds.min.y as i32, w, h, advance, coverage: Arc::new(coverage) }
+}
+
+/// Glyph `id` at `px`, from the cache when possible.
+fn rasterized(id: GlyphId, px: f32) -> Rasterized {
+    let render = || draw_glyph(id, px);
     // If a panic elsewhere poisoned the lock, skip the cache rather than
     // take the editor down: rasterizing again is always possible.
     let Ok(mut cache) = glyph_cache().lock() else {
         return render();
     };
-    let key: GlyphKey = (ch, px.to_bits());
+    let key: GlyphKey = (id.0, px.to_bits());
     if let Some(hit) = cache.get(&key) {
         return hit.clone();
     }
@@ -413,9 +442,11 @@ mod tests {
     #[test]
     fn the_built_in_font_loads() {
         // Fails only if the checked-in TTF is damaged.
-        let metrics = font().horizontal_line_metrics(30.0);
-        assert!(metrics.is_some_and(|lm| lm.ascent > 0.0));
+        assert!(font().glyph_count() > 3000, "Noto Sans has a few thousand glyphs");
         assert!(ascent(30.0) > 0.0 && ascent(30.0) < line_height(30.0));
+        // Noto Sans: 1000 units per em, ascender 1069, descender -293, no line gap.
+        assert!(close(ascent(30.0), 30.0 * 1.069), "{}", ascent(30.0));
+        assert!(close(line_height(30.0), 30.0 * 1.362), "{}", line_height(30.0));
     }
 
     #[test]
@@ -671,6 +702,18 @@ mod tests {
         assert_eq!(sanitize_input("a\n\rb"), "a\n\nb");
         assert_eq!(sanitize_input("\r\n\r\n"), "\n\n");
         assert_eq!(sanitize_input("a\r\u{7}\nb"), "a\n\nb", "a dropped control still separates CR from LF");
+    }
+
+    #[test]
+    fn layout_matches_the_widths_text_has_always_had() {
+        // Measured with the previous rasterizer (fontdue) before the switch
+        // to ab_glyph in 1.7.1. Saved annotations and menus keep their exact
+        // layout only while these hold, kerning pairs (AV, To, Ty) included.
+        let sample = "Frame Fang 1.7: naive naïve Straße Здравствуй Αθήνα ¼ £ ¶ § AVAWAY To Ty 0123456789";
+        for (px, width) in [(12.0, 503.65), (14.0, 587.59), (21.0, 881.39), (28.0, 1175.19), (42.0, 1762.78)] {
+            let got = line_width(sample, px);
+            assert!((got - width).abs() < 0.01, "{px} px: {got} wide, was {width}");
+        }
     }
 
     #[test]

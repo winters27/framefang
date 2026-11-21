@@ -166,13 +166,6 @@ pub fn glide(from: Rect4, to: Rect4, t: Duration) -> Rect4 {
     (mix(from.0, to.0), mix(from.1, to.1), mix(from.2, to.2), mix(from.3, to.3))
 }
 
-/// Where a highlight with nothing to glide from starts: a touch larger than
-/// its target, so it settles onto it.
-pub fn arrival(to: Rect4) -> Rect4 {
-    let grow = (to.2.min(to.3) / 40).clamp(4, 14);
-    (to.0 - grow, to.1 - grow, to.2 + grow * 2, to.3 + grow * 2)
-}
-
 /// `s` cut to at most `max` characters, with `...` when it was longer.
 pub fn shorten(s: &str, max: usize) -> String {
     if s.chars().count() <= max { return s.to_owned(); }
@@ -336,9 +329,9 @@ mod tests {
         assert_eq!(glide(a, b, GLIDE * 3), b);
         let quarter = glide(a, b, GLIDE / 4);
         assert!(quarter.0 > 100, "past halfway a quarter of the way in: {quarter:?}");
-        // Arriving from nothing it settles inward onto the target.
-        let start = arrival(b);
-        assert!(start.0 < b.0 && start.2 > b.2);
+        // Gliding from where it already is goes nowhere: how the first box
+        // of a capture lands in place.
+        assert_eq!(glide(b, b, Duration::ZERO), b);
     }
 
     #[test]

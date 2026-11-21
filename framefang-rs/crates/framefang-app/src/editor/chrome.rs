@@ -61,8 +61,40 @@ fn icon(c: &mut Canvas, r: Rect4, kind: IconKind, accent: Option<[u8; 4]>) {
     render_icon(c.px, c.w, c.h, r.0, r.1, r.0 + r.2, r.1 + r.3, kind, ICON_INK, accent);
 }
 
+/// A hovered button's fill, a step up from `BUTTON`.
+const BUTTON_HOVER: u32 = 0x00_40_40_48;
+/// The tool in hand, hovered.
+const SELECTION_BLUE_HOVER: u32 = 0x00_82_AC_F5;
+
+/// `from` blended toward `to` by `t` (0 to 1), channel by channel.
+fn mix(from: u32, to: u32, t: f32) -> u32 {
+    let channel = |shift: u32| {
+        let (a, b) = (((from >> shift) & 0xFF) as f32, ((to >> shift) & 0xFF) as f32);
+        ((a + (b - a) * t.clamp(0.0, 1.0)).round() as u32) << shift
+    };
+    channel(16) | channel(8) | channel(0)
+}
+
+/// One panel button. `hover` (0 at rest, 1 fully hovered, eased by the
+/// caller) lifts its fill a step, draws an edge in the color scheme's accent
+/// and, past halfway, grows it a pixel each way, so the button the pointer
+/// is on is plain at a glance. The icon keeps its box, so it never jumps.
+fn draw_button(c: &mut Canvas, r: Rect4, lit: bool, hover: f32, kind: IconKind, accent: Option<[u8; 4]>) {
+    let (rest, raised) = if lit { (SELECTION_BLUE, SELECTION_BLUE_HOVER) } else { (BUTTON, BUTTON_HOVER) };
+    let grow = i32::from(hover >= 0.5);
+    let face = (r.0 - grow, r.1 - grow, r.2 + 2 * grow, r.3 + 2 * grow);
+    c.fill_rect(face, mix(rest, raised, hover));
+    let edge = (255.0 * hover).round() as u32;
+    if edge > 0 {
+        c.blend_ring(face.0, face.1, face.0 + face.2 - 1, face.1 + face.3 - 1, crate::palette::LASER(), edge);
+    }
+    icon(c, r, kind, accent);
+}
+
 /// The tool column, the tool in hand lit (none while no tool is).
-pub(super) fn draw_tool_panel(c: &mut Canvas, slots: &[ToolSlot], bounds: Rect4, sel: Rect4, active: Option<Tool>) {
+/// `hover(i)` is how hovered button `i` is.
+pub(super) fn draw_tool_panel(c: &mut Canvas, slots: &[ToolSlot], bounds: Rect4, sel: Rect4, active: Option<Tool>,
+                              hover: impl Fn(usize) -> f32) {
     const DIVIDER: u32 = 0x00_44_44_48;
     let origin = tool_panel_origin(slots, bounds, sel);
     let (w, h) = tool_panel_dims(slots);
@@ -70,15 +102,13 @@ pub(super) fn draw_tool_panel(c: &mut Canvas, slots: &[ToolSlot], bounds: Rect4,
     let line = divider_y(slots, origin);
     c.fill(origin.0 + 6, line, origin.0 + w - 6, line + 1, DIVIDER);
     for (i, slot) in slots.iter().enumerate() {
-        let r = slot_rect(slots, origin, i);
         let lit = matches!(slot, ToolSlot::Tool(t) if active == Some(*t));
-        c.fill_rect(r, if lit { SELECTION_BLUE } else { BUTTON });
         let kind = match slot {
             ToolSlot::Tool(t) => IconKind::Tool(*t),
             ToolSlot::Undo => IconKind::Undo,
             ToolSlot::Redo => IconKind::Redo,
         };
-        icon(c, r, kind, None);
+        draw_button(c, slot_rect(slots, origin, i), lit, hover(i), kind, None);
     }
 }
 
@@ -142,8 +172,8 @@ pub(super) fn draw_action_panel_pulse(c: &mut Canvas, bounds: Rect4, sel: Rect4,
     for i in 0..5 { ring(c, 4 + i, (glow / (1 + i as u32)).min(255)); }
 }
 
-/// The action row.
-pub(super) fn draw_action_panel(c: &mut Canvas, bounds: Rect4, sel: Rect4, actions: &[Action]) {
+/// The action row. `hover(i)` is how hovered button `i` is.
+pub(super) fn draw_action_panel(c: &mut Canvas, bounds: Rect4, sel: Rect4, actions: &[Action], hover: impl Fn(usize) -> f32) {
     // The red of the recording indicator's dot, so Record is never taken
     // for Save.
     const RECORD_RED: [u8; 4] = [0xFF, 0x3A, 0x3A, 0xFF];
@@ -151,8 +181,6 @@ pub(super) fn draw_action_panel(c: &mut Canvas, bounds: Rect4, sel: Rect4, actio
     let (w, h) = action_panel_dims(actions);
     c.fill_rect((origin.0, origin.1, w, h), PANEL_BG);
     for (i, a) in actions.iter().enumerate() {
-        let r = action_rect(origin, i);
-        c.fill_rect(r, BUTTON);
         let (kind, accent) = match a {
             Action::Pin => (IconKind::Pin, None),
             Action::Copy => (IconKind::Copy, None),
@@ -160,7 +188,7 @@ pub(super) fn draw_action_panel(c: &mut Canvas, bounds: Rect4, sel: Rect4, actio
             Action::Record => (IconKind::Record, Some(RECORD_RED)),
             Action::Close => (IconKind::Close, None),
         };
-        icon(c, r, kind, accent);
+        draw_button(c, action_rect(origin, i), false, hover(i), kind, accent);
     }
 }
 
@@ -551,11 +579,48 @@ pub(super) fn draw_color_loupe(
 /// How many decimal digits `n` has.
 fn digits(n: u32) -> i32 { n.checked_ilog10().map_or(1, |d| d as i32 + 1) }
 
-/// The selection's size, `w x h` in the pixel font on a dark chip just
-/// inside the corner at `(ax, ay)`, moved outside it where that corner is
-/// too near the monitor's top or left. The chip darkens what is under it
-/// to a quarter rather than hiding it.
-pub(super) fn draw_dimension_chip(c: &mut Canvas, bounds: Rect4, (ax, ay): (i32, i32), w: u32, h: u32) {
+/// The selection handles' fill.
+const HANDLE_FILL: u32 = 0x00_FF_FF_FF;
+/// Half a handle's side: 4 px squares, a white dot in a blue edge (6 px
+/// until 1.7.1, which read heavy on the 1 px frame).
+const HANDLE_REACH: i32 = 2;
+
+/// The selection: a 1 px blue frame through the corners `(x0, y0)` and
+/// `(x1, y1)` (exclusive), and, where the box can be pulled, small marks at
+/// its corners and the middles of its sides. What grabs an edge is
+/// `Edge::HIT_THRESHOLD` around it, not the drawn square, so small marks are
+/// no harder to hit.
+pub(super) fn draw_selection_frame(c: &mut Canvas, (x0, y0, x1, y1): (i32, i32, i32, i32), handles: bool) {
+    c.outline(x0, y0, x1, y1, SELECTION_BLUE);
+    if !handles { return; }
+    let (xm, ym, xe, ye) = ((x0 + x1) / 2, (y0 + y1) / 2, x1 - 1, y1 - 1);
+    for (x, y) in [(x0, y0), (xm, y0), (xe, y0), (x0, ym), (xe, ym), (x0, ye), (xm, ye), (xe, ye)] {
+        let (a, b) = ((x - HANDLE_REACH, y - HANDLE_REACH), (x + HANDLE_REACH, y + HANDLE_REACH));
+        c.fill(a.0, a.1, b.0, b.1, HANDLE_FILL);
+        c.outline(a.0, a.1, b.0, b.1, SELECTION_BLUE);
+    }
+}
+
+/// Between the selection's edge and the size chip.
+const CHIP_GAP: i32 = 4;
+
+/// Where the size chip goes for selection `sel` on monitor `bounds`:
+/// outside the box, on its top edge and flush with its left side, so it
+/// never covers what is being captured (the right side and the foot are
+/// where the tool column and the action row go). A box against the top of
+/// the monitor has no room there, so the chip sits just inside its top left
+/// corner instead. Kept on the monitor sideways.
+fn dimension_chip_spot(bounds: Rect4, sel: Rect4, chip: (i32, i32)) -> (i32, i32) {
+    let (bx, by, bw, _) = bounds;
+    let above = sel.1 - CHIP_GAP - chip.1;
+    let (x, y) = if above >= by { (sel.0, above) } else { (sel.0 + CHIP_GAP, sel.1 + CHIP_GAP) };
+    (x.clamp(bx, (bx + bw - chip.0).max(bx)), y)
+}
+
+/// The selection's size, `w x h` in the pixel font on a dark chip outside
+/// the box (`dimension_chip_spot`). The chip darkens what is under it to a
+/// quarter rather than hiding it.
+pub(super) fn draw_dimension_chip(c: &mut Canvas, bounds: Rect4, sel: Rect4, w: u32, h: u32) {
     const SCALE: i32 = 2;
     const PAD_X: i32 = 6;
     const PAD_Y: i32 = 4;
@@ -564,8 +629,7 @@ pub(super) fn draw_dimension_chip(c: &mut Canvas, bounds: Rect4, (ax, ay): (i32,
     let number_w = |n: u32| digits(n) * 5 * SCALE + (digits(n) - 1) * SCALE;
     let chip_w = number_w(w) + SPACE + CROSS_W + SPACE + number_w(h) + 2 * PAD_X;
     let chip_h = 7 * SCALE + 2 * PAD_Y;
-    let x = if ax - chip_w - 4 < bounds.0 { ax + 4 } else { ax - chip_w - 4 };
-    let y = if ay - chip_h - 4 < bounds.1 { ay + 4 } else { ay - chip_h - 4 };
+    let (x, y) = dimension_chip_spot(bounds, sel, (chip_w, chip_h));
     // Three quarters of 0x16191D over the picture.
     let (xa, xb) = (x.clamp(0, c.w as i32) as usize, (x + chip_w).clamp(0, c.w as i32) as usize);
     let (ya, yb) = (y.clamp(0, c.h as i32) as usize, (y + chip_h).clamp(0, c.h as i32) as usize);
@@ -593,6 +657,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_size_chip_sits_outside_the_box_unless_the_screen_ends() {
+        let screen = (0, 0, 1920, 1080);
+        let chip = (90, 22);
+        let inside = |p: (i32, i32), r: Rect4| p.0 >= r.0 && p.0 < r.0 + r.2 && p.1 >= r.1 && p.1 < r.1 + r.3;
+        let overlaps = |(x, y): (i32, i32), r: Rect4| {
+            x < r.0 + r.2 && r.0 < x + chip.0 && y < r.1 + r.3 && r.1 < y + chip.1
+        };
+        // Room above: on the top edge, outside, flush with the left side.
+        let sel = (400, 300, 500, 200);
+        let spot = dimension_chip_spot(screen, sel, chip);
+        assert_eq!(spot, (400, 300 - CHIP_GAP - chip.1));
+        assert!(!overlaps(spot, sel), "it must not cover the picture");
+        // Against the top of the screen: just inside the top left corner.
+        let top = (400, 10, 500, 200);
+        assert_eq!(dimension_chip_spot(screen, top, chip), (400 + CHIP_GAP, 10 + CHIP_GAP));
+        assert!(inside(dimension_chip_spot(screen, top, chip), top));
+        // A box at the right edge keeps the chip on the screen.
+        let right = (1880, 300, 40, 40);
+        assert_eq!(dimension_chip_spot(screen, right, chip).0, 1920 - chip.0);
+        // On a second monitor its own top counts.
+        let second = (1920, 0, 1920, 1080);
+        assert_eq!(dimension_chip_spot(second, (2000, 20, 300, 300), chip), (2000 + CHIP_GAP, 20 + CHIP_GAP));
+    }
+
+    #[test]
+    fn a_hovered_button_lifts_grows_and_takes_the_accent_edge() {
+        let (w, h) = (900usize, 900usize);
+        let (screen, sel) = ((0, 0, 900, 900), (300, 150, 300, 300));
+        let draw = |hover: f32| {
+            let mut px = vec![0u32; w * h];
+            draw_tool_panel(&mut Canvas::new(&mut px, w, h), &EDITOR_SLOTS, screen, sel, None, |i| if i == 2 { hover } else { 0.0 });
+            px
+        };
+        let (rest, hot) = (draw(0.0), draw(1.0));
+        let r = slot_rect(&EDITOR_SLOTS, tool_panel_origin(&EDITOR_SLOTS, screen, sel), 2);
+        let at = |px: &[u32], x: i32, y: i32| px[y as usize * w + x as usize];
+        // At rest the pixel just outside the button is panel; hovered, the
+        // button has grown over it and its edge carries the accent.
+        let (out_x, mid_y) = (r.0 - 1, r.1 + r.3 / 2);
+        assert_eq!(at(&rest, out_x, mid_y), PANEL_BG);
+        assert_eq!(at(&hot, out_x, mid_y), crate::palette::LASER());
+        // The face is lighter than at rest, away from the icon's ink.
+        assert_eq!(at(&rest, r.0 + 1, r.1 + 1), BUTTON);
+        assert_eq!(at(&hot, r.0 + 1, r.1 + 1), BUTTON_HOVER);
+        // Other buttons are untouched.
+        let other = slot_rect(&EDITOR_SLOTS, tool_panel_origin(&EDITOR_SLOTS, screen, sel), 7);
+        assert_eq!(at(&rest, other.0 + 1, other.1 + 1), at(&hot, other.0 + 1, other.1 + 1));
+        // Mixing lands on both ends exactly.
+        assert_eq!((mix(BUTTON, BUTTON_HOVER, 0.0), mix(BUTTON, BUTTON_HOVER, 1.0)), (BUTTON, BUTTON_HOVER));
+    }
+
+    #[test]
     fn the_pulse_breathes_three_times_slowly_and_ends_dark() {
         assert_eq!(pulse_level(0.0), 0.0, "starts dark");
         assert!(pulse_level(PULSE_SECS - 0.001) < 0.01, "fades out, no hard cut");
@@ -609,7 +725,7 @@ mod tests {
         let (w, h) = (900usize, 900usize);
         let lit = |active: Option<Tool>| {
             let mut px = vec![0u32; w * h];
-            draw_tool_panel(&mut Canvas::new(&mut px, w, h), &EDITOR_SLOTS, (0, 0, 900, 900), (300, 150, 300, 300), active);
+            draw_tool_panel(&mut Canvas::new(&mut px, w, h), &EDITOR_SLOTS, (0, 0, 900, 900), (300, 150, 300, 300), active, |_| 0.0);
             px.iter().filter(|&&p| p == SELECTION_BLUE).count()
         };
         assert_eq!(lit(None), 0);
@@ -651,10 +767,11 @@ mod tests {
     fn the_size_chip_darkens_what_is_under_it_and_stays_on_screen() {
         let (w, h) = (200usize, 120usize);
         let mut px = vec![0x00_FF_FF_FF; w * h];
-        // A corner at the screen's top left: the chip goes outside it.
-        draw_dimension_chip(&mut Canvas::new(&mut px, w, h), (0, 0, 200, 120), (10, 10), 640, 480);
+        // A box near the screen's top: no room above, so the chip sits just
+        // inside its top left corner.
+        draw_dimension_chip(&mut Canvas::new(&mut px, w, h), (0, 0, 200, 120), (10, 10, 150, 90), 640, 480);
         assert_ne!(px[20 * w + 20], 0x00_FF_FF_FF, "inside the chip is darker");
-        assert_eq!(px[5 * w + 5], 0x00_FF_FF_FF, "the corner itself stays clear");
+        assert_eq!(px[5 * w + 5], 0x00_FF_FF_FF, "outside the box stays clear");
     }
 
     #[test]

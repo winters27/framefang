@@ -55,6 +55,8 @@ pub(super) struct Startup {
     pub(super) settings: AppSettings,
     pub(super) hotkeys: Option<HotkeyManager>,
     pub(super) hotkey_error: Option<String>,
+    /// Another screenshot tool that wants Print Screen is running.
+    pub(super) rival_notice: Option<String>,
     pub(super) portal_hotkey: bool,
     pub(super) wayland: bool,
     pub(super) first_run: bool,
@@ -71,6 +73,9 @@ pub(super) struct TrayApp {
     /// `ensure_tray` and then cleared, so a shortcut that never fires is
     /// not left unexplained.
     hotkey_error: Option<String>,
+    /// Another screenshot tool wants Print Screen too; said once, with
+    /// `hotkey_error`, and then cleared.
+    rival_notice: Option<String>,
     /// Presses arrive from the desktop's global-shortcuts portal, not a
     /// key grab. The desktop then has the last word on the binding, which
     /// the tray's Capture row has to admit.
@@ -202,6 +207,7 @@ impl TrayApp {
             app_state: AppState::load(),
             hotkeys: start.hotkeys,
             hotkey_error: start.hotkey_error,
+            rival_notice: start.rival_notice,
             portal_hotkey: start.portal_hotkey,
             wayland: start.wayland,
             recorder: Recorder::new(),

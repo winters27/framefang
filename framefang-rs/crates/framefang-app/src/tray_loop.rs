@@ -88,8 +88,16 @@ pub fn run() -> Result<()> {
     // asked once and passed along; both the start-up notice and the tray's
     // Capture row depend on it.
     let wayland = framefang_platform::session::is_wayland();
+    // Before any toast can go out, so even the first one has the logo.
+    #[cfg(target_os = "windows")]
+    crate::toast_identity::register();
 
     let (hotkeys, hotkey_error) = start_hotkeys(&settings);
+    // Another screenshot tool on Print Screen: said once at start-up, unless
+    // the shortcut already failed for a reason of its own.
+    let rival_notice = hotkey_error.is_none()
+        .then(|| crate::system_shortcuts::print_screen_rival_advice(&settings.hotkey()))
+        .flatten();
     // Presses come either from a key grab or from the desktop's
     // global-shortcuts portal. Only through the portal can the desktop pick
     // a different key than the one asked for, which the wording must allow.
@@ -99,7 +107,7 @@ pub fn run() -> Result<()> {
     let event_loop = EventLoop::new().map_err(|e| anyhow!("event loop: {e}"))?;
     event_loop.set_control_flow(ControlFlow::Wait);
 
-    let mut app = TrayApp::new(Startup { settings, hotkeys, hotkey_error, portal_hotkey, wayland, first_run });
+    let mut app = TrayApp::new(Startup { settings, hotkeys, hotkey_error, rival_notice, portal_hotkey, wayland, first_run });
     app.sweep_old_gif_work();
     event_loop.run_app(&mut app).map_err(|e| anyhow!("event loop stopped with an error: {e}"))?;
     app.finish();
@@ -134,7 +142,7 @@ fn start_hotkeys(settings: &AppSettings) -> (Option<HotkeyManager>, Option<Strin
     if problem.is_none() && crate::system_shortcuts::system_takes(&settings.hotkey()) {
         problem = Some(format!(
             "Windows is using Print Screen for its own capture. In Settings > {}, \
-             turn off \u{201C}{}\u{201D}. Framefang's Settings has a button that opens it.",
+             turn off \u{201C}{}\u{201D}. Frame Fang's Settings has a button that opens it.",
             crate::system_shortcuts::windows_page_path(),
             crate::system_shortcuts::switch_name()));
     }

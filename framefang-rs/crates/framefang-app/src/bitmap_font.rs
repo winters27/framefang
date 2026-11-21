@@ -4,7 +4,7 @@ the size chip, step numbers, dialog text.
 
 It covers printable ASCII (0x20 to 0x7E) and nothing else, on purpose. Text
 the user types into an annotation goes through `framefang_core::text` instead,
-which rasterises a bundled OFL typeface with `fontdue` and so handles accents,
+which rasterises a bundled OFL typeface with `ab_glyph` and so handles accents,
 Greek, Cyrillic and symbols. The interface strings are ASCII by construction
 and look best on a crisp pixel grid, which is what this gives them. Any other
 character draws as `?`, so a stray one still shows up as something.

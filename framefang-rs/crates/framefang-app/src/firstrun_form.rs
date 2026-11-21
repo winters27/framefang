@@ -16,7 +16,7 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::NamedKey;
 use winit::window::WindowId;
 
-use crate::dialog::{fit_middle, inside, Input, Rect, Shell};
+use crate::dialog::{fit_middle, inside, Input, Page, Rect, Shell};
 use crate::palette::*;
 
 const CARD_W: u32 = 520;
@@ -95,29 +95,33 @@ impl FirstRunView {
 
     fn paint(&mut self) {
         let Some(mut page) = self.shell.page() else { return };
-
-        let version = format!("v{}  //  welcome", env!("CARGO_PKG_VERSION"));
-        page.text(MARGIN, VERSION_Y, &version, TEXT_MUTED());
-        page.text(MARGIN, RUNNING_Y, "Frame Fang is now running in the tray / menu bar.", TEXT_BRIGHT);
-
-        // The two settings a newcomer most needs, as they are right now, so
-        // there's no trip to Settings just to find them.
-        page.text(MARGIN, SETTINGS_Y, "HOTKEY", SECTION_TINT());
-        crate::keycap::draw_line_on(&mut page, VALUE_X, SETTINGS_Y, &crate::keycap::chord(&self.hotkey), 1, TEXT_BRIGHT);
-        let folder_y = SETTINGS_Y + SETTINGS_STEP;
-        page.text(MARGIN, folder_y, "SAVE TO", SECTION_TINT());
-        let folder = fit_middle(&self.save_dir, CARD_W as i32 - MARGIN - VALUE_X);
-        page.text(VALUE_X, folder_y, &folder, TEXT_BRIGHT);
-
-        let mut y = HINTS_Y;
-        for hint in &self.hints {
-            page.text(MARGIN, y, hint, TEXT_MUTED());
-            y += HINT_STEP;
-        }
-
-        page.button(OK_BUTTON, "Okay", true, self.over_button);
+        draw_welcome(&mut page, &self.hotkey, &self.save_dir, &self.hints, self.over_button);
         self.shell.show(page);
     }
+}
+
+/// The welcome card's body.
+fn draw_welcome(page: &mut Page, hotkey: &str, save_dir: &str, hints: &[&str], over_button: bool) {
+    let version = format!("v{}  //  welcome", env!("CARGO_PKG_VERSION"));
+    page.text(MARGIN, VERSION_Y, &version, TEXT_MUTED());
+    page.text(MARGIN, RUNNING_Y, "Frame Fang is now running in the tray / menu bar.", TEXT_BRIGHT);
+
+    // The two settings a newcomer most needs, as they are right now, so
+    // there's no trip to Settings just to find them.
+    page.text(MARGIN, SETTINGS_Y, "HOTKEY", SECTION_TINT());
+    crate::keycap::draw_line_on(page, VALUE_X, SETTINGS_Y, &crate::keycap::chord(hotkey), 1, TEXT_BRIGHT);
+    let folder_y = SETTINGS_Y + SETTINGS_STEP;
+    page.text(MARGIN, folder_y, "SAVE TO", SECTION_TINT());
+    let folder = fit_middle(save_dir, CARD_W as i32 - MARGIN - VALUE_X);
+    page.text(VALUE_X, folder_y, &folder, TEXT_BRIGHT);
+
+    let mut y = HINTS_Y;
+    for hint in hints {
+        page.text(MARGIN, y, hint, TEXT_MUTED());
+        y += HINT_STEP;
+    }
+
+    page.button(OK_BUTTON, "Okay", true, over_button);
 }
 
 /// Where this OS shows the tray icon, a short line each. Chosen at run
@@ -174,6 +178,25 @@ mod tests {
             assert_eq!(with, without + 1);
         }
         assert!(without >= 2);
+    }
+
+    /// The welcome card as it shows on a first launch, with the default
+    /// capture key, in every color scheme, twice the size:
+    /// `target/welcome-<scheme>.png`.
+    #[test]
+    #[ignore]
+    fn preview_welcome() {
+        let hotkey = framefang_core::settings::AppSettings::default().hotkey().describe();
+        let folder = "C:\\Users\\you\\Pictures\\Frame Fang";
+        for scheme in crate::palette::Scheme::ALL {
+            crate::palette::set(scheme);
+            let mut page = Page::offscreen(CARD_W, CARD_H);
+            draw_welcome(&mut page, &hotkey, folder, &tray_hints(false), false);
+            let img = page.window_image("// WELCOME");
+            let img = image::imageops::resize(&img, img.width() * 2, img.height() * 2, image::imageops::FilterType::Nearest);
+            let name = format!("welcome-{}.png", scheme.name().to_lowercase());
+            img.save(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target").join(name)).unwrap();
+        }
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 `NotoSans-Regular.ttf` is Noto Sans Regular (static, hinted TrueType) from the
 Noto Project. `framefang_core::text` embeds it with `include_bytes!` and
-fontdue rasterizes it, so text annotations come out pixel for pixel the same
+ab_glyph rasterizes it, so text annotations come out pixel for pixel the same
 on every operating system, with no system fonts involved.
 
 | | |

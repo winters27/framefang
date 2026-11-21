@@ -234,10 +234,31 @@ fn open_windows_keyboard() -> Result<(), String> {
     Err("not Windows".into())
 }
 
-/// True when the system itself takes `hk`, so a Framefang binding on it never
+/// True when the system itself takes `hk`, so a Frame Fang binding on it never
 /// fires. Only Windows' Print Screen is detected; elsewhere this is `false`.
 pub fn system_takes(hk: &Hotkey) -> bool {
-    hk.virtual_key == VK_PRINT_SCREEN && hk.modifiers.is_empty() && windows_print_screen_opens_snipping()
+    is_plain_print_screen(hk) && windows_print_screen_opens_snipping()
+}
+
+fn is_plain_print_screen(hk: &Hotkey) -> bool {
+    hk.virtual_key == VK_PRINT_SCREEN && hk.modifiers.is_empty()
+}
+
+/// The name of another screenshot tool running now that wants Print Screen
+/// too (Lightshot, ShareX, ...), if any; the first known one when several
+/// are. Off Windows there is never one.
+pub fn print_screen_rival() -> Option<&'static str> {
+    let running = framefang_platform::processes::running_programs();
+    framefang_core::rivals::among(running.iter().map(String::as_str)).first().map(|r| r.name)
+}
+
+/// What to tell someone at start-up when their capture key `hk` is plain
+/// Print Screen and another tool that wants it is running.
+pub fn print_screen_rival_advice(hk: &Hotkey) -> Option<String> {
+    if !is_plain_print_screen(hk) { return None; }
+    let running = framefang_platform::processes::running_programs();
+    let found = framefang_core::rivals::among(running.iter().map(String::as_str));
+    found.first().map(|r| framefang_core::rivals::advice(r))
 }
 
 /// `HKCU\Control Panel\Keyboard\PrintScreenKeyForSnippingEnabled`. When the

@@ -52,8 +52,13 @@
       <Directory Id="ProgramMenuFolder">
         <Directory Id="ApplicationProgramsFolder" Name="Frame Fang">
           <Component Id="StartMenuShortcut" Win64="yes" Guid="D1084C35-9CC7-44EF-9A63-AC5E84CAD8CE">
+            <!-- The ID ties Frame Fang's toasts to this shortcut: without it
+                 Windows shows them with no name or logo, and drops the modern
+                 layout. Must match toast_identity::APP_ID. -->
             <Shortcut Id="FramefangStartMenuShortcut" Name="Frame Fang" Description="Fast screenshots with annotations"
-                      Target="[APPLICATIONFOLDER]framefang.exe" WorkingDirectory="APPLICATIONFOLDER" Icon="ProductIcon.ico" />
+                      Target="[APPLICATIONFOLDER]framefang.exe" WorkingDirectory="APPLICATIONFOLDER" Icon="ProductIcon.ico">
+              <ShortcutProperty Key="System.AppUserModel.ID" Value="winters27.FrameFang" />
+            </Shortcut>
             <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" Directory="ApplicationProgramsFolder" />
             <RegistryValue Root="HKCU" Key="Software\Framefang\Framefang" Name="installed" Type="integer" Value="1" KeyPath="yes" />
           </Component>

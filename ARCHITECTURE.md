@@ -101,7 +101,7 @@ buffer, softbuffer puts it on screen, so nothing depends on a GPU driver.
   the stitched bitmap and screen coordinates; the editor is one window over
   the union of all monitors so a drag can cross from one screen to the next.
 - **Text.** User text is laid out by `framefang-core::text` with the bundled
-  Noto Sans (`framefang-core/assets/fonts/`, OFL) through fontdue, so it is the
+  Noto Sans (`framefang-core/assets/fonts/`, OFL) through ab_glyph, so it is the
   same on every OS; glyphs the font lacks draw as a visible box. The small
   fixed labels in the app's own chrome use the 5x7 pixel font in
   `bitmap_font.rs`.

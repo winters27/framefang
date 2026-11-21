@@ -5,19 +5,48 @@
 //! that says what a press does and the tip that names a button. Also the
 //! tray's tick, for what animates without events.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use framefang_core::state::Edge;
 use framefang_core::virtual_desktop as vdesk;
 use winit::window::CursorIcon;
 
 use super::dock::{DockFrame, READ_STEP, SCROLL_HINT};
-use super::flyout::{flyout_layout, shifted};
+use super::flyout::{ease_out, flyout_layout, shifted};
 use super::geometry::{rect_contains, Rect4};
 use super::panels::*;
 use super::video::{timeline_bar_rect, timeline_chip_rect};
 use super::*;
 use crate::pick::{self, Look, PickMode};
+
+/// A panel button eases lit this fast when the pointer lands on it, so it
+/// is clear at once what a click would hit...
+pub(super) const HOVER_IN: Duration = Duration::from_millis(120);
+/// ...and back to rest a little slower when the pointer leaves.
+pub(super) const HOVER_OUT: Duration = Duration::from_millis(180);
+/// The pointer rests this long before a tip shows, so a passing pointer
+/// doesn't flash tips over the panel.
+pub(super) const TIP_DELAY: Duration = Duration::from_millis(450);
+/// After a tip that was showing goes away, the next one within this shows
+/// at once (the pointer is reading its way along the panel).
+pub(super) const TIP_WARM: Duration = Duration::from_millis(400);
+
+/// How long after the capture shows before the highlight starts gliding
+/// between targets; until then each target lands in place.
+const SETTLE: Duration = Duration::from_millis(150);
+
+/// How lit button `b` is, 0 at rest to 1 fully hovered, given the button the
+/// pointer is on (and since when) and the one it last left (when, and how
+/// lit it was then). A free function so a frame can take a copy of the two
+/// before it borrows the window's pixels.
+pub(super) fn hover_level_of(hot: Option<(PanelHot, Instant)>, cooling: Option<(PanelHot, Instant, f32)>, b: PanelHot) -> f32 {
+    let progress = |since: Instant, span: Duration| (since.elapsed().as_secs_f32() / span.as_secs_f32()).min(1.0);
+    match (hot, cooling) {
+        (Some((h, since)), _) if h == b => ease_out(progress(since, HOVER_IN)),
+        (_, Some((c, since, from))) if c == b => from * (1.0 - ease_out(progress(since, HOVER_OUT))),
+        _ => 0.0,
+    }
+}
 
 /// The resize arrows for a grabbed edge or corner, the crosshair inside.
 pub(super) fn edge_cursor(e: Edge) -> CursorIcon {
@@ -103,7 +132,14 @@ impl Overlay {
             }
         };
         if self.hover.target.as_ref().map(|t| t.0) != Some(next.0) {
-            self.hover.glide_from = if self.hover.target.is_some() { self.shown_target() } else { pick::arrival(next.0) };
+            // Glide only from one target to the next once the capture has
+            // been on screen a moment. The first box, and any correction in
+            // the first frames (the window's true place is only known once it
+            // shows), lands in place: Brandon didn't like the box growing in
+            // from the top left as Print Screen opened.
+            let settled = self.hover.dock_since.is_some_and(|t| t.elapsed() >= SETTLE);
+            let glide = settled && self.hover.target.is_some();
+            self.hover.glide_from = if glide { self.shown_target() } else { next.0 };
             self.hover.glide_at = Instant::now();
         }
         self.hover.target = Some(next);
@@ -234,6 +270,68 @@ impl Overlay {
         self.finish_selection(switch)
     }
 
+    /// The panel button under the pointer, if any. The column isn't drawn in
+    /// record mode, so only the row counts there.
+    pub(super) fn hot_button(&self) -> Option<PanelHot> {
+        if self.state != State::Ready { return None; }
+        let sel = self.panel_sel()?;
+        let bounds = self.panel_bounds(sel);
+        let slots = self.tool_set().slots();
+        let column = tool_panel_origin(slots, bounds, sel);
+        if let Some((i, _)) = slot_at(slots, column, self.pointer).filter(|_| self.mode != Mode::Record) {
+            return Some(PanelHot::Slot(i));
+        }
+        let actions = self.actions();
+        action_at(action_panel_origin(bounds, sel, actions), self.pointer, actions).map(|(i, _)| PanelHot::Action(i))
+    }
+
+    /// Follow the pointer onto and off the panel buttons: the one it lands
+    /// on starts easing lit, the one it left eases back from however lit it
+    /// had got. True when that changed what is drawn.
+    pub(super) fn refresh_hot(&mut self) -> bool {
+        let now = self.hot_button();
+        if now == self.hot.map(|(b, _)| b) { return false; }
+        if let Some((left, _)) = self.hot {
+            self.cooling = Some((left, Instant::now(), self.hover_level(left)));
+        }
+        self.hot = now.map(|b| (b, Instant::now()));
+        true
+    }
+
+    /// How lit button `b` is now, 0 at rest to 1 fully hovered.
+    pub(super) fn hover_level(&self, b: PanelHot) -> f32 {
+        hover_level_of(self.hot, self.cooling, b)
+    }
+
+    /// A button is still easing lit or back, so frames should come fast.
+    pub(super) fn hover_easing(&self) -> bool {
+        self.hot.is_some_and(|(_, since)| since.elapsed() < HOVER_IN)
+            || self.cooling.is_some_and(|(_, since, _)| since.elapsed() < HOVER_OUT)
+    }
+
+    /// Recompute the tip for where the pointer is. A new tip waits until the
+    /// pointer has rested `TIP_DELAY` on what it names; one that follows a
+    /// tip that was showing (moving along the column) shows at once. True
+    /// when the tip changed.
+    pub(super) fn refresh_tip(&mut self) -> bool {
+        let next = self.compute_tip();
+        let named = |t: Option<(&'static str, i32, i32)>| t.map(|(label, ..)| label);
+        if named(next) != named(self.tip) {
+            if self.tip_shown() { self.tip_warm = Some(Instant::now()); }
+            let warm = self.tip_warm.is_some_and(|t| t.elapsed() < TIP_WARM);
+            let now = Instant::now();
+            self.tip_since = if warm { now.checked_sub(TIP_DELAY).unwrap_or(now) } else { now };
+        }
+        let changed = next != self.tip;
+        self.tip = next;
+        changed
+    }
+
+    /// The tip is up: the pointer has rested on its subject long enough.
+    pub(super) fn tip_shown(&self) -> bool {
+        self.tip.is_some() && self.tip_since.elapsed() >= TIP_DELAY
+    }
+
     /// The tip for what the pointer is over, and where it goes.
     pub(super) fn compute_tip(&self) -> Option<(&'static str, i32, i32)> {
         let sel = self.panel_sel()?;
@@ -329,6 +427,33 @@ impl Overlay {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hovered_button_eases_lit_and_back() {
+        let (a, b) = (PanelHot::Slot(2), PanelHot::Action(1));
+        let ago = |ms: u64| Instant::now().checked_sub(Duration::from_millis(ms)).unwrap();
+        // Just arrived: barely lit. A while later: fully lit.
+        assert!(hover_level_of(Some((a, Instant::now())), None, a) < 0.2);
+        assert_eq!(hover_level_of(Some((a, ago(1000))), None, a), 1.0);
+        // Halfway through its ease it is well past half, easing out.
+        let half = hover_level_of(Some((a, ago(HOVER_IN.as_millis() as u64 / 2))), None, a);
+        assert!(half > 0.6 && half < 1.0, "{half}");
+        // Just left from 0.8: still about 0.8. Long gone: dark.
+        let leaving = hover_level_of(None, Some((a, Instant::now(), 0.8)), a);
+        assert!(leaving > 0.7 && leaving <= 0.8, "{leaving}");
+        assert_eq!(hover_level_of(None, Some((a, ago(1000), 0.8)), a), 0.0);
+        // Other buttons stay at rest.
+        assert_eq!(hover_level_of(Some((a, ago(1000))), Some((a, ago(10), 1.0)), b), 0.0);
+        // The pointer back on the button it was leaving: the hover wins.
+        assert_eq!(hover_level_of(Some((a, ago(1000))), Some((a, Instant::now(), 0.3)), a), 1.0);
+    }
+
+    #[test]
+    fn tips_wait_longer_than_the_hover_takes() {
+        // The button answers first; the tip only after a real rest.
+        assert!(TIP_DELAY > HOVER_IN * 3);
+        assert!(TIP_WARM < TIP_DELAY);
+    }
 
     #[test]
     fn each_edge_shows_the_arrows_it_moves_along() {

@@ -469,8 +469,19 @@ pub struct Overlay {
     /// Changes the tray hasn't taken yet.
     unsent: framefang_core::settings_store::Patch,
 
-    /// The hovered button's tip and where it goes.
+    /// The hovered button's tip and where it goes. It shows once the pointer
+    /// has rested `TIP_DELAY` (see `refresh_tip`).
     tip: Option<(&'static str, i32, i32)>,
+    /// When the pointer arrived at what `tip` names.
+    tip_since: Instant,
+    /// When a tip that was showing went away: a new one within `TIP_WARM`
+    /// of it shows at once, so moving along the column reads tip by tip.
+    tip_warm: Option<Instant>,
+    /// The panel button under the pointer, and since when (it eases lit).
+    hot: Option<(panels::PanelHot, Instant)>,
+    /// The button the pointer just left, when, and how lit it was then
+    /// (it eases back to rest).
+    cooling: Option<(panels::PanelHot, Instant, f32)>,
     /// An Esc confirmation on screen: the next Esc goes through with it.
     confirm: Option<Discard>,
     /// A Copy that kept the editor open, for "Copied to clipboard".
